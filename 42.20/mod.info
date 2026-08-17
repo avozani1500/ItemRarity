@@ -1,0 +1,6 @@
+name=Item Rarity (Experimental)
+id=ItemRarity
+description=Experimental loot-distribution scanner for Project Zomboid Build 42.20+.
+author=Natan
+modversion=0.1.0-experimental
+versionMin=42.20.0

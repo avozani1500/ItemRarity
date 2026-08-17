@@ -1,0 +1,22 @@
+{
+    "UI_ItemRarity_Rarity": "Rarity",
+    "UI_ItemRarity_Common": "Common",
+    "UI_ItemRarity_Uncommon": "Uncommon",
+    "UI_ItemRarity_Rare": "Rare",
+    "UI_ItemRarity_Epic": "Epic",
+    "UI_ItemRarity_Exotic": "Exotic",
+    "UI_ItemRarity_Category": "Category",
+    "UI_ItemRarity_Percentile": "Percentile",
+    "UI_ItemRarity_Availability": "Availability D",
+    "UI_ItemRarity_Confidence": "Confidence",
+    "UI_ItemRarity_Coverage": "Coverage",
+    "UI_ItemRarity_BaseTier": "Base tier",
+    "UI_ItemRarity_ScarcityPercentile": "Scarcity percentile",
+    "UI_ItemRarity_Utility": "Utility",
+    "UI_ItemRarity_UtilityConfidence": "Utility confidence",
+    "UI_ItemRarity_UtilitySubgroup": "Utility subgroup",
+    "UI_ItemRarity_SubgroupRank": "Subgroup rank",
+    "UI_ItemRarity_ParentPercentile": "Parent percentile",
+    "UI_ItemRarity_PromotionReason": "Promotion reason",
+    "UI_ItemRarity_FinalTier": "Final tier"
+}
