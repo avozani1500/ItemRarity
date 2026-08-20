@@ -57,6 +57,33 @@ if Events and Events.OnClientCommand then
             if ItemRarityRegistrySnapshot and ItemRarityRegistrySnapshot.write then
                 ItemRarityRegistrySnapshot.write(args and args.label or "CURRENT")
             end
+        elseif module == "ItemRarity" and command == "clothingCostCalibration" then
+            require "ItemRarity/Diagnostics/ClothingCostCalibration"
+            if ItemRarityClothingCostCalibration and ItemRarityClothingCostCalibration.write then
+                ItemRarityClothingCostCalibration.write(ItemRarityScanner.results)
+            end
+        elseif module == "ItemRarity" and command == "clothingMechanicalValue" then
+            require "ItemRarity/Diagnostics/ClothingMechanicalValueReport"
+            if ItemRarityClothingMechanicalValueReport and ItemRarityClothingMechanicalValueReport.write then
+                ItemRarityClothingMechanicalValueReport.write(ItemRarityScanner.results)
+            end
+        elseif module == "ItemRarity" and command == "reloadDiagnostic" then
+            -- The debug console is client-side, but report writers run on the
+            -- host.  Restrict server-side reload to an explicit allow-list;
+            -- this supports fast diagnostic iteration without turning the
+            -- client command channel into an arbitrary file loader.
+            local files = {
+                clothingMechanicalValue = "media/lua/server/ItemRarity/Diagnostics/ClothingMechanicalValueReport.lua",
+                clothingCostCalibration = "media/lua/server/ItemRarity/Diagnostics/ClothingCostCalibration.lua",
+            }
+            local key = args and tostring(args.key or "") or ""
+            local path = files[key]
+            if path and reloadLuaFile then
+                reloadLuaFile(path)
+                ItemRarityUtils.info("Server diagnostic reloaded: " .. key)
+            elseif not path then
+                ItemRarityUtils.warn("Rejected unknown server diagnostic reload request: " .. key)
+            end
         end
     end)
 end

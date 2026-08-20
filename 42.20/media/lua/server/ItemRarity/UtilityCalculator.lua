@@ -329,6 +329,25 @@ local function bodyLocationGraph(bodyLocation)
     return graph
 end
 
+-- Some clothing advertises a real special function through runtime/script
+-- behavior rather than a numeric defense field (for example an activated
+-- breathing-system garment).  This is intentionally generic: it inspects
+-- behavior markers, never a fullType or item name.
+local function clothingSpecialBehaviorEvidence(scriptItem)
+    local tags = string.lower(readString(scriptItem, "getTags", "tags") or "")
+    local activated = readBoolean(scriptItem, "isActivatedItem", "activatedItem")
+    local keepOnDeplete = readBoolean(scriptItem, "isKeepOnDeplete", "keepOnDeplete")
+    local onCreate = readString(scriptItem, "getOnCreate", "onCreate")
+    local specialTag = string.find(tags, "scba", 1, true) ~= nil or string.find(tags, "hazmatsuit", 1, true) ~= nil
+    -- OnCreate alone is often cosmetic/randomization metadata. It is recorded
+    -- as evidence, but only an activated/depleting behavior or an explicit
+    -- breathing-system tag is enough to make the value non-quantifiable.
+    if activated or keepOnDeplete or specialTag then
+        return true, string.format("activated=%s,onCreate=%s,keepOnDeplete=%s,specialTag=%s", tostring(activated), tostring(onCreate ~= nil), tostring(keepOnDeplete), tostring(specialTag))
+    end
+    return false, nil
+end
+
 local function regionSet(regions)
     local set = {}
     for _, region in ipairs(regions or {}) do set[region] = true end
@@ -463,6 +482,7 @@ local function makeClothingDiscoveryCandidate(data, scriptItem)
         metrics.windResistance = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getWindresistance", "windresistance")
     end
     local equipmentGraph = bodyLocationGraph(bodyLocation)
+    local mechanicalSpecialBehavior, mechanicalSpecialReason = clothingSpecialBehaviorEvidence(scriptItem)
     local functionalGroup, functionalReason = clothingFunctionalGroup(equipmentGraph, regions, metrics)
     local priorFunctionalGroup = (functionalGroup == "TORSO_LAYER" or functionalGroup == "LOWER_BODY_LAYER"
         or functionalGroup == "CORE_ACCESSORY" or functionalGroup == "GENERAL_UNRESOLVED") and "GENERAL_CLOTHING" or functionalGroup
@@ -478,6 +498,8 @@ local function makeClothingDiscoveryCandidate(data, scriptItem)
         functionalGroupReason = functionalReason,
         priorFunctionalGroup = priorFunctionalGroup,
         equipmentGraph = equipmentGraph,
+        mechanicalSpecialBehavior = mechanicalSpecialBehavior,
+        mechanicalSpecialReason = mechanicalSpecialReason,
         metrics = metrics,
         profile = profile,
         utilityEligible = false,
@@ -930,10 +952,64 @@ local function assignFunctionalCoverageFactors(clothing)
     end
 end
 
+local function clothingProgressiveLoss(loss, freeLoss)
+    local excess = math.max(0, loss - freeLoss)
+    if excess == 0 then return 0 end
+    return clamp(100 * ((excess / math.max(1, 100 - freeLoss)) ^ .72), 0, 100)
+end
+
+local function assignClothingMechanicalBaseBenefit(clothing)
+    local scales = clothingGlobalRobustScales(clothing, { "durability", "insulation", "windResistance", "waterResistance" })
+    for _, candidate in ipairs(clothing) do
+        local m = candidate.metrics or {}
+        local coreKnown = m.biteDefense ~= nil and m.scratchDefense ~= nil and m.bulletDefense ~= nil
+            and m.insulation ~= nil and m.windResistance ~= nil and m.waterResistance ~= nil
+        local rawProtection = ((clamp(m.biteDefense or 0, 0, 100) * .50) + (clamp(m.scratchDefense or 0, 0, 100) * .35)
+            + (clamp(m.bulletDefense or 0, 0, 100) * .15)) * clamp(candidate.functionalCoverageFactor or .70, 0, 1)
+        local insulation = globalRobustScale(m.insulation, scales.insulation) or 0
+        local wind = globalRobustScale(m.windResistance, scales.windResistance) or 0
+        local water = globalRobustScale(m.waterResistance, scales.waterResistance) or 0
+        local weather = insulation * .40 + wind * .35 + water * .25
+        local durability = globalRobustScale(m.durability, scales.durability) or 0
+        candidate.mechanicalBaseBenefit = rawProtection * .85 + weather * .15
+        candidate.mechanicalDurabilityFactor = .75 + .25 * durability / 100
+        candidate.mechanicalAttributesKnown = coreKnown
+    end
+end
+
+local function assignClothingMechanicalValueStatus(candidates)
+    for _, candidate in ipairs(candidates) do
+        if candidate.clothingUtilityCandidate then
+            local m = candidate.metrics or {}
+            local direct = candidate.utilityComponents and candidate.utilityComponents.directSlot or {}
+            local combatLoss = clamp((1 - (m.combatSpeedModifier or 1)) * 100, 0, 100)
+            local runLoss = clamp((1 - (m.runSpeedModifier or 1)) * 100, 0, 100)
+            local discomfort = clamp((m.discomfortModifier or 0) * 100, 0, 100)
+            local visionLoss = clamp((1 - (m.visionModifier or 1)) * 100, 0, 100)
+            local hearingLoss = clamp((1 - (m.hearingModifier or 1)) * 100, 0, 100)
+            local weightLoss = 100 - (direct.weight or 50)
+            local costIndex = clothingProgressiveLoss(combatLoss, 1) * .30 + clothingProgressiveLoss(runLoss, 1) * .25
+                + clothingProgressiveLoss(visionLoss, 1) * .15 + clothingProgressiveLoss(hearingLoss, 1) * .15
+                + clothingProgressiveLoss(discomfort, 2) * .10 + clothingProgressiveLoss(weightLoss, 15) * .05
+            local excess = math.max(0, costIndex - 7)
+            candidate.mechanicalFunctionalCost = excess == 0 and 0 or (excess ^ 1.28) / 5.5
+            candidate.mechanicalValue = math.max(0, (candidate.mechanicalBaseBenefit or 0) * (candidate.mechanicalDurabilityFactor or .75) - candidate.mechanicalFunctionalCost)
+            if candidate.mechanicalSpecialBehavior or not candidate.mechanicalAttributesKnown then
+                candidate.mechanicalValueStatus = "MECHANICAL_VALUE_PARTIAL"
+            elseif (candidate.mechanicalBaseBenefit or 0) <= .01 then
+                candidate.mechanicalValueStatus = "MECHANICALLY_TRIVIAL"
+            else
+                candidate.mechanicalValueStatus = "MECHANICAL_VALUE_KNOWN"
+            end
+        end
+    end
+end
+
 local function scoreClothingUtility(candidates)
     local clothing = {}
     for _, candidate in ipairs(candidates) do if candidate.clothingUtilityCandidate then table.insert(clothing, candidate) end end
     assignFunctionalCoverageFactors(clothing)
+    assignClothingMechanicalBaseBenefit(clothing)
     local grouped = {}
     for _, candidate in ipairs(clothing) do
         local groupKey, references, groupMode = clothingNormalizationGroup(candidate, clothing)
@@ -1175,6 +1251,12 @@ local function publishCandidateFields(candidates)
         data.slotRankingConfidence = candidate.slotRankingConfidence
         data.clothingBalancedThresholds = candidate.clothingBalancedThresholds
         data.clothingEquipmentGraph = candidate.equipmentGraph
+        data.clothingMechanicalValue = candidate.mechanicalValue
+        data.clothingMechanicalValueStatus = candidate.mechanicalValueStatus
+        data.clothingMechanicalBaseBenefit = candidate.mechanicalBaseBenefit
+        data.clothingMechanicalDurabilityFactor = candidate.mechanicalDurabilityFactor
+        data.clothingMechanicalFunctionalCost = candidate.mechanicalFunctionalCost
+        data.clothingMechanicalSpecialReason = candidate.mechanicalSpecialReason
     end
 end
 
@@ -1219,6 +1301,13 @@ local function applyTierAdjustment(data, candidate)
         or not confidenceAtLeast(candidate.utilityConfidence, UTILITY.minimumConfidenceForAdjustment) then
         if data.baseScarcityTier == "EPIC" or data.baseScarcityTier == "EXOTIC" then data.finalRarityTier = "RARE" end
         data.utilityAdjustmentReason = "no eligible/reliable Utility; visual ceiling RARE"
+        if candidate.kind == "CLOTHING" then
+            data.clothingMechanicalTierBeforeCap = data.finalRarityTier
+            if candidate.mechanicalValueStatus == "MECHANICALLY_TRIVIAL" and (TIER_INDEX[data.finalRarityTier] or 1) > TIER_INDEX.UNCOMMON then
+                data.finalRarityTier = "UNCOMMON"
+                data.utilityAdjustmentReason = "Clothing MechanicalValue: trivial known benefit; visual ceiling UNCOMMON"
+            end
+        end
         return
     end
 
@@ -1249,6 +1338,11 @@ local function applyTierAdjustment(data, candidate)
         else
             data.finalRarityTier = candidate.utility >= thresholds.excellent and confirmed and candidate.utilityConfidence == "HIGH" and "EXOTIC" or "EPIC"
             data.utilityAdjustmentReason = "ClothingUtility V1 Balanced: Scarcity plus DIRECT_SLOT quality"
+        end
+        data.clothingMechanicalTierBeforeCap = data.finalRarityTier
+        if candidate.mechanicalValueStatus == "MECHANICALLY_TRIVIAL" and (TIER_INDEX[data.finalRarityTier] or 1) > TIER_INDEX.UNCOMMON then
+            data.finalRarityTier = "UNCOMMON"
+            data.utilityAdjustmentReason = "Clothing MechanicalValue: trivial known benefit; visual ceiling UNCOMMON"
         end
         return
     end
@@ -1871,6 +1965,7 @@ function ItemRarityUtilityCalculator.calculate(results)
     scoreMeleeV2(candidates)
     scoreClothingUtility(candidates)
     scoreClothingDirectSlotV1(candidates)
+    assignClothingMechanicalValueStatus(candidates)
     publishCandidateFields(candidates)
     buildSubfamilyMetrics(results)
     for _, candidate in ipairs(candidates) do applyTierAdjustment(candidate.data, candidate) end

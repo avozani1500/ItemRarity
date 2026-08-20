@@ -26,7 +26,9 @@ function ItemRarityRegistrySnapshot.write(label)
     for fullType in pairs(results) do table.insert(fullTypes, fullType) end
     table.sort(fullTypes)
     label = tostring(label or "CURRENT"):gsub("[^%w_%-]", "_")
-    local writer = getFileWriter("ItemRarity_RegistrySnapshot_" .. label .. ".tsv", true, false)
+    -- Unlike the historical reports, this forensic capture has no preexisting
+    -- file.  Ask the game to create it on first use.
+    local writer = getFileWriter("ItemRarity_RegistrySnapshot_" .. label .. ".tsv", true, true)
     if not writer then return false end
     writer:write("fullType\tbaseScarcityTier\trarityTier\tfinalRarityTier\trouteWeighted\trouteWeightedPercentile\tutility\tutilityPercentile\tutilityConfidence\tutilityEligible\tutilityKind\tutilitySubgroup\tutilitySubgroupRank\tutilityParentPercentile\tutilityScoreVersion\tslotQualityPercentile\tslotQualityRank\tslotRankingConfidence\tutilityAdjustmentReason\n")
     for _, fullType in ipairs(fullTypes) do

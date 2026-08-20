@@ -72,3 +72,62 @@ function ItemRarity.writeRegistrySnapshot(label)
     if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
     return nil, message
 end
+
+-- Requests a server-side, read-only Clothing cost calibration.  It does not
+-- rescan or mutate the active registry; the host merely writes a diagnostic
+-- from the already-computed result set.
+function ItemRarity.writeClothingCostCalibration()
+    if ItemRarityClothingCostCalibration and type(ItemRarityClothingCostCalibration.write) == "function" and ItemRarityScanner then
+        return ItemRarityClothingCostCalibration.write(ItemRarityScanner.results)
+    end
+    local player = getSpecificPlayer and getSpecificPlayer(0) or (getPlayer and getPlayer() or nil)
+    if sendClientCommand and player then
+        sendClientCommand(player, "ItemRarity", "clothingCostCalibration", {})
+        local message = "ItemRarity Clothing cost calibration requested from the client; waiting for the host report."
+        if ItemRarityUtils and ItemRarityUtils.info then ItemRarityUtils.info(message) else print(message) end
+        return true, message
+    end
+    local message = "ItemRarity Clothing cost calibration is unavailable: this Lua context cannot reach the host registry."
+    if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+    return nil, message
+end
+
+-- Read-only absolute-mechanical-value audit for Clothing.  The host writes a
+-- simulation from its current result set and never republishes a registry.
+function ItemRarity.writeClothingMechanicalValueAudit()
+    if ItemRarityClothingMechanicalValueReport and type(ItemRarityClothingMechanicalValueReport.write) == "function" and ItemRarityScanner then
+        return ItemRarityClothingMechanicalValueReport.write(ItemRarityScanner.results)
+    end
+    local player = getSpecificPlayer and getSpecificPlayer(0) or (getPlayer and getPlayer() or nil)
+    if sendClientCommand and player then
+        sendClientCommand(player, "ItemRarity", "clothingMechanicalValue", {})
+        local message = "ItemRarity absolute Clothing mechanical-value audit requested from the client; waiting for the host report."
+        if ItemRarityUtils and ItemRarityUtils.info then ItemRarityUtils.info(message) else print(message) end
+        return true, message
+    end
+    local message = "ItemRarity Clothing mechanical-value audit is unavailable: this Lua context cannot reach the host registry."
+    if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+    return nil, message
+end
+
+-- Reloads an explicitly permitted server-side diagnostic writer.  Normal
+-- ItemRarity runtime files remain intentionally outside this API; changing
+-- active pipeline code still requires the normal controlled validation flow.
+function ItemRarity.reloadDiagnostic(key)
+    local allowed = { clothingMechanicalValue=true, clothingCostCalibration=true }
+    if not allowed[key] then
+        local message = "ItemRarity.reloadDiagnostic() rejected an unknown diagnostic key."
+        if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+        return nil, message
+    end
+    local player = getSpecificPlayer and getSpecificPlayer(0) or (getPlayer and getPlayer() or nil)
+    if sendClientCommand and player then
+        sendClientCommand(player, "ItemRarity", "reloadDiagnostic", { key=key })
+        local message = "ItemRarity server diagnostic reload requested: " .. key
+        if ItemRarityUtils and ItemRarityUtils.info then ItemRarityUtils.info(message) else print(message) end
+        return true, message
+    end
+    local message = "ItemRarity.reloadDiagnostic() cannot reach the host."
+    if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+    return nil, message
+end

@@ -5,6 +5,7 @@ require "ItemRarity/PoolRouteResolver"
 require "ItemRarity/TableAvailabilityCalculator"
 require "ItemRarity/UtilityCalculator"
 require "ItemRarity/RarityRegistryPublisher"
+require "ItemRarity/Diagnostics/RegistrySnapshot"
 
 -- Observes final Lua loot tables. It never writes to loot tables or items.
 ItemRarityScanner = ItemRarityScanner or {}
@@ -275,6 +276,55 @@ function ItemRarityScanner.canScanCurrentTables()
         and type(SuburbsDistributions) == "table"
 end
 
+-- Keep the live validation compact and automatic.  This intentionally reads
+-- only already-published runtime values; it never contributes to the result
+-- signature or changes the scoring pipeline.
+local function logMechanicalValueValidation(results)
+    local tierCounts = { COMMON = 0, UNCOMMON = 0, RARE = 0, EPIC = 0, EXOTIC = 0 }
+    local trivialCount, changedCount = 0, 0
+    local transitions = { rare = 0, epic = 0, exotic = 0 }
+
+    for _, data in pairs(results) do
+        local tier = data.finalRarityTier
+        if tierCounts[tier] then tierCounts[tier] = tierCounts[tier] + 1 end
+        if data.clothingMechanicalValueStatus == "MECHANICALLY_TRIVIAL" then
+            trivialCount = trivialCount + 1
+            local beforeCap = data.clothingMechanicalTierBeforeCap
+            if beforeCap and beforeCap ~= tier then
+                changedCount = changedCount + 1
+                if beforeCap == "RARE" and tier == "UNCOMMON" then transitions.rare = transitions.rare + 1 end
+                if beforeCap == "EPIC" and tier == "UNCOMMON" then transitions.epic = transitions.epic + 1 end
+                if beforeCap == "EXOTIC" and tier == "UNCOMMON" then transitions.exotic = transitions.exotic + 1 end
+            end
+        end
+    end
+
+    ItemRarityUtils.info(string.format(
+        "Clothing MechanicalValue validation | trivial=%d | tier-capped=%d | RARE->UNCOMMON=%d | EPIC->UNCOMMON=%d | EXOTIC->UNCOMMON=%d | tiers C/U/R/E/X=%d/%d/%d/%d/%d",
+        trivialCount, changedCount, transitions.rare, transitions.epic, transitions.exotic,
+        tierCounts.COMMON, tierCounts.UNCOMMON, tierCounts.RARE, tierCounts.EPIC, tierCounts.EXOTIC
+    ))
+
+    local targets = {
+        "Base.Briefs_SmallTrunks_Black", "Base.Jacket_NavyBlue", "Base.Jacket_Leather",
+        "Base.Jacket_Fireman", "Base.Shoes_WorkBoots", "Base.Cuirass_Metal",
+        "Base.Vambrace_Left", "Base.Shoulderpad_Articulated_L_Metal", "Base.HazmatSuit",
+        "Base.Katana", "Base.HollowBook_Handgun",
+    }
+    for _, fullType in ipairs(targets) do
+        local data = results[fullType]
+        if data then
+            ItemRarityUtils.info(string.format(
+                "Validation %s | tier=%s | beforeCap=%s | MechanicalValue=%s | MechanicalStatus=%s",
+                fullType, tostring(data.finalRarityTier), tostring(data.clothingMechanicalTierBeforeCap),
+                tostring(data.clothingMechanicalValue), tostring(data.clothingMechanicalValueStatus)
+            ))
+        else
+            ItemRarityUtils.warn("Validation target missing: " .. fullType)
+        end
+    end
+end
+
 local function runFullScan(source, force)
     if ItemRarityScanner.isScanning then
         ItemRarityUtils.warn("Scan request ignored: a scan is already running.")
@@ -396,6 +446,7 @@ local function runFullScan(source, force)
     if counters.malformedEntries > 0 then ItemRarityUtils.warn("Skipped " .. counters.malformedEntries .. " malformed item/weight pairs.") end
     ItemRarityRegistryPublisher.publish(ItemRarityScanner.results)
     ItemRarityUtils.info("registry republished")
+    if force then logMechanicalValueValidation(ItemRarityScanner.results) end
     if ItemRarityConfig.devReportsEnabled then
         require "ItemRarity/Diagnostics/RuntimeDiagnosticReport"
         ItemRarityUtilityCalculator.writeReports(ItemRarityScanner.results)
@@ -422,5 +473,11 @@ function ItemRarityScanner.scan(source)
 end
 
 function ItemRarityScanner.rescan(source)
-    return runFullScan(source or "manual", true)
+    local results = runFullScan(source or "manual", true)
+    -- Temporary forensic capture for baseline-regression investigation. The
+    -- writer is read-only and runs after the completed pipeline/signature.
+    if ItemRarityRegistrySnapshot and ItemRarityRegistrySnapshot.write then
+        ItemRarityRegistrySnapshot.write("CURRENT")
+    end
+    return results
 end
