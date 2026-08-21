@@ -354,6 +354,25 @@ local function logMechanicalValueValidation(results)
             ))
         end
     end
+    local medical = { known = 0, partial = 0, promoted = 0 }
+    for _, data in pairs(results) do
+        if data.utilityKind == "MEDICAL" then
+            if data.medicalValueStatus == "MECHANICAL_VALUE_KNOWN" then medical.known = medical.known + 1 end
+            if data.medicalValueStatus == "MECHANICAL_VALUE_PARTIAL" then medical.partial = medical.partial + 1 end
+            if data.finalRarityTier ~= data.baseScarcityTier then medical.promoted = medical.promoted + 1 end
+        end
+    end
+    ItemRarityUtils.info(string.format("MedicalUtility V1 | known=%d | partial=%d | tier-changed=%d | effect=90%% uses=10%% weight=0%%", medical.known, medical.partial, medical.promoted))
+    for _, fullType in ipairs({ "Base.Antibiotics", "Base.Marigold", "Base.Bandage", "Base.Bandaid", "Base.RippedSheets", "Base.AlcoholWipes", "Base.BlackSageDried", "Base.CommonMallowDried", "Base.LemonGrass", "Base.GingerRoot" }) do
+        local data = results[fullType]
+        if data then
+            ItemRarityUtils.info(string.format(
+                "Medical validation %s | group=%s | Scarcity=%s | Utility=%s | percentile=%s | confidence=%s | before=%s | after=%s",
+                fullType, tostring(data.utilitySubgroup), tostring(data.baseScarcityTier), tostring(data.utility), tostring(data.utilityPercentile),
+                tostring(data.utilityConfidence), tostring(data.baseScarcityTier), tostring(data.finalRarityTier)
+            ))
+        end
+    end
 end
 
 local function runFullScan(source, force)

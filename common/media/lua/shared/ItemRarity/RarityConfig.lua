@@ -136,4 +136,16 @@ ItemRarityConfig.utility = {
         coverage = { minimumFactor = 0.70, maximumFactor = 1.00 },
         essential = { "biteDefense", "scratchDefense", "bulletDefense", "coverageEvidenceCount", "weight", "durability", "runSpeedModifier", "combatSpeedModifier", "insulation", "windResistance", "waterResistance" },
     },
+
+    -- MedicalUtility V1 compares only treatments for the same medical
+    -- problem. Efficacy dominates; real uses are secondary. Weight remains
+    -- diagnostic-only because its gameplay cost is contextual for medicine.
+    medical = {
+        utilityVersion = "V1_EFFECT_90_USES_10",
+        efficacyWeight = 0.90,
+        usesWeight = 0.10,
+        weightWeight = 0.00,
+        mediumConfidenceProfiles = 2,
+        highConfidenceProfiles = 8,
+    },
 }

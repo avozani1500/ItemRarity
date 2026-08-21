@@ -568,6 +568,92 @@ local function makeAccessoryMechanicalCandidate(data, scriptItem)
     }
 end
 
+-- Medical discovery deliberately crosses original item categories: B42 puts
+-- antibiotics and several herbs under base:food, while clean bandage inputs
+-- can remain material/household.  Functional effect fields, not names or
+-- modules, decide whether an item belongs to this Utility universe.
+local function makeMedicalCandidate(data, scriptItem)
+    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
+    if not ok then runtimeItem = nil end
+    local displayCategory = string.lower(tostring(data.displayCategory or readString(scriptItem, "getDisplayCategory", "displayCategory") or ""))
+    local tags = string.lower(tostring(readString(scriptItem, "getTags", "tags") or ""))
+    local itemType = string.lower(tostring(readString(scriptItem, "getItemType", "itemType") or ""))
+    local metrics = {
+        bandagePower = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getBandagePower", "bandagePower"),
+        alcoholPower = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getAlcoholPower", "alcoholPower"),
+        reduceInfectionPower = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getReduceInfectionPower", "reduceInfectionPower"),
+        painReduction = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getPainReduction", "painReduction")
+            or readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getPainChange", "painReduction"),
+        fluReduction = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getFluReduction", "fluReduction"),
+        feverReduction = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getFeverReduction", "feverReduction")
+            or readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getReduceFever", "feverReduction"),
+        foodSicknessChange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getFoodSicknessChange", "foodSicknessChange"),
+        useDelta = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getUseDelta", "useDelta"),
+        weight = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getActualWeight", "actualWeight"),
+    }
+    local canBandage = readBoolean(runtimeItem, "isCanBandage", "canBandage") or readBoolean(scriptItem, "isCanBandage", "canBandage")
+    local hasNumericEffect = (metrics.bandagePower or 0) > 0 or (metrics.alcoholPower or 0) > 0
+        or (metrics.reduceInfectionPower or 0) > 0 or (metrics.painReduction or 0) ~= 0
+        or (metrics.fluReduction or 0) ~= 0 or (metrics.feverReduction or 0) ~= 0
+        or (metrics.foodSicknessChange or 0) < 0
+    local procedure = contains(tags, "removebullet") or contains(tags, "removeglass") or contains(tags, "tweezers")
+    local unpackRecipe = readString(scriptItem, "getDoubleClickRecipe", "doubleClickRecipe")
+    local hasOnEat = readField(scriptItem, "onEat") ~= nil or callMethod(scriptItem, "getOnEat") ~= nil
+    local firstAid = displayCategory == "firstaid"
+    local declaredMedical = data.category == "MEDICAL" or firstAid
+    if not declaredMedical and not canBandage and not hasNumericEffect and not procedure then return nil end
+
+    local subgroup, dominantEffect
+    if canBandage or (metrics.bandagePower or 0) > 0 then
+        subgroup, dominantEffect = "WOUND_TREATMENT", metrics.bandagePower or 0
+    elseif (metrics.alcoholPower or 0) > 0 then
+        subgroup, dominantEffect = "DISINFECTION", metrics.alcoholPower or 0
+    elseif (metrics.reduceInfectionPower or 0) > 0 then
+        subgroup, dominantEffect = "INFECTION_TREATMENT", metrics.reduceInfectionPower or 0
+    elseif (metrics.painReduction or 0) ~= 0 then
+        subgroup, dominantEffect = "PAIN_MEDICINE", math.abs(metrics.painReduction or 0)
+    elseif (metrics.fluReduction or 0) ~= 0 or (metrics.feverReduction or 0) ~= 0 then
+        subgroup, dominantEffect = "FEVER_TREATMENT", math.abs(metrics.fluReduction or 0) + math.abs(metrics.feverReduction or 0)
+    elseif (metrics.foodSicknessChange or 0) < 0 then
+        subgroup, dominantEffect = "TOXIN_TREATMENT", math.abs(metrics.foodSicknessChange or 0)
+    elseif procedure then
+        subgroup = "PROCEDURE_TOOL"
+    elseif unpackRecipe then
+        subgroup = "MEDICAL_SUPPLY"
+    else
+        subgroup = "SPECIAL_MEDICAL"
+    end
+    local isDrainable = contains(itemType, "drainable")
+    local uses = 1
+    if isDrainable and metrics.useDelta and metrics.useDelta > 0 and metrics.useDelta <= 1 then uses = math.max(1, math.floor(1 / metrics.useDelta + .5)) end
+    local knownGroups = { WOUND_TREATMENT=true, INFECTION_TREATMENT=true, DISINFECTION=true, PAIN_MEDICINE=true, FEVER_TREATMENT=true, TOXIN_TREATMENT=true }
+    local known = knownGroups[subgroup] == true and dominantEffect ~= nil
+    local status = known and "MECHANICAL_VALUE_KNOWN" or "MECHANICAL_VALUE_PARTIAL"
+    return {
+        data = data,
+        kind = "MEDICAL",
+        subgroup = subgroup,
+        functionalGroup = subgroup,
+        parentGroup = "MEDICAL",
+        metrics = metrics,
+        medicalDominantEffect = dominantEffect,
+        medicalUses = uses,
+        medicalValueStatus = status,
+        medicalDeclared = declaredMedical,
+        medicalProcedure = procedure,
+        medicalUnpackRecipe = unpackRecipe,
+        medicalOnEat = hasOnEat,
+        -- Weight intentionally does not belong to this V1 mechanical profile
+        -- or score. Two treatments with identical effect/uses are comparable
+        -- regardless of contextual carry weight.
+        profile = table.concat({ subgroup, tostring(dominantEffect), tostring(uses), tostring(canBandage), tostring(status) }, ":"),
+        utilityEligible = known,
+        ineligibleReason = known and nil or "MedicalUtility V1 PARTIAL: effect exists but is not safely quantified",
+        config = UTILITY.medical,
+        directions = { dominantEffect=false, uses=false },
+    }
+end
+
 local function makeContainerCandidate(data, scriptItem)
     -- The temporary object is never put into an inventory and is never
     -- transmitted. It exists only long enough to read the B42 runtime API.
@@ -675,6 +761,8 @@ local function candidateFor(data)
     if not scriptItem then
         return { data = data, utilityEligible = false, ineligibleReason = "ScriptItem is unavailable" }
     end
+    local medical = makeMedicalCandidate(data, scriptItem)
+    if medical then return medical end
     if data.category == "CONTAINER" then return makeContainerCandidate(data, scriptItem) end
     if data.category == "CLOTHING" then return makeClothingDiscoveryCandidate(data, scriptItem) end
     if data.category == "ACCESSORY" or string.lower(tostring(data.displayCategory or "")) == "accessory" then
@@ -1298,8 +1386,69 @@ local function scoreClothingDirectSlotV1(candidates)
     for _, candidate in ipairs(candidates) do if candidate.clothingUtilityCandidate then candidate.clothingBalancedThresholds = balanced end end
 end
 
+-- Active MedicalUtility V1.  Each functional treatment problem owns an
+-- isolated reference population. Effect is deliberately dominant and real
+-- drainable uses are a minor secondary signal; weight is diagnostic-only.
+local function scoreMedicalUtility(candidates)
+    local grouped = {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "MEDICAL" and candidate.utilityEligible then
+            grouped[candidate.subgroup] = grouped[candidate.subgroup] or {}
+            table.insert(grouped[candidate.subgroup], candidate)
+        end
+    end
+    for subgroup, members in pairs(grouped) do
+        local representatives, effects, uses = {}, {}, {}
+        for _, candidate in ipairs(members) do
+            if not representatives[candidate.profile] then
+                representatives[candidate.profile] = candidate
+                table.insert(effects, candidate.medicalDominantEffect)
+                table.insert(uses, candidate.medicalUses)
+            end
+        end
+        -- Keep one representative per mechanical profile, but retain tied
+        -- values from different profiles.  This is the same percentile
+        -- treatment used by the approved Medical V1 diagnostic: three
+        -- distinct wound profiles at BandagePower=2 occupy their real shared
+        -- position instead of being collapsed into one artificial value.
+        effects, uses = sortedCopy(effects), sortedCopy(uses)
+        local profileCount = 0
+        for _ in pairs(representatives) do profileCount = profileCount + 1 end
+        local confidence = profileCount >= UTILITY.medical.highConfidenceProfiles and "HIGH"
+            or (profileCount >= UTILITY.medical.mediumConfidenceProfiles and "MEDIUM" or "LOW")
+        local scores = {}
+        for _, candidate in pairs(representatives) do
+            local effectPercentile = percentileRank(effects, candidate.medicalDominantEffect, false)
+            local usesPercentile = percentileRank(uses, candidate.medicalUses, false)
+            candidate.metricPercentiles = { dominantEffect=effectPercentile, uses=usesPercentile }
+            candidate.utility = effectPercentile * UTILITY.medical.efficacyWeight + usesPercentile * UTILITY.medical.usesWeight
+            candidate.utilityConfidence = confidence
+            candidate.profileCount = profileCount
+            candidate.validAttributeCount = 2
+            candidate.essentialsPresent = candidate.medicalDominantEffect ~= nil and candidate.medicalUses ~= nil
+            candidate.normalizationGroup = "MEDICAL:" .. subgroup
+            candidate.utilityScoreVersion = UTILITY.medical.utilityVersion
+            table.insert(scores, candidate.utility)
+        end
+        scores = sortedCopy(scores)
+        for _, candidate in ipairs(members) do
+            local representative = representatives[candidate.profile]
+            candidate.utility = representative.utility
+            candidate.utilityConfidence = representative.utilityConfidence
+            candidate.profileCount = representative.profileCount
+            candidate.validAttributeCount = representative.validAttributeCount
+            candidate.essentialsPresent = representative.essentialsPresent
+            candidate.metricPercentiles = representative.metricPercentiles
+            candidate.normalizationGroup = representative.normalizationGroup
+            candidate.utilityScoreVersion = representative.utilityScoreVersion
+            candidate.data.utilityPercentile = percentileRank(scores, candidate.utility, false)
+        end
+    end
+end
+
 local function utilitySupportStatus(candidate)
     if candidate.utilitySupport then return candidate.utilitySupport end
+    if candidate.kind == "MEDICAL" and candidate.medicalValueStatus == "MECHANICAL_VALUE_PARTIAL" then return "UTILITY_PARTIAL" end
     if candidate.clothingUtilityCandidate then
         if candidate.utility == nil or candidate.utilityConfidence == "LOW" then return "UTILITY_LOW_CONFIDENCE" end
         return "UTILITY_SUPPORTED"
@@ -1352,6 +1501,13 @@ local function publishCandidateFields(candidates)
         data.accessoryMechanicalDurabilityFactor = candidate.accessoryMechanicalDurabilityFactor
         data.accessoryMechanicalFunctionalCost = candidate.accessoryMechanicalFunctionalCost
         data.accessoryMechanicalSpecialReason = candidate.accessoryMechanicalSpecialReason
+        data.medicalValueStatus = candidate.medicalValueStatus
+        data.medicalDominantEffect = candidate.medicalDominantEffect
+        data.medicalUses = candidate.medicalUses
+        data.medicalDeclared = candidate.medicalDeclared
+        data.medicalProcedure = candidate.medicalProcedure
+        data.medicalUnpackRecipe = candidate.medicalUnpackRecipe
+        data.medicalOnEat = candidate.medicalOnEat
     end
 end
 
@@ -1403,6 +1559,13 @@ local function applyTierAdjustment(data, candidate)
     -- name/module exception.
     if not candidate.utilityEligible or candidate.utility == nil
         or not confidenceAtLeast(candidate.utilityConfidence, UTILITY.minimumConfidenceForAdjustment) then
+        -- Medical PARTIAL means the item has a real medical/procedure/supply
+        -- role that this V1 cannot quantify safely. It is intentionally not
+        -- promoted, but it also receives no automatic visual cap.
+        if candidate.kind == "MEDICAL" and candidate.medicalValueStatus == "MECHANICAL_VALUE_PARTIAL" then
+            data.utilityAdjustmentReason = "MedicalUtility V1 PARTIAL: no quantified promotion and no automatic cap"
+            return
+        end
         if data.baseScarcityTier == "EPIC" or data.baseScarcityTier == "EXOTIC" then data.finalRarityTier = "RARE" end
         data.utilityAdjustmentReason = "no eligible/reliable Utility; visual ceiling RARE"
         if candidate.kind == "CLOTHING" then
@@ -1464,6 +1627,13 @@ local function applyTierAdjustment(data, candidate)
         local tier, reason = matrixTierFromAxes(data, data.utilityPercentile, { p70=70, p80=80, p90=90, p95=95 })
         data.finalRarityTier = tier
         data.utilityAdjustmentReason = reason
+        return
+    end
+
+    if candidate.kind == "MEDICAL" then
+        local tier, reason = matrixTierFromAxes(data, data.utilityPercentile, { p70=70, p80=80, p90=90, p95=95 })
+        data.finalRarityTier = tier
+        data.utilityAdjustmentReason = "MedicalUtility V1 (effect 90%, real uses 10%, no weight): " .. reason
         return
     end
 
@@ -2075,6 +2245,7 @@ function ItemRarityUtilityCalculator.calculate(results)
     scoreMeleeV2(candidates)
     scoreClothingUtility(candidates)
     scoreClothingDirectSlotV1(candidates)
+    scoreMedicalUtility(candidates)
     assignClothingMechanicalValueStatus(candidates)
     assignAccessoryMechanicalValueStatus(candidates)
     publishCandidateFields(candidates)

@@ -14,6 +14,7 @@ ItemRarityClothingMechanicalValueReport = ItemRarityClothingMechanicalValueRepor
 local function reloadActivePipelineForDevelopment()
     if not reloadLuaFile or (ItemRarityScanner and ItemRarityScanner.isScanning) then return false end
     local files = {
+        "media/lua/shared/ItemRarity/RarityConfig.lua",
         "media/lua/server/ItemRarity/UtilityCalculator.lua",
         "media/lua/server/ItemRarity/RarityRegistryPublisher.lua",
         "media/lua/server/ItemRarity/RarityScanner.lua",
@@ -334,7 +335,201 @@ local function writeTrivialPolicySimulation(results)
     ItemRarityUtils.info("Trivial wearable policy simulation written: Policy2="..p2Changed.." changes; Policy3 U->C="..p3Transitions.uncommonToCommon..", R->U="..p3Transitions.rareToUncommon.."; KNOWN/PARTIAL changed="..knownPartialChanged)
 end
 
+-- MEDICAL discovery is deliberately report-only.  It is colocated with this
+-- hot-reloadable diagnostic because an already-open B42 world does not index
+-- newly added server Lua files.  None of these fields flow into Utility,
+-- FinalRarityTier, the registry, or its deterministic signature.
+local function writeMedicalRuntimeAudit(results)
+    if type(results) ~= "table" or not getFileWriter then return end
+    local manager = getScriptManager and getScriptManager() or nil
+    local function metric(runtime, script, getters, member)
+        for _, getter in ipairs(getters) do
+            local v = tonumber(call(runtime, getter))
+            if v == nil then v = tonumber(call(script, getter)) end
+            if v ~= nil then return v end
+        end
+        return tonumber(field(script, member))
+    end
+    local function boolMetric(runtime, script, getters, member)
+        for _, getter in ipairs(getters) do
+            local v = call(runtime, getter)
+            if v == nil then v = call(script, getter) end
+            if v ~= nil then return v == true end
+        end
+        local v = field(script, member)
+        return v == true
+    end
+    local function groupFor(m, tags, hasOnEat, unpackRecipe)
+        if m.canBandage or (m.bandagePower or 0) > 0 then return "WOUND_TREATMENT", "BandagePower/CanBandage" end
+        if (m.alcoholPower or 0) > 0 then return "DISINFECTION", "AlcoholPower" end
+        if (m.reduceInfectionPower or 0) > 0 then return "INFECTION_TREATMENT", "ReduceInfectionPower" end
+        if (m.painReduction or 0) ~= 0 then return "PAIN_MEDICINE", "PainReduction" end
+        if (m.fluReduction or 0) ~= 0 or (m.feverReduction or 0) ~= 0 then return "FEVER_TREATMENT", "Flu/Fever reduction" end
+        if (m.foodSicknessChange or 0) < 0 then return "TOXIN_TREATMENT", "FoodSicknessChange" end
+        if string.find(tags, "removebullet", 1, true) or string.find(tags, "removeglass", 1, true) or string.find(tags, "tweezers", 1, true) then return "PROCEDURE_TOOL", "procedure tag" end
+        if unpackRecipe then return "MEDICAL_SUPPLY", "unpack recipe" end
+        if hasOnEat then return "SPECIAL_MEDICAL", "OnEat behavior" end
+        return "SPECIAL_MEDICAL", "Medical/FirstAid classification without quantified effect"
+    end
+    local function usesFor(m, isDrainable)
+        -- InventoryItem exposes a default UseDelta even for normal items. It
+        -- must not turn an ordinary Bandage into a fictional 32-use item.
+        if not isDrainable then return 1 end
+        if m.useDelta and m.useDelta > 0 and m.useDelta <= 1 then return math.max(1, math.floor((1 / m.useDelta) + .5)) end
+        return 1
+    end
+    local function scoreFor(group, m, uses)
+        local weight = math.max(.01, m.weight or 1)
+        if group == "WOUND_TREATMENT" then return ((m.bandagePower or 0) * uses) / weight end
+        if group == "DISINFECTION" then return ((m.alcoholPower or 0) * uses) / weight end
+        if group == "INFECTION_TREATMENT" then return ((m.reduceInfectionPower or 0) * uses) / weight end
+        if group == "PAIN_MEDICINE" then return (math.abs(m.painReduction or 0) * uses) / weight end
+        if group == "FEVER_TREATMENT" then return ((math.abs(m.fluReduction or 0) + math.abs(m.feverReduction or 0)) * uses) / weight end
+        if group == "TOXIN_TREATMENT" then return (math.abs(m.foodSicknessChange or 0) * uses) / weight end
+        return nil
+    end
+    local function dominantEffect(group, m)
+        if group == "WOUND_TREATMENT" then return m.bandagePower end
+        if group == "DISINFECTION" then return m.alcoholPower end
+        if group == "INFECTION_TREATMENT" then return m.reduceInfectionPower end
+        if group == "PAIN_MEDICINE" then return math.abs(m.painReduction or 0) end
+        if group == "FEVER_TREATMENT" then return math.abs(m.fluReduction or 0) + math.abs(m.feverReduction or 0) end
+        if group == "TOXIN_TREATMENT" then return math.abs(m.foodSicknessChange or 0) end
+        return nil
+    end
+    local function percentileIn(values, value)
+        if #values == 0 or value == nil then return nil end
+        if #values == 1 then return 50 end
+        local below, equal = 0, 0
+        for _, v in ipairs(values) do
+            if v < value then below = below + 1 elseif v == value then equal = equal + 1 end
+        end
+        return clamp(((below + (equal - 1) * .5) / (#values - 1)) * 100, 0, 100)
+    end
+    local records, profiles, groups = {}, {}, {}
+    for _, data in pairs(results) do
+        local script = manager and manager:FindItem(data.fullType) or nil
+        if script then
+            local ok, runtime = pcall(function() return script:InstanceItem(nil, false) end)
+            if not ok then runtime = nil end
+            local tags = lower(call(script, "getTags") or field(script, "tags") or "")
+            local display = tostring(data.displayCategory or call(script, "getDisplayCategory") or "")
+            local scriptItemType = lower(call(script, "getItemType") or field(script, "itemType") or "")
+            local isDrainable = string.find(scriptItemType, "drainable", 1, true) ~= nil
+            local medical = boolMetric(runtime, script, { "isMedical", "getMedical" }, "medical")
+            local m = {
+                canBandage = boolMetric(runtime, script, { "isCanBandage", "getCanBandage" }, "canBandage"),
+                bandagePower = metric(runtime, script, { "getBandagePower" }, "bandagePower"),
+                alcoholPower = metric(runtime, script, { "getAlcoholPower" }, "alcoholPower"),
+                reduceInfectionPower = metric(runtime, script, { "getReduceInfectionPower" }, "reduceInfectionPower"),
+                painReduction = metric(runtime, script, { "getPainReduction", "getPainChange" }, "painReduction"),
+                fluReduction = metric(runtime, script, { "getFluReduction" }, "fluReduction"),
+                feverReduction = metric(runtime, script, { "getFeverReduction", "getReduceFever" }, "feverReduction"),
+                foodSicknessChange = metric(runtime, script, { "getFoodSicknessChange" }, "foodSicknessChange"),
+                fatigueChange = metric(runtime, script, { "getFatigueChange" }, "fatigueChange"),
+                stressChange = metric(runtime, script, { "getStressChange" }, "stressChange"),
+                unhappyChange = metric(runtime, script, { "getUnhappyChange" }, "unhappyChange"),
+                useDelta = metric(runtime, script, { "getUseDelta" }, "useDelta"),
+                uses = metric(runtime, script, { "getUses" }, "uses"),
+                count = metric(runtime, script, { "getCount" }, "count"),
+                weight = metric(runtime, script, { "getActualWeight", "getWeight" }, "actualWeight"),
+            }
+            local hasOnEat = (field(script, "onEat") or call(script, "getOnEat")) ~= nil
+            local unpackRecipe = field(script, "doubleClickRecipe") or call(script, "getDoubleClickRecipe")
+            local hasNumericEffect = (m.bandagePower or 0) > 0 or (m.alcoholPower or 0) > 0 or (m.reduceInfectionPower or 0) > 0
+                or (m.painReduction or 0) ~= 0 or (m.fluReduction or 0) ~= 0 or (m.feverReduction or 0) ~= 0 or (m.foodSicknessChange or 0) < 0
+            local firstAid = lower(display) == "firstaid"
+            local procedureTag = string.find(tags, "removebullet", 1, true) or string.find(tags, "removeglass", 1, true) or string.find(tags, "tweezers", 1, true)
+            if medical or firstAid or m.canBandage or hasNumericEffect or procedureTag then
+                local group, reason = groupFor(m, tags, hasOnEat, unpackRecipe)
+                local uses = usesFor(m, isDrainable)
+                local partial = not hasNumericEffect and (hasOnEat or procedureTag or unpackRecipe or medical or firstAid)
+                local status = hasNumericEffect and "MECHANICAL_VALUE_KNOWN" or (partial and "MECHANICAL_VALUE_PARTIAL" or "UTILITY_UNSUPPORTED")
+                local profile = table.concat({ group, tostring(m.canBandage), tostring(m.bandagePower), tostring(m.alcoholPower), tostring(m.reduceInfectionPower), tostring(m.painReduction), tostring(m.fluReduction), tostring(m.feverReduction), tostring(m.foodSicknessChange), tostring(m.fatigueChange), tostring(m.useDelta), tostring(uses), tostring(m.weight), tostring(tags), tostring(hasOnEat), tostring(unpackRecipe) }, ":")
+                local record = { data=data, script=script, display=display, scriptItemType=scriptItemType, isDrainable=isDrainable, medical=medical, tags=tags, m=m, uses=uses, group=group, groupReason=reason, status=status, hasOnEat=hasOnEat, unpackRecipe=unpackRecipe, profile=profile }
+                record.score = scoreFor(group, m, uses)
+                record.effect = dominantEffect(group, m)
+                table.insert(records, record); profiles[profile] = profiles[profile] or {}; table.insert(profiles[profile], record)
+                groups[group] = groups[group] or {}; table.insert(groups[group], record)
+            end
+        end
+    end
+    table.sort(records, function(a,b) return a.data.fullType < b.data.fullType end)
+    local counts = { MECHANICAL_VALUE_KNOWN=0, MECHANICAL_VALUE_PARTIAL=0, UTILITY_UNSUPPORTED=0 }
+    for _, r in ipairs(records) do counts[r.status] = counts[r.status] + 1 end
+    for _, list in pairs(groups) do
+        table.sort(list, function(a,b)
+            local as, bs = a.score or -1, b.score or -1
+            return as == bs and a.data.fullType < b.data.fullType or as > bs
+        end)
+    end
+    -- MedicalUtility V1 candidates: efficacy dominates, uses are secondary,
+    -- and weight deliberately has zero influence.  Normalize within function
+    -- after deduplicating mechanical profiles, never across medical problems.
+    local utilityModels = {}
+    for group, list in pairs(groups) do
+        local byProfile, profilesForGroup = {}, {}
+        for _, r in ipairs(list) do
+            if r.status == "MECHANICAL_VALUE_KNOWN" and r.effect ~= nil and not byProfile[r.profile] then
+                byProfile[r.profile] = r; table.insert(profilesForGroup, r)
+            end
+        end
+        local effects, uses = {}, {}
+        for _, r in ipairs(profilesForGroup) do table.insert(effects, r.effect); table.insert(uses, r.uses) end
+        table.sort(effects); table.sort(uses)
+        local rows = {}
+        for _, r in ipairs(list) do
+            if r.status == "MECHANICAL_VALUE_KNOWN" and r.effect ~= nil then
+                local ep, up = percentileIn(effects, r.effect), percentileIn(uses, r.uses)
+                table.insert(rows, { record=r, effectPercentile=ep, usesPercentile=up, modelA=.90 * ep + .10 * up, modelB=.80 * ep + .20 * up })
+            end
+        end
+        table.sort(rows, function(a,b) return a.modelA == b.modelA and a.record.data.fullType < b.record.data.fullType or a.modelA > b.modelA end)
+        if #rows > 0 then utilityModels[group] = { profiles=#profilesForGroup, rows=rows } end
+    end
+    local unique = 0; for _ in pairs(profiles) do unique = unique + 1 end
+    local writer = getFileWriter("ItemRarity_MedicalRuntimeAudit.txt", true, false); if not writer then return end
+    writer:write("Item Rarity MEDICAL runtime audit (REPORT ONLY)\n")
+    writer:write("No Utility, FinalRarityTier, registry, UI, or signature field is changed. Candidate detection uses runtime/script Medical, FirstAid display category, medical effects, and procedure tags; never names/fullTypes.\n")
+    writer:write("KNOWN = a quantified medical effect is available. PARTIAL = medical/procedure/OnEat/unpack behavior exists but its effect is not quantified safely. UNSUPPORTED = no usable effect evidence. Scores are preliminary within-function efficiency (effect x real drainable uses / weight), not a tier model. B42 ScriptItem exposes vanilla Medical as false through this Lua bridge, so FirstAid/effect/tag evidence is the reliable detector.\n\n")
+    writer:write(string.format("ITEMS=%d | UNIQUE_MECHANICAL_PROFILES=%d | KNOWN=%d | PARTIAL=%d | UNSUPPORTED=%d\n\n", #records, unique, counts.MECHANICAL_VALUE_KNOWN, counts.MECHANICAL_VALUE_PARTIAL, counts.UTILITY_UNSUPPORTED))
+    writer:write("FUNCTIONAL GROUPS / PRELIMINARY RANKING\n")
+    local orderedGroups={}; for group in pairs(groups) do table.insert(orderedGroups, group) end; table.sort(orderedGroups)
+    for _, group in ipairs(orderedGroups) do
+        local list, uniqueProfiles = groups[group], {}; for _,r in ipairs(list) do uniqueProfiles[r.profile]=true end
+        local profileCount=0; for _ in pairs(uniqueProfiles) do profileCount=profileCount+1 end
+        writer:write(string.format("\n[%s] items=%d | unique_profiles=%d\nrank | fullType | score | uses | weight | status | effect reason\n",group,#list,profileCount))
+        for index,r in ipairs(list) do writer:write(string.format("%d | %s | %s | %d | %s | %s | %s\n",index,r.data.fullType,number(r.score),r.uses,number(r.m.weight),r.status,r.groupReason)) end
+    end
+    writer:write("\nMEDICALUTILITY V1 SIMULATION (NO WEIGHT)\n")
+    writer:write("A = 90% dominant efficacy + 10% real uses; B = 80% dominant efficacy + 20% real uses. Both components are percentile-normalized only inside the same functional group, after mechanical-profile deduplication. This section is not active.\n")
+    for _, group in ipairs(orderedGroups) do
+        local model = utilityModels[group]
+        if model then
+            writer:write(string.format("\n[%s] unique_known_profiles=%d\nrank A | fullType | dominant effect | effect pctl | uses | uses pctl | Model A | Model B\n", group, model.profiles))
+            for index, row in ipairs(model.rows) do
+                writer:write(string.format("%d | %s | %s | %s | %d | %s | %s | %s\n", index, row.record.data.fullType, number(row.record.effect), number(row.effectPercentile), row.record.uses, number(row.usesPercentile), number(row.modelA), number(row.modelB)))
+            end
+        end
+    end
+    writer:write("\nALL MEDICAL CANDIDATES\nfullType | original category | DisplayCategory | ScriptItemType | drainable | Medical bridge | functional group | status | BandagePower | CanBandage | AlcoholPower | ReduceInfectionPower | PainReduction | FluReduction | FeverReduction | FoodSicknessChange | FatigueChange | uses | UseDelta | weight | tags | OnEat | unpack | ScarcityTier | ScarcityPercentile | preliminary score\n")
+    for _,r in ipairs(records) do
+        local d,m=r.data,r.m
+        local scarcity = d.baseScarcityTier or d.rarityTier or "N/A"
+        local p = d.scarcityPercentile or (d.tableAvailability and d.tableAvailability.routeWeightedPercentile)
+        local row={d.fullType,d.category or "",r.display,r.scriptItemType,tostring(r.isDrainable),tostring(r.medical),r.group,r.status,number(m.bandagePower),tostring(m.canBandage),number(m.alcoholPower),number(m.reduceInfectionPower),number(m.painReduction),number(m.fluReduction),number(m.feverReduction),number(m.foodSicknessChange),number(m.fatigueChange),r.uses,number(m.useDelta),number(m.weight),r.tags,tostring(r.hasOnEat),tostring(r.unpackRecipe or ""),scarcity,number(p),number(r.score)}
+        for i,v in ipairs(row) do row[i]=tostring(v) end; writer:write(table.concat(row," | ").."\n")
+    end
+    writer:write("\nIDENTICAL MECHANICAL PROFILES\n")
+    local duplicateGroups={}; for _,list in pairs(profiles) do if #list>1 then table.insert(duplicateGroups,list) end end
+    table.sort(duplicateGroups,function(a,b) return a[1].profile < b[1].profile end)
+    for _,list in ipairs(duplicateGroups) do local names={}; for _,r in ipairs(list) do table.insert(names,r.data.fullType) end; table.sort(names); writer:write(table.concat(names,", ").."\n") end
+    writer:close()
+    ItemRarityUtils.info(string.format("MEDICAL runtime audit written: %d items, %d unique profiles, KNOWN=%d PARTIAL=%d UNSUPPORTED=%d.", #records, unique, counts.MECHANICAL_VALUE_KNOWN, counts.MECHANICAL_VALUE_PARTIAL, counts.UTILITY_UNSUPPORTED))
+end
+
 if reloadedActivePipelineForDevelopment and ItemRarityScanner and ItemRarityScanner.results then
     writeAccessoryMechanicalValueAudit(ItemRarityScanner.results)
     writeTrivialPolicySimulation(ItemRarityScanner.results)
+    writeMedicalRuntimeAudit(ItemRarityScanner.results)
 end
