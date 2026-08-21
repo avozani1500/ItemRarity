@@ -282,7 +282,8 @@ end
 local function logMechanicalValueValidation(results)
     local tierCounts = { COMMON = 0, UNCOMMON = 0, RARE = 0, EPIC = 0, EXOTIC = 0 }
     local trivialCount, changedCount = 0, 0
-    local transitions = { rare = 0, epic = 0, exotic = 0 }
+    local transitions = { uncommon = 0, rare = 0, epic = 0, exotic = 0 }
+    local accessory = { trivial = 0, changed = 0, uncommon = 0, rare = 0, epic = 0, exotic = 0, partial = {} }
 
     for _, data in pairs(results) do
         local tier = data.finalRarityTier
@@ -292,21 +293,41 @@ local function logMechanicalValueValidation(results)
             local beforeCap = data.clothingMechanicalTierBeforeCap
             if beforeCap and beforeCap ~= tier then
                 changedCount = changedCount + 1
+                if beforeCap == "UNCOMMON" and tier == "COMMON" then transitions.uncommon = transitions.uncommon + 1 end
                 if beforeCap == "RARE" and tier == "UNCOMMON" then transitions.rare = transitions.rare + 1 end
                 if beforeCap == "EPIC" and tier == "UNCOMMON" then transitions.epic = transitions.epic + 1 end
                 if beforeCap == "EXOTIC" and tier == "UNCOMMON" then transitions.exotic = transitions.exotic + 1 end
             end
         end
+        if data.accessoryMechanicalValueStatus == "MECHANICALLY_TRIVIAL" then
+            accessory.trivial = accessory.trivial + 1
+            local beforeCap = data.accessoryMechanicalTierBeforeCap
+            if beforeCap and beforeCap ~= tier then
+                accessory.changed = accessory.changed + 1
+                if beforeCap == "UNCOMMON" and tier == "COMMON" then accessory.uncommon = accessory.uncommon + 1 end
+                if beforeCap == "RARE" and tier == "UNCOMMON" then accessory.rare = accessory.rare + 1 end
+                if beforeCap == "EPIC" and tier == "UNCOMMON" then accessory.epic = accessory.epic + 1 end
+                if beforeCap == "EXOTIC" and tier == "UNCOMMON" then accessory.exotic = accessory.exotic + 1 end
+            end
+        elseif data.accessoryMechanicalValueStatus == "MECHANICAL_VALUE_PARTIAL" then
+            table.insert(accessory.partial, data.fullType)
+        end
     end
 
     ItemRarityUtils.info(string.format(
-        "Clothing MechanicalValue validation | trivial=%d | tier-capped=%d | RARE->UNCOMMON=%d | EPIC->UNCOMMON=%d | EXOTIC->UNCOMMON=%d | tiers C/U/R/E/X=%d/%d/%d/%d/%d",
-        trivialCount, changedCount, transitions.rare, transitions.epic, transitions.exotic,
+        "Clothing MechanicalValue Policy 3 | trivial=%d | tier-changed=%d | UNCOMMON->COMMON=%d | RARE->UNCOMMON=%d | EPIC->UNCOMMON=%d | EXOTIC->UNCOMMON=%d | tiers C/U/R/E/X=%d/%d/%d/%d/%d",
+        trivialCount, changedCount, transitions.uncommon, transitions.rare, transitions.epic, transitions.exotic,
         tierCounts.COMMON, tierCounts.UNCOMMON, tierCounts.RARE, tierCounts.EPIC, tierCounts.EXOTIC
+    ))
+    table.sort(accessory.partial)
+    ItemRarityUtils.info(string.format(
+        "Accessory MechanicalValue Policy 3 | trivial=%d | tier-changed=%d | UNCOMMON->COMMON=%d | RARE->UNCOMMON=%d | EPIC->UNCOMMON=%d | EXOTIC->UNCOMMON=%d | PARTIAL=%s",
+        accessory.trivial, accessory.changed, accessory.uncommon, accessory.rare, accessory.epic, accessory.exotic,
+        #accessory.partial > 0 and table.concat(accessory.partial, ",") or "none"
     ))
 
     local targets = {
-        "Base.Briefs_SmallTrunks_Black", "Base.Jacket_NavyBlue", "Base.Jacket_Leather",
+        "Base.Briefs_SmallTrunks_Black", "Base.Boxers_Hearts", "Base.Jacket_NavyBlue", "Base.Jacket_Leather",
         "Base.Jacket_Fireman", "Base.Shoes_WorkBoots", "Base.Cuirass_Metal",
         "Base.Vambrace_Left", "Base.Shoulderpad_Articulated_L_Metal", "Base.HazmatSuit",
         "Base.Katana", "Base.HollowBook_Handgun",
@@ -321,6 +342,16 @@ local function logMechanicalValueValidation(results)
             ))
         else
             ItemRarityUtils.warn("Validation target missing: " .. fullType)
+        end
+    end
+    for _, fullType in ipairs({ "Base.Glasses_Normal_HornRimmed", "Base.Glasses", "Base.Tie_BowTieFull", "Base.Hat_FastFood", "Base.Hat_BaseballCap_3N", "Base.Gloves_MetalArmour", "Base.GasmaskFilter", "Base.HolsterShoulder", "Base.Oxygen_Tank", "Base.RespiratorFilters" }) do
+        local data = results[fullType]
+        if data then
+            ItemRarityUtils.info(string.format(
+                "Accessory validation %s | tier=%s | beforeCap=%s | MechanicalValue=%s | MechanicalStatus=%s",
+                fullType, tostring(data.finalRarityTier), tostring(data.accessoryMechanicalTierBeforeCap),
+                tostring(data.accessoryMechanicalValue), tostring(data.accessoryMechanicalValueStatus)
+            ))
         end
     end
 end

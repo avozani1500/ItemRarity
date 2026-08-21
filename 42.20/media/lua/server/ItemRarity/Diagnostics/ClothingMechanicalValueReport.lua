@@ -12,7 +12,7 @@ ItemRarityClothingMechanicalValueReport = ItemRarityClothingMechanicalValueRepor
 -- world restart for an in-progress server-side Lua iteration.  It is never
 -- entered when this report is loaded by the normal scan/report path.
 local function reloadActivePipelineForDevelopment()
-    if not reloadLuaFile or (ItemRarityScanner and ItemRarityScanner.isScanning) then return end
+    if not reloadLuaFile or (ItemRarityScanner and ItemRarityScanner.isScanning) then return false end
     local files = {
         "media/lua/server/ItemRarity/UtilityCalculator.lua",
         "media/lua/server/ItemRarity/RarityRegistryPublisher.lua",
@@ -25,9 +25,10 @@ local function reloadActivePipelineForDevelopment()
     if ItemRarityScanner and ItemRarityScanner.rescan then
         ItemRarityScanner.rescan("development runtime reload bridge")
     end
+    return true
 end
 
-reloadActivePipelineForDevelopment()
+local reloadedActivePipelineForDevelopment = reloadActivePipelineForDevelopment()
 
 local API = ItemRarityUtilityCalculator.getClothingDiagnosticApi()
 local clamp, quantile, sortedCopy = API.clamp, API.quantile, API.sortedCopy
@@ -179,4 +180,161 @@ function ItemRarityClothingMechanicalValueReport.write(results)
     writer:write("\nRARE+ MECHANICALLY_TRIVIAL\n")
     for _,r in ipairs(records) do if r.status=="MECHANICALLY_TRIVIAL" and r.data.finalRarityTier~="COMMON" and r.data.finalRarityTier~="UNCOMMON" then writer:write(string.format("%s | %s | active=%s | Q30=%s\n",r.data.fullType,r.slot,r.data.finalRarityTier,cappedTier(r,cuts.Q30))) end end
     writer:close(); ItemRarityUtils.info("AbsoluteMechanicalValue V2 audit written to Zomboid/Lua/ItemRarity_ClothingMechanicalValue.txt (report only)."); return true
+end
+
+-- B42 does not add a new server Lua file to its already-open require index.
+-- Keep this first ACCESSORY investigation inside the allow-listed report that
+-- can be hot-reloaded.  It is read-only and does not feed UtilityCalculator.
+local function writeAccessoryMechanicalValueAudit(results)
+    if type(results) ~= "table" or not getFileWriter then return end
+    local manager = getScriptManager and getScriptManager() or nil
+    local records, profiles, values, rareTrivial = {}, {}, {}, {}
+    local function value(object, getter, member)
+        local result = tonumber(call(object, getter))
+        if result == nil then result = tonumber(field(object, member)) end
+        return result
+    end
+    for _, data in pairs(results) do
+        local item = manager and manager:FindItem(data.fullType) or nil
+        local displayCategory = lower(data.displayCategory or call(item, "getDisplayCategory"))
+        if item and (data.category == "ACCESSORY" or displayCategory == "accessory") then
+            local ok, runtime = pcall(function() return item:InstanceItem(nil, false) end)
+            if not ok then runtime = nil end
+            local blood = call(runtime, "getBloodClothingType") or call(item, "getBloodClothingType")
+                or call(runtime, "getBloodLocation") or call(item, "getBloodLocation") or field(item, "bloodLocation") or ""
+            local body = call(runtime, "getBodyLocation") or call(item, "getBodyLocation") or field(item, "bodyLocation") or ""
+            local m = {
+                bite=value(runtime,"getBiteDefense","biteDefense") or value(item,"getBiteDefense","biteDefense"),
+                scratch=value(runtime,"getScratchDefense","scratchDefense") or value(item,"getScratchDefense","scratchDefense"),
+                bullet=value(runtime,"getBulletDefense","bulletDefense") or value(item,"getBulletDefense","bulletDefense"),
+                insulation=value(runtime,"getInsulation","insulation") or value(item,"getInsulation","insulation"),
+                wind=value(runtime,"getWindResistance","windResistance") or value(item,"getWindResistance","windResistance"),
+                water=value(runtime,"getWaterResistance","waterResistance") or value(item,"getWaterResistance","waterResistance"),
+                conditionMax=value(runtime,"getConditionMax","conditionMax") or value(item,"getConditionMax","conditionMax"),
+                conditionLowerChance=value(runtime,"getConditionLowerChance","conditionLowerChance") or value(item,"getConditionLowerChance","conditionLowerChance"),
+                weight=value(runtime,"getActualWeight","actualWeight") or value(item,"getActualWeight","actualWeight"),
+                runSpeedModifier=value(runtime,"getRunSpeedModifier","runSpeedModifier") or value(item,"getRunSpeedModifier","runSpeedModifier"),
+                combatSpeedModifier=value(runtime,"getCombatSpeedModifier","combatSpeedModifier") or value(item,"getCombatSpeedModifier","combatSpeedModifier"),
+                discomfortModifier=value(runtime,"getDiscomfortModifier","discomfortModifier") or value(item,"getDiscomfortModifier","discomfortModifier"),
+                visionModifier=value(runtime,"getVisionModifier","visionModifier") or value(item,"getVisionModifier","visionModifier"),
+                hearingModifier=value(runtime,"getHearingModifier","hearingModifier") or value(item,"getHearingModifier","hearingModifier"),
+            }
+            if m.wind == nil then m.wind=value(runtime,"getWindresistance","windresistance") or value(item,"getWindresistance","windresistance") end
+            local tags = tostring(call(item,"getTags") or field(item,"tags") or "")
+            local activated = field(item,"activatedItem") == true or call(item,"isActivatedItem") == true
+            local keep = field(item,"keepOnDeplete") == true or call(item,"isKeepOnDeplete") == true
+            local special = activated or keep or string.find(lower(tags),"scba",1,true) ~= nil or string.find(lower(tags),"hazmat",1,true) ~= nil
+            local zones, seen = 0, {}
+            for token in string.gmatch(lower(blood), "[^;,%s]+") do seen[token]=true end
+            for _ in pairs(seen) do zones=zones+1 end
+            local coverage = zones == 0 and 0 or (.70 + .30 * math.min(1,zones/3))
+            local protection = ((m.bite or 0)*.50 + (m.scratch or 0)*.35 + (m.bullet or 0)*.15) * coverage
+            local weather = ((m.insulation or 0)*.40 + (m.wind or 0)*.35 + (m.water or 0)*.25) * 100
+            local baseBenefit = protection*.85 + weather*.15
+            local durabilitySignal = m.conditionMax and m.conditionLowerChance and math.log(1+math.max(0,m.conditionMax)*math.max(0,m.conditionLowerChance)) or 0
+            local durabilityFactor = .75 + .25 * math.min(1,durabilitySignal/6)
+            local cost = functionalCost({ runSpeedModifier=m.runSpeedModifier, combatSpeedModifier=m.combatSpeedModifier, discomfortModifier=m.discomfortModifier, visionModifier=m.visionModifier, hearingModifier=m.hearingModifier },50)
+            local coreKnown = m.bite ~= nil and m.scratch ~= nil and m.bullet ~= nil and m.insulation ~= nil and m.wind ~= nil and m.water ~= nil
+            local status = special and "MECHANICAL_VALUE_PARTIAL" or (not coreKnown and "MECHANICAL_VALUE_PARTIAL" or (baseBenefit <= .01 and "MECHANICALLY_TRIVIAL" or "MECHANICAL_VALUE_KNOWN"))
+            local profile = table.concat({tostring(body),tostring(blood),tostring(m.bite),tostring(m.scratch),tostring(m.bullet),tostring(m.insulation),tostring(m.wind),tostring(m.water),tostring(m.conditionMax),tostring(m.conditionLowerChance),tostring(m.weight),tostring(m.runSpeedModifier),tostring(m.combatSpeedModifier),tostring(m.discomfortModifier),tostring(m.visionModifier),tostring(m.hearingModifier)},":")
+            local record = { data=data, body=body, blood=blood, tags=tags, m=m, zones=zones, protection=protection, weather=weather, baseBenefit=baseBenefit, durabilityFactor=durabilityFactor, cost=cost, mechanicalValue=math.max(0,baseBenefit*durabilityFactor-cost), status=status, profile=profile, special=special }
+            table.insert(records,record); profiles[profile]=profiles[profile] or {}; table.insert(profiles[profile],record)
+        end
+    end
+    table.sort(records,function(a,b) return a.data.fullType < b.data.fullType end)
+    local statusCounts={MECHANICALLY_TRIVIAL=0,MECHANICAL_VALUE_KNOWN=0,MECHANICAL_VALUE_PARTIAL=0}
+    for _,record in ipairs(records) do
+        statusCounts[record.status]=statusCounts[record.status]+1
+        if #profiles[record.profile] == 1 then table.insert(values,record.mechanicalValue) end
+        if record.status == "MECHANICALLY_TRIVIAL" and (record.data.finalRarityTier == "RARE" or record.data.finalRarityTier == "EPIC" or record.data.finalRarityTier == "EXOTIC") then table.insert(rareTrivial,record) end
+    end
+    values=sortedCopy(values)
+    local writer=getFileWriter("ItemRarity_AccessoryMechanicalValue.txt",true,false); if not writer then return end
+    writer:write("Item Rarity ACCESSORY MechanicalValue audit (REPORT ONLY)\nNo active tier, Utility, registry, classifier, or UI field changed. ACCESSORY uses runtime/script DisplayCategory=Accessory, never name/fullType.\n")
+    writer:write("MechanicalValue is an investigation metric only: defensive/weather benefit modulated by durability, minus intrinsic functional cost. Durability cannot create benefit on its own. TRIVIAL=known zero benefit; KNOWN=measured benefit; PARTIAL=special behavior or incomplete core fields.\n\n")
+    writer:write(string.format("ITEMS=%d | UNIQUE_PROFILES=%d | TRIVIAL=%d | KNOWN=%d | PARTIAL=%d | value min/p25/p50/p75/p95/max=%s/%s/%s/%s/%s/%s\n\n",#records,#values,statusCounts.MECHANICALLY_TRIVIAL,statusCounts.MECHANICAL_VALUE_KNOWN,statusCounts.MECHANICAL_VALUE_PARTIAL,number(quantile(values,0)),number(quantile(values,25)),number(quantile(values,50)),number(quantile(values,75)),number(quantile(values,95)),number(quantile(values,100))))
+    writer:write("RARE+ MECHANICALLY_TRIVIAL\nfullType | tier | occurrences | distributions | BodyLocation | BloodLocation | tags\n")
+    for _,r in ipairs(rareTrivial) do
+        writer:write(tostring(r.data.fullType).." | "..tostring(r.data.finalRarityTier).." | "..tostring(r.data.occurrences or 0).." | "..tostring(#(r.data.distributions or {})).." | "..tostring(r.body).." | "..tostring(r.blood).." | "..tostring(r.tags).."\n")
+    end
+    writer:write("\nIDENTICAL MECHANICAL PROFILES\n")
+    for _,group in pairs(profiles) do if #group > 1 then local names={}; for _,r in ipairs(group) do table.insert(names,r.data.fullType.."("..r.data.finalRarityTier..")") end; table.sort(names); writer:write(table.concat(names,", ").."\n") end end
+    writer:write("\nALL ACCESSORIES\nfullType | tier | occurrences | BodyLocation | BloodLocation | bite | scratch | bullet | insulation | wind | water | conditionMax | conditionLowerChance | weight | run | combat | discomfort | vision | hearing | coverage | ProtectionBenefit | WeatherBenefit | DurabilityFactor | FunctionalCost | MechanicalValue | Status | tags\n")
+    for _,r in ipairs(records) do
+        local m=r.m
+        local columns={r.data.fullType,r.data.finalRarityTier,r.data.occurrences or 0,r.body,r.blood,number(m.bite),number(m.scratch),number(m.bullet),number(m.insulation),number(m.wind),number(m.water),number(m.conditionMax),number(m.conditionLowerChance),number(m.weight),number(m.runSpeedModifier),number(m.combatSpeedModifier),number(m.discomfortModifier),number(m.visionModifier),number(m.hearingModifier),r.zones,number(r.protection),number(r.weather),number(r.durabilityFactor),number(r.cost),number(r.mechanicalValue),r.status,r.tags}
+        for index,column in ipairs(columns) do columns[index]=tostring(column) end
+        writer:write(table.concat(columns," | ").."\n")
+    end
+    writer:close(); ItemRarityUtils.info(string.format("ACCESSORY MechanicalValue audit written: %d items; %d RARE+ trivial candidates.",#records,#rareTrivial))
+end
+
+-- Alternative policy simulation only.  It never writes FinalRarityTier or
+-- publishes a registry: it answers whether trivial wearable cosmetics should
+-- collapse to COMMON unless their underlying Scarcity is EPIC/EXOTIC.
+local function writeTrivialPolicySimulation(results)
+    if type(results) ~= "table" or not getFileWriter then return end
+    local tiers={"COMMON","UNCOMMON","RARE","EPIC","EXOTIC"}
+    local current, policy2, policy3={},{},{}
+    for _,tier in ipairs(tiers) do current[tier]=0; policy2[tier]=0; policy3[tier]=0 end
+    local p2Changed, p2UncommonToCommon, p2RareScarcity, knownPartialChanged, examples = 0, 0, 0, 0, {}
+    local p3Transitions={uncommonToCommon=0,rareToUncommon=0,epicToUncommon=0,exoticToUncommon=0}
+    local function statusOf(data)
+        return data.clothingMechanicalValueStatus or data.accessoryMechanicalValueStatus
+    end
+    local function groupOf(data)
+        local location=lower(data.utilitySubgroup or (data.clothingDiscovery and data.clothingDiscovery.bodyLocation) or "")
+        if data.utilityKind == "CLOTHING" then
+            if string.find(location,"underwear",1,true) or string.find(location,"bra",1,true) then return "UNDERWEAR" end
+            return "CLOTHING:"..(location ~= "" and location or "UNRESOLVED")
+        end
+        if string.find(location,"hat",1,true) then return "HEADWEAR" end
+        if string.find(location,"eye",1,true) then return "EYEWEAR" end
+        if string.find(location,"neck",1,true) then return "NECKWEAR" end
+        if string.find(location,"ear",1,true) or string.find(location,"wrist",1,true) or string.find(location,"belly",1,true) or string.find(location,"nose",1,true) then return "JEWELLERY" end
+        return "ACCESSORY:"..(location ~= "" and location or "UNRESOLVED")
+    end
+    for _,data in pairs(results) do
+        local before=data.finalRarityTier or data.rarityTier
+        current[before]=(current[before] or 0)+1
+        local status=statusOf(data)
+        local scarcity=data.baseScarcityTier or data.rarityTier
+        local after2, after3=before, before
+        if status == "MECHANICALLY_TRIVIAL" then
+            after2=(scarcity == "EPIC" or scarcity == "EXOTIC") and "UNCOMMON" or "COMMON"
+            after3=(scarcity == "COMMON" or scarcity == "UNCOMMON") and "COMMON" or "UNCOMMON"
+        elseif status == "MECHANICAL_VALUE_KNOWN" or status == "MECHANICAL_VALUE_PARTIAL" then
+            if after2 ~= before or after3 ~= before then knownPartialChanged=knownPartialChanged+1 end
+        end
+        policy2[after2]=(policy2[after2] or 0)+1
+        policy3[after3]=(policy3[after3] or 0)+1
+        if after2 ~= before then
+            p2Changed=p2Changed+1
+            if before == "UNCOMMON" and after2 == "COMMON" then p2UncommonToCommon=p2UncommonToCommon+1 end
+            if scarcity == "RARE" then p2RareScarcity=p2RareScarcity+1 end
+        end
+        if after3 ~= before then
+            if before == "UNCOMMON" and after3 == "COMMON" then p3Transitions.uncommonToCommon=p3Transitions.uncommonToCommon+1 end
+            if before == "RARE" and after3 == "UNCOMMON" then p3Transitions.rareToUncommon=p3Transitions.rareToUncommon+1 end
+            if before == "EPIC" and after3 == "UNCOMMON" then p3Transitions.epicToUncommon=p3Transitions.epicToUncommon+1 end
+            if before == "EXOTIC" and after3 == "UNCOMMON" then p3Transitions.exoticToUncommon=p3Transitions.exoticToUncommon+1 end
+            table.insert(examples,{fullType=data.fullType,group=groupOf(data),scarcity=scarcity,current=before,proposed=after3,status=status})
+        end
+    end
+    table.sort(examples,function(a,b) return a.fullType < b.fullType end)
+    local writer=getFileWriter("ItemRarity_TrivialPolicySimulation.txt",true,false); if not writer then return end
+    writer:write("Item Rarity trivial wearable policy simulation (NOT ACTIVE)\n")
+    writer:write("Active: MECHANICALLY_TRIVIAL <= UNCOMMON. Policy 2: Scarcity COMMON/UNCOMMON/RARE => COMMON; EPIC/EXOTIC => UNCOMMON. Policy 3: COMMON/UNCOMMON => COMMON; RARE/EPIC/EXOTIC => UNCOMMON. KNOWN and PARTIAL retain current final tier in both simulations.\n\n")
+    writer:write("CURRENT C/U/R/E/X="..current.COMMON.."/"..current.UNCOMMON.."/"..current.RARE.."/"..current.EPIC.."/"..current.EXOTIC.."\n")
+    writer:write("POLICY_2 C/U/R/E/X="..policy2.COMMON.."/"..policy2.UNCOMMON.."/"..policy2.RARE.."/"..policy2.EPIC.."/"..policy2.EXOTIC.." | changed="..p2Changed.." | UNCOMMON->COMMON="..p2UncommonToCommon.." | Policy2-changed items with Scarcity RARE="..p2RareScarcity.."\n")
+    writer:write("POLICY_3 C/U/R/E/X="..policy3.COMMON.."/"..policy3.UNCOMMON.."/"..policy3.RARE.."/"..policy3.EPIC.."/"..policy3.EXOTIC.." | UNCOMMON->COMMON="..p3Transitions.uncommonToCommon.." | RARE->UNCOMMON="..p3Transitions.rareToUncommon.." | EPIC->UNCOMMON="..p3Transitions.epicToUncommon.." | EXOTIC->UNCOMMON="..p3Transitions.exoticToUncommon.." | KNOWN/PARTIAL_CHANGED="..knownPartialChanged.."\n\n")
+    writer:write("POLICY_3 AFFECTED TRIVIAL ITEMS\nfullType | mechanical group | ScarcityTier | current | proposed | status\n")
+    for _,row in ipairs(examples) do writer:write(row.fullType.." | "..row.group.." | "..tostring(row.scarcity).." | "..row.current.." | "..row.proposed.." | "..tostring(row.status).."\n") end
+    writer:close()
+    ItemRarityUtils.info("Trivial wearable policy simulation written: Policy2="..p2Changed.." changes; Policy3 U->C="..p3Transitions.uncommonToCommon..", R->U="..p3Transitions.rareToUncommon.."; KNOWN/PARTIAL changed="..knownPartialChanged)
+end
+
+if reloadedActivePipelineForDevelopment and ItemRarityScanner and ItemRarityScanner.results then
+    writeAccessoryMechanicalValueAudit(ItemRarityScanner.results)
+    writeTrivialPolicySimulation(ItemRarityScanner.results)
 end

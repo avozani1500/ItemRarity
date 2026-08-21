@@ -517,6 +517,57 @@ local function makeClothingDiscoveryCandidate(data, scriptItem)
     }
 end
 
+-- ACCESSORY is intentionally not an Utility universe yet.  This candidate
+-- exists solely to derive the structural MechanicalValueStatus used by the
+-- approved trivial-benefit visual ceiling.  It has no score, percentile, or
+-- promotion path of its own.
+local function makeAccessoryMechanicalCandidate(data, scriptItem)
+    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
+    if not ok then runtimeItem = nil end
+    local bodyLocation = readRuntimeOrScriptString(runtimeItem, scriptItem, "getBodyLocation", "bodyLocation") or ""
+    local coveredParts = readRuntimeOrScriptString(runtimeItem, scriptItem, "getBloodClothingType", "bloodClothingType")
+        or readRuntimeOrScriptString(runtimeItem, scriptItem, "getBloodLocation", "bloodLocation")
+        or readRuntimeOrScriptString(runtimeItem, scriptItem, "getCoveredParts", "coveredParts") or ""
+    local conditionMax = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getConditionMax", "conditionMax")
+    local conditionLowerChance = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getConditionLowerChance", "conditionLowerChance")
+    local metrics = {
+        biteDefense = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getBiteDefense", "biteDefense"),
+        scratchDefense = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getScratchDefense", "scratchDefense"),
+        bulletDefense = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getBulletDefense", "bulletDefense"),
+        insulation = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getInsulation", "insulation"),
+        windResistance = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getWindResistance", "windResistance"),
+        waterResistance = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getWaterResistance", "waterResistance"),
+        conditionMax = conditionMax,
+        conditionLowerChance = conditionLowerChance,
+        durability = conditionMax and conditionLowerChance and math.log(1 + math.max(0, conditionMax) * math.max(0, conditionLowerChance)) or nil,
+        weight = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getActualWeight", "actualWeight"),
+        runSpeedModifier = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getRunSpeedModifier", "runSpeedModifier"),
+        combatSpeedModifier = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getCombatSpeedModifier", "combatSpeedModifier"),
+        discomfortModifier = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getDiscomfortModifier", "discomfortModifier"),
+        visionModifier = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getVisionModifier", "visionModifier"),
+        hearingModifier = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getHearingModifier", "hearingModifier"),
+    }
+    if metrics.windResistance == nil then
+        metrics.windResistance = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getWindresistance", "windresistance")
+    end
+    local special, reason = clothingSpecialBehaviorEvidence(scriptItem)
+    return {
+        data = data,
+        kind = "ACCESSORY",
+        subgroup = string.lower(tostring(bodyLocation ~= "" and bodyLocation or "UNRESOLVED")),
+        parentGroup = "ACCESSORY",
+        metrics = metrics,
+        profile = profileKey(metrics, { "biteDefense", "scratchDefense", "bulletDefense", "insulation", "windResistance", "waterResistance", "conditionMax", "conditionLowerChance", "weight", "runSpeedModifier", "combatSpeedModifier", "discomfortModifier", "visionModifier", "hearingModifier" }) .. ":" .. tostring(bodyLocation) .. ":" .. tostring(coveredParts),
+        utilityEligible = false,
+        ineligibleReason = "AccessoryUtility is not implemented; MechanicalValueStatus is used only for the trivial-benefit ceiling",
+        accessoryMechanicalCandidate = true,
+        accessoryBodyLocation = bodyLocation,
+        accessoryCoveredParts = coveredParts,
+        accessoryMechanicalSpecialBehavior = special,
+        accessoryMechanicalSpecialReason = reason,
+    }
+end
+
 local function makeContainerCandidate(data, scriptItem)
     -- The temporary object is never put into an inventory and is never
     -- transmitted. It exists only long enough to read the B42 runtime API.
@@ -626,6 +677,9 @@ local function candidateFor(data)
     end
     if data.category == "CONTAINER" then return makeContainerCandidate(data, scriptItem) end
     if data.category == "CLOTHING" then return makeClothingDiscoveryCandidate(data, scriptItem) end
+    if data.category == "ACCESSORY" or string.lower(tostring(data.displayCategory or "")) == "accessory" then
+        return makeAccessoryMechanicalCandidate(data, scriptItem)
+    end
     if data.category == "WEAPON" or data.category == "TOOL" then return makeMeleeCandidate(data, scriptItem) end
     return { data = data, utilityEligible = false, ineligibleReason = "category is not implemented for Utility" }
 end
@@ -1005,6 +1059,41 @@ local function assignClothingMechanicalValueStatus(candidates)
     end
 end
 
+local function assignAccessoryMechanicalValueStatus(candidates)
+    for _, candidate in ipairs(candidates) do
+        if candidate.accessoryMechanicalCandidate then
+            local m = candidate.metrics or {}
+            -- The active rule needs only a sound zero-benefit classification.
+            -- Keep the richer coverage/durability/cost decomposition in the
+            -- read-only diagnostic; avoiding it here prevents B42 Java value
+            -- wrappers from influencing a simple structural ceiling.
+            local bite = tonumber(m.biteDefense) or 0
+            local scratch = tonumber(m.scratchDefense) or 0
+            local bullet = tonumber(m.bulletDefense) or 0
+            local insulation = tonumber(m.insulation) or 0
+            local wind = tonumber(m.windResistance) or 0
+            local water = tonumber(m.waterResistance) or 0
+            candidate.accessoryMechanicalBaseBenefit = bite * .50 + scratch * .35 + bullet * .15
+                + insulation * .06 + wind * .05 + water * .04
+            candidate.accessoryMechanicalDurabilityFactor = 1
+            candidate.accessoryMechanicalFunctionalCost = 0
+            candidate.accessoryMechanicalValue = candidate.accessoryMechanicalBaseBenefit
+            local coreKnown = m.biteDefense ~= nil and m.scratchDefense ~= nil and m.bulletDefense ~= nil
+                and m.insulation ~= nil and m.windResistance ~= nil and m.waterResistance ~= nil
+            if candidate.accessoryMechanicalSpecialBehavior or not coreKnown then
+                candidate.accessoryMechanicalValueStatus = "MECHANICAL_VALUE_PARTIAL"
+            -- Match the approved ACCESSORY audit: only a genuinely zero
+            -- measured benefit is TRIVIAL. Tiny but real weather values stay
+            -- KNOWN and keep the normal scarcity path.
+            elseif candidate.accessoryMechanicalBaseBenefit <= .000001 then
+                candidate.accessoryMechanicalValueStatus = "MECHANICALLY_TRIVIAL"
+            else
+                candidate.accessoryMechanicalValueStatus = "MECHANICAL_VALUE_KNOWN"
+            end
+        end
+    end
+end
+
 local function scoreClothingUtility(candidates)
     local clothing = {}
     for _, candidate in ipairs(candidates) do if candidate.clothingUtilityCandidate then table.insert(clothing, candidate) end end
@@ -1257,12 +1346,27 @@ local function publishCandidateFields(candidates)
         data.clothingMechanicalDurabilityFactor = candidate.mechanicalDurabilityFactor
         data.clothingMechanicalFunctionalCost = candidate.mechanicalFunctionalCost
         data.clothingMechanicalSpecialReason = candidate.mechanicalSpecialReason
+        data.accessoryMechanicalValue = candidate.accessoryMechanicalValue
+        data.accessoryMechanicalValueStatus = candidate.accessoryMechanicalValueStatus
+        data.accessoryMechanicalBaseBenefit = candidate.accessoryMechanicalBaseBenefit
+        data.accessoryMechanicalDurabilityFactor = candidate.accessoryMechanicalDurabilityFactor
+        data.accessoryMechanicalFunctionalCost = candidate.accessoryMechanicalFunctionalCost
+        data.accessoryMechanicalSpecialReason = candidate.accessoryMechanicalSpecialReason
     end
 end
 
 -- Declared ahead of the active calculator so the proven Scarcity × Utility
 -- matrix can be shared by diagnostics and the runtime FinalRarityTier path.
 local matrixTierFromAxes
+
+-- Frozen Policy 3 for mechanically trivial wearables.  This is intentionally
+-- based on the internal scarcity axis, never on a name, slot, module, or the
+-- currently visible tier: common/uncommon scarcity is visually COMMON, while
+-- a genuinely scarce trivial variant may remain UNCOMMON.
+local function trivialWearableFinalTier(baseScarcityTier)
+    if baseScarcityTier == "COMMON" or baseScarcityTier == "UNCOMMON" then return "COMMON" end
+    return "UNCOMMON"
+end
 
 local function applyTierAdjustment(data, candidate)
     data.baseScarcityTier = data.rarityTier
@@ -1303,9 +1407,15 @@ local function applyTierAdjustment(data, candidate)
         data.utilityAdjustmentReason = "no eligible/reliable Utility; visual ceiling RARE"
         if candidate.kind == "CLOTHING" then
             data.clothingMechanicalTierBeforeCap = data.finalRarityTier
-            if candidate.mechanicalValueStatus == "MECHANICALLY_TRIVIAL" and (TIER_INDEX[data.finalRarityTier] or 1) > TIER_INDEX.UNCOMMON then
-                data.finalRarityTier = "UNCOMMON"
-                data.utilityAdjustmentReason = "Clothing MechanicalValue: trivial known benefit; visual ceiling UNCOMMON"
+            if candidate.mechanicalValueStatus == "MECHANICALLY_TRIVIAL" then
+                data.finalRarityTier = trivialWearableFinalTier(data.baseScarcityTier)
+                data.utilityAdjustmentReason = "Clothing MechanicalValue Policy 3: trivial benefit follows scarcity COMMON/UNCOMMON->COMMON, RARE+->UNCOMMON"
+            end
+        elseif candidate.kind == "ACCESSORY" then
+            data.accessoryMechanicalTierBeforeCap = data.finalRarityTier
+            if candidate.accessoryMechanicalValueStatus == "MECHANICALLY_TRIVIAL" then
+                data.finalRarityTier = trivialWearableFinalTier(data.baseScarcityTier)
+                data.utilityAdjustmentReason = "Accessory MechanicalValue Policy 3: trivial benefit follows scarcity COMMON/UNCOMMON->COMMON, RARE+->UNCOMMON"
             end
         end
         return
@@ -1340,9 +1450,9 @@ local function applyTierAdjustment(data, candidate)
             data.utilityAdjustmentReason = "ClothingUtility V1 Balanced: Scarcity plus DIRECT_SLOT quality"
         end
         data.clothingMechanicalTierBeforeCap = data.finalRarityTier
-        if candidate.mechanicalValueStatus == "MECHANICALLY_TRIVIAL" and (TIER_INDEX[data.finalRarityTier] or 1) > TIER_INDEX.UNCOMMON then
-            data.finalRarityTier = "UNCOMMON"
-            data.utilityAdjustmentReason = "Clothing MechanicalValue: trivial known benefit; visual ceiling UNCOMMON"
+        if candidate.mechanicalValueStatus == "MECHANICALLY_TRIVIAL" then
+            data.finalRarityTier = trivialWearableFinalTier(data.baseScarcityTier)
+            data.utilityAdjustmentReason = "Clothing MechanicalValue Policy 3: trivial benefit follows scarcity COMMON/UNCOMMON->COMMON, RARE+->UNCOMMON"
         end
         return
     end
@@ -1966,6 +2076,7 @@ function ItemRarityUtilityCalculator.calculate(results)
     scoreClothingUtility(candidates)
     scoreClothingDirectSlotV1(candidates)
     assignClothingMechanicalValueStatus(candidates)
+    assignAccessoryMechanicalValueStatus(candidates)
     publishCandidateFields(candidates)
     buildSubfamilyMetrics(results)
     for _, candidate in ipairs(candidates) do applyTierAdjustment(candidate.data, candidate) end
