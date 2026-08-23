@@ -208,6 +208,17 @@ ItemRarityConfig.utility = {
         yieldTiers = { uncommon = 20, rare = 30, epic = 60, exotic = 85 },
     },
 
+    -- LightFireUtility V1 has deliberately separate functional axes. Light
+    -- sources are judged by what they illuminate and their drain duration;
+    -- ignition sources are judged only by stable start-fire uses. A dual item
+    -- takes the better resulting tier, never a combined score. Neither axis
+    -- may produce EXOTIC in V1.
+    lightFire = {
+        utilityVersion = "V1_LIGHT85_DURATION15_FIRE_ABSOLUTE_EPIC_CAP",
+        light = { illumination = 0.85, duration = 0.15, maxTier = "EPIC" },
+        fireUses = { uncommon = 20, rare = 40, epic = 60, maxTier = "EPIC" },
+    },
+
     -- Literature V1 is structural: SkillBook position alone owns its tier;
     -- reading mood has a bounded RARE ceiling; permanent recipes are scored
     -- from their unique LearnedRecipes; all remaining special literature is

@@ -1088,6 +1088,59 @@ local function recipeLiteratureTier(score, tiers)
     return "COMMON"
 end
 
+-- Light and fire are discovered from the same structural signals vanilla uses:
+-- emitted light values and the `base:startfire` tag.  `DisplayCategory` alone
+-- is intentionally insufficient: an unlit lantern, candle box or propane
+-- refill has no measured function in its published state and stays outside
+-- LightFireUtility V1.
+local function makeLightFireCandidate(data, scriptItem)
+    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
+    if not ok then runtimeItem = nil end
+    local tags = string.lower(tostring(readString(scriptItem, "getTags", "tags") or ""))
+    local metrics = {
+        lightStrength = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getLightStrength", "lightStrength"),
+        lightDistance = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getLightDistance", "lightDistance"),
+        useDelta = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getUseDelta", "useDelta"),
+        usesBattery = readBoolean(runtimeItem, "isUsesBattery", "usesBattery") or contains(tags, "base:usesbattery"),
+        activated = readBoolean(runtimeItem, "canBeActivated", "activatedItem"),
+        equippable = readBoolean(runtimeItem, "canBeEquipped", "canBeEquipped"),
+        weight = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getActualWeight", "actualWeight"),
+    }
+    -- DisplayCategory is a declared structural script signal, never a
+    -- display-name heuristic. A LightSource label alone is deliberately not
+    -- enough: unlit candles/lanterns and propane refills expose UseDelta but
+    -- no emitted light, so must remain SPECIAL_PARTIAL. FireSource can use
+    -- its declared category because its actual FireUtility is still gated by
+    -- a finite structural UseDelta.
+    local displayCategory = string.lower(tostring(data.displayCategory or readString(scriptItem, "getDisplayCategory", "displayCategory") or ""))
+    local isLight = (metrics.lightStrength or 0) > 0 or (metrics.lightDistance or 0) > 0
+    local isFire = contains(tags, "base:startfire") or displayCategory == "firesource"
+    if not isLight and not isFire then return nil end
+    if metrics.useDelta and metrics.useDelta > 0 and metrics.useDelta <= 1 then
+        metrics.estimatedUses = math.max(1, math.floor(1 / metrics.useDelta + .5))
+    end
+    local functionalGroup = isLight and isFire and "DUAL_FUNCTION" or (isLight and "LIGHTSOURCE" or "FIRESOURCE")
+    local essential = (isLight and metrics.lightStrength ~= nil and metrics.lightDistance ~= nil and metrics.estimatedUses ~= nil)
+        or (isFire and metrics.estimatedUses ~= nil)
+    return {
+        data = data,
+        kind = "LIGHTFIRE",
+        subgroup = functionalGroup,
+        functionalGroup = functionalGroup,
+        parentGroup = "LIGHTFIRE",
+        metrics = metrics,
+        lightFunction = isLight,
+        fireFunction = isFire,
+        profile = table.concat({ functionalGroup, tostring(metrics.lightStrength or 0), tostring(metrics.lightDistance or 0),
+            tostring(metrics.useDelta or 0), tostring(metrics.estimatedUses or 0) }, ":"),
+        utilityEligible = essential,
+        utilityConfidence = essential and "HIGH" or "LOW",
+        validAttributeCount = (isLight and 3 or 0) + (isFire and 1 or 0),
+        utilityScoreVersion = UTILITY.lightFire.utilityVersion,
+        ineligibleReason = essential and nil or "LightFireUtility V1: required structural light/fire metrics unavailable",
+    }
+end
+
 local function makeLiteratureCandidate(data, scriptItem)
     if data.category ~= "LITERATURE" then return nil end
     -- Preserve the established ScriptItem/runtime bridge for frozen
@@ -1225,6 +1278,8 @@ local function candidateFor(data)
     if fish then return fish end
     local food = makeFoodCandidate(data, scriptItem)
     if food then return food end
+    local lightFire = makeLightFireCandidate(data, scriptItem)
+    if lightFire then return lightFire end
     local literature = makeLiteratureCandidate(data, scriptItem)
     if literature then return literature end
     if data.category == "CONTAINER" then return makeContainerCandidate(data, scriptItem) end
@@ -2273,6 +2328,78 @@ local function scoreFoodUtility(candidates)
     end
 end
 
+local function lightFireTierForScore(score)
+    if score >= 80 then return "EXOTIC" end
+    if score >= 60 then return "EPIC" end
+    if score >= 40 then return "RARE" end
+    if score >= 20 then return "UNCOMMON" end
+    return "COMMON"
+end
+
+local function cappedTier(tier, maximum)
+    local index, cap = TIER_INDEX[tier] or 1, TIER_INDEX[maximum] or #TIER_STRENGTH
+    return TIER_STRENGTH[math.min(index, cap)]
+end
+
+-- LightFireUtility V1 has no percentile or Scarcity contribution. The
+-- current loaded structural population establishes the simple normalisation
+-- maxima for light strength, reach and drain estimate. Fire remains absolute:
+-- uses map directly to the approved C/U/R/E bands.
+local function scoreLightFireUtility(candidates)
+    local lights, fires = {}, {}
+    local maxStrength, maxDistance, maxUses = 0, 0, 0
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "LIGHTFIRE" and candidate.utilityEligible then
+            local metrics = candidate.metrics
+            if candidate.lightFunction then
+                table.insert(lights, candidate)
+                maxStrength = math.max(maxStrength, metrics.lightStrength or 0)
+                maxDistance = math.max(maxDistance, metrics.lightDistance or 0)
+                maxUses = math.max(maxUses, metrics.estimatedUses or 0)
+            end
+            if candidate.fireFunction then table.insert(fires, candidate) end
+        end
+    end
+    local lightProfiles, fireProfiles = {}, {}
+    for _, candidate in ipairs(lights) do
+        local m = candidate.metrics
+        local strength = maxStrength > 0 and 100 * (m.lightStrength or 0) / maxStrength or 0
+        local distance = maxDistance > 0 and 100 * (m.lightDistance or 0) / maxDistance or 0
+        local duration = maxUses > 0 and 100 * (m.estimatedUses or 0) / maxUses or 0
+        local illumination = (strength + distance) / 2
+        candidate.lightIllumination = illumination
+        candidate.lightDuration = duration
+        candidate.lightUtility = UTILITY.lightFire.light.illumination * illumination + UTILITY.lightFire.light.duration * duration
+        candidate.lightTier = cappedTier(lightFireTierForScore(candidate.lightUtility), UTILITY.lightFire.light.maxTier)
+        lightProfiles[candidate.profile] = true
+    end
+    for _, candidate in ipairs(fires) do
+        local uses = candidate.metrics.estimatedUses or 0
+        candidate.fireUtility = uses
+        if uses >= UTILITY.lightFire.fireUses.epic then candidate.fireTier = "EPIC"
+        elseif uses >= UTILITY.lightFire.fireUses.rare then candidate.fireTier = "RARE"
+        elseif uses >= UTILITY.lightFire.fireUses.uncommon then candidate.fireTier = "UNCOMMON"
+        else candidate.fireTier = "COMMON" end
+        candidate.fireTier = cappedTier(candidate.fireTier, UTILITY.lightFire.fireUses.maxTier)
+        fireProfiles[candidate.profile] = true
+    end
+    local lightCount, fireCount = 0, 0
+    for _ in pairs(lightProfiles) do lightCount = lightCount + 1 end
+    for _ in pairs(fireProfiles) do fireCount = fireCount + 1 end
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "LIGHTFIRE" and candidate.utilityEligible then
+            local lightIndex = TIER_INDEX[candidate.lightTier] or 0
+            local fireIndex = TIER_INDEX[candidate.fireTier] or 0
+            candidate.lightFireFinalTier = TIER_STRENGTH[math.max(lightIndex, fireIndex)] or "COMMON"
+            candidate.lightFireSelectedFunction = lightIndex >= fireIndex and "LIGHTSOURCE" or "FIRESOURCE"
+            candidate.utility = candidate.lightFireSelectedFunction == "LIGHTSOURCE" and candidate.lightUtility or candidate.fireUtility
+            candidate.profileCount = candidate.lightFireSelectedFunction == "LIGHTSOURCE" and lightCount or fireCount
+            candidate.normalizationGroup = "LIGHTFIRE:" .. candidate.lightFireSelectedFunction
+            candidate.utilityPercentile = nil
+        end
+    end
+end
+
 local function utilitySupportStatus(candidate)
     if candidate.utilitySupport then return candidate.utilitySupport end
     if candidate.kind == "MEDICAL" and candidate.medicalValueStatus == "MECHANICAL_VALUE_PARTIAL" then return "UTILITY_PARTIAL" end
@@ -2353,6 +2480,13 @@ local function publishCandidateFields(candidates)
         data.fishingScarcity = candidate.kind == "FISH" and candidate.fishingScarcity or nil
         data.fishYieldTierCeiling = candidate.kind == "FISH" and candidate.fishYieldTierCeiling or nil
         data.fishPositionTier = candidate.kind == "FISH" and candidate.fishPositionTier or nil
+        data.lightFireLightUtility = candidate.kind == "LIGHTFIRE" and candidate.lightUtility and round(candidate.lightUtility) or nil
+        data.lightFireIllumination = candidate.kind == "LIGHTFIRE" and candidate.lightIllumination and round(candidate.lightIllumination) or nil
+        data.lightFireDuration = candidate.kind == "LIGHTFIRE" and candidate.lightDuration and round(candidate.lightDuration) or nil
+        data.lightFireTier = candidate.kind == "LIGHTFIRE" and candidate.lightTier or nil
+        data.fireUtility = candidate.kind == "LIGHTFIRE" and candidate.fireUtility or nil
+        data.fireTier = candidate.kind == "LIGHTFIRE" and candidate.fireTier or nil
+        data.lightFireSelectedFunction = candidate.kind == "LIGHTFIRE" and candidate.lightFireSelectedFunction or nil
         data.literatureFunctionalGroup = candidate.kind == "LITERATURE" and candidate.functionalGroup or nil
         data.literatureStructuralTier = candidate.kind == "LITERATURE" and candidate.literatureStructuralTier or nil
         data.literatureMoodBenefit = candidate.kind == "LITERATURE" and candidate.metrics and candidate.metrics.moodBenefit or nil
@@ -2438,6 +2572,18 @@ local function applyTierAdjustment(data, candidate)
     if candidate.kind == "CONTAINER" and candidate.containerV2Group == "KEY_CONTAINER" then
         data.finalRarityTier = trivialWearableFinalTier(data.baseScarcityTier)
         data.utilityAdjustmentReason = "ContainerUtility V2 KEY_CONTAINER policy: scarcity COMMON/UNCOMMON->COMMON, RARE+->UNCOMMON"
+        return
+    end
+
+    if candidate.kind == "LIGHTFIRE" and candidate.utilityEligible and candidate.lightFireFinalTier then
+        data.finalRarityTier = candidate.lightFireFinalTier
+        if candidate.functionalGroup == "DUAL_FUNCTION" then
+            data.utilityAdjustmentReason = "LightFireUtility V1: max(LightTier, FireTier), no combined score; EPIC ceiling"
+        elseif candidate.functionalGroup == "LIGHTSOURCE" then
+            data.utilityAdjustmentReason = "LightFireUtility V1: illumination 85% + duration 15%; EPIC ceiling"
+        else
+            data.utilityAdjustmentReason = "LightFireUtility V1: absolute estimated start-fire uses; EPIC ceiling"
+        end
         return
     end
 
@@ -3165,6 +3311,7 @@ function ItemRarityUtilityCalculator.calculate(results)
     scoreMedicalUtility(candidates)
     scoreFishUtility(candidates)
     scoreFoodUtility(candidates)
+    scoreLightFireUtility(candidates)
     assignClothingMechanicalValueStatus(candidates)
     assignAccessoryMechanicalValueStatus(candidates)
     publishCandidateFields(candidates)

@@ -72,6 +72,11 @@ if Events and Events.OnClientCommand then
             if ItemRarityFoodRuntimeAudit and ItemRarityFoodRuntimeAudit.write then
                 ItemRarityFoodRuntimeAudit.write(ItemRarityScanner.results)
             end
+        elseif module == "ItemRarity" and command == "lightFireAudit" then
+            require "ItemRarity/Diagnostics/LightFireAudit"
+            if ItemRarityLightFireAudit and ItemRarityLightFireAudit.write then
+                ItemRarityLightFireAudit.write(ItemRarityScanner.results)
+            end
         elseif module == "ItemRarity" and command == "reloadDiagnostic" then
             -- The debug console is client-side, but report writers run on the
             -- host.  Restrict server-side reload to an explicit allow-list;

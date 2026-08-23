@@ -2,6 +2,7 @@ if isServer() then return end
 
 require "ItemRarity/RarityAPI"
 require "ItemRarity/RarityUtils"
+require "ItemRarity/LightFireClientAudit"
 
 local lastRevision = nil
 
