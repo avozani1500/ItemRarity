@@ -67,6 +67,11 @@ if Events and Events.OnClientCommand then
             if ItemRarityClothingMechanicalValueReport and ItemRarityClothingMechanicalValueReport.write then
                 ItemRarityClothingMechanicalValueReport.write(ItemRarityScanner.results)
             end
+        elseif module == "ItemRarity" and command == "foodRuntimeAudit" then
+            require "ItemRarity/Diagnostics/ClothingMechanicalValueReport"
+            if ItemRarityFoodRuntimeAudit and ItemRarityFoodRuntimeAudit.write then
+                ItemRarityFoodRuntimeAudit.write(ItemRarityScanner.results)
+            end
         elseif module == "ItemRarity" and command == "reloadDiagnostic" then
             -- The debug console is client-side, but report writers run on the
             -- host.  Restrict server-side reload to an explicit allow-list;
@@ -74,6 +79,7 @@ if Events and Events.OnClientCommand then
             -- client command channel into an arbitrary file loader.
             local files = {
                 clothingMechanicalValue = "media/lua/server/ItemRarity/Diagnostics/ClothingMechanicalValueReport.lua",
+                foodRuntimeAudit = "media/lua/server/ItemRarity/Diagnostics/ClothingMechanicalValueReport.lua",
                 clothingCostCalibration = "media/lua/server/ItemRarity/Diagnostics/ClothingCostCalibration.lua",
             }
             local key = args and tostring(args.key or "") or ""

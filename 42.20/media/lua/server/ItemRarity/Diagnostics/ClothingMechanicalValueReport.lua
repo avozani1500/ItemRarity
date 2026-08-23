@@ -528,8 +528,214 @@ local function writeMedicalRuntimeAudit(results)
     ItemRarityUtils.info(string.format("MEDICAL runtime audit written: %d items, %d unique profiles, KNOWN=%d PARTIAL=%d UNSUPPORTED=%d.", #records, unique, counts.MECHANICAL_VALUE_KNOWN, counts.MECHANICAL_VALUE_PARTIAL, counts.UTILITY_UNSUPPORTED))
 end
 
+-- FOOD discovery is intentionally report-only.  Food has overlapping roles
+-- (freshness, cooking, hydration, energy, ingredients and special effects),
+-- so this audit records a primary role plus flags before any Utility formula
+-- is considered.  It never changes the registry or FinalRarityTier.
+local function writeFoodRuntimeAudit(results)
+    if type(results) ~= "table" or not getFileWriter then return end
+    local manager = getScriptManager and getScriptManager() or nil
+    local function metric(runtime, script, getters, member)
+        for _, getter in ipairs(getters) do
+            local value = tonumber(call(runtime, getter))
+            if value == nil then value = tonumber(call(script, getter)) end
+            if value ~= nil then return value end
+        end
+        return tonumber(field(script, member))
+    end
+    local function boolean(runtime, script, getters, member)
+        for _, getter in ipairs(getters) do
+            local value = call(runtime, getter)
+            if value == nil then value = call(script, getter) end
+            if value ~= nil then return value == true end
+        end
+        return field(script, member) == true
+    end
+    local function realUses(metrics, drainable)
+        if not drainable then return 1 end
+        if metrics.useDelta and metrics.useDelta > 0 and metrics.useDelta <= 1 then
+            return math.max(1, math.floor((1 / metrics.useDelta) + .5))
+        end
+        return 1
+    end
+    local function hasMedicalEffect(m)
+        return (m.bandagePower or 0) > 0 or (m.alcoholPower or 0) > 0 or (m.reduceInfectionPower or 0) > 0
+            or (m.painReduction or 0) ~= 0 or (m.fluReduction or 0) ~= 0 or (m.feverReduction or 0) ~= 0
+            or (m.foodSicknessChange or 0) < 0
+    end
+    local function flagsFor(m)
+        local flags = {}
+        if m.cookable then table.insert(flags, "COOKABLE") end
+        local fresh = (m.daysFresh or 0) > 0 and (m.daysFresh or 0) < 100000000
+        local rotten = (m.daysTotallyRotten or 0) > 0 and (m.daysTotallyRotten or 0) < 100000000
+        if fresh or rotten then table.insert(flags, "PERISHABLE") else table.insert(flags, "SHELF_STABLE") end
+        if math.abs(m.thirstChange or 0) > 0 then table.insert(flags, "HYDRATION") end
+        if (m.calories or 0) > 0 or (m.carbohydrates or 0) > 0 or (m.proteins or 0) > 0 or (m.lipids or 0) > 0 then table.insert(flags, "ENERGY_NUTRITION") end
+        if m.dangerousUncooked then table.insert(flags, "RAW_RISK") end
+        if m.poison or (m.poisonPower or 0) > 0 or (m.foodSicknessChange or 0) > 0 then table.insert(flags, "TOXIN_RISK") end
+        if m.alcoholic or (m.alcoholPower or 0) > 0 then table.insert(flags, "ALCOHOL") end
+        if m.preparationRequired then table.insert(flags, "PREPARATION_REQUIRED") end
+        if m.preparationAmbiguous then table.insert(flags, "PREPARATION_AMBIGUOUS") end
+        return table.concat(flags, ",")
+    end
+    local function primaryGroup(m)
+        if m.cookable then return "COOKABLE" end
+        if math.abs(m.thirstChange or 0) > math.abs(m.hungerChange or 0) and math.abs(m.thirstChange or 0) > 0 then return "DRINK_HYDRATION" end
+        local fresh = (m.daysFresh or 0) > 0 and (m.daysFresh or 0) < 100000000
+        local rotten = (m.daysTotallyRotten or 0) > 0 and (m.daysTotallyRotten or 0) < 100000000
+        if fresh or rotten then return "PERISHABLE_READY_OR_INGREDIENT" end
+        return "SHELF_STABLE_READY_OR_INGREDIENT"
+    end
+    local function foodFunction(m, tags, status)
+        if status == "MECHANICAL_VALUE_PARTIAL" then return "SPECIAL_PARTIAL" end
+        if m.cantEat then return "SPECIAL_PARTIAL" end
+        if m.preparationRequired or m.preparationAmbiguous then return "SPECIAL_PARTIAL" end
+        -- These B42 tags describe a mechanical recipe role rather than a
+        -- display name.  They keep recipe components from silently competing
+        -- as ordinary ready-to-eat meals.
+        if string.find(tags, "ingredient", 1, true) or string.find(tags, "isseed", 1, true)
+            or string.find(tags, "iscutting", 1, true) or string.find(tags, "pizzasauce", 1, true) then
+            return "INGREDIENT"
+        end
+        local eatType, eatSound = lower(m.eatType), lower(m.customEatSound)
+        if string.find(eatType,"drink",1,true) and string.find(eatSound,"drinking",1,true)
+            and (m.thirstBenefit or 0) > (m.hungerBenefit or 0) then return "DRINK" end
+        return "FOOD"
+    end
+    local records, profiles, groups, excludedMedical = {}, {}, {}, 0
+    for _, data in pairs(results) do
+        local script = manager and manager:FindItem(data.fullType) or nil
+        if script then
+            local ok, runtime = pcall(function() return script:InstanceItem(nil, false) end)
+            if not ok then runtime = nil end
+            local display = tostring(data.displayCategory or call(script, "getDisplayCategory") or "")
+            -- ScriptItem:getType() is the actual B42 item class (Food,
+            -- Weapon, Container…). getItemType() is a namespaced tag such as
+            -- base:weapon and is not a Food discriminator.
+            local itemType = lower(call(script, "getType") or field(script, "type") or "")
+            local tags = lower(call(script, "getTags") or field(script, "tags") or "")
+            local m = {
+                hungerChange = metric(runtime, script, { "getHungerChange" }, "hungerChange"), thirstChange = metric(runtime, script, { "getThirstChange" }, "thirstChange"),
+                calories = metric(runtime, script, { "getCalories" }, "calories"), carbohydrates = metric(runtime, script, { "getCarbohydrates" }, "carbohydrates"), proteins = metric(runtime, script, { "getProteins" }, "proteins"), lipids = metric(runtime, script, { "getLipids" }, "lipids"),
+                weight = metric(runtime, script, { "getActualWeight", "getWeight" }, "actualWeight"), daysFresh = metric(runtime, script, { "getDaysFresh" }, "daysFresh"), daysTotallyRotten = metric(runtime, script, { "getDaysTotallyRotten" }, "daysTotallyRotten"),
+                cookable = boolean(runtime, script, { "isCookable", "getIsCookable" }, "isCookable"), minutesToCook = metric(runtime, script, { "getMinutesToCook" }, "minutesToCook"), minutesToBurn = metric(runtime, script, { "getMinutesToBurn" }, "minutesToBurn"),
+                unhappyChange = metric(runtime, script, { "getUnhappyChange" }, "unhappyChange"), boredomChange = metric(runtime, script, { "getBoredomChange" }, "boredomChange"), stressChange = metric(runtime, script, { "getStressChange" }, "stressChange"), fatigueChange = metric(runtime, script, { "getFatigueChange" }, "fatigueChange"), enduranceChange = metric(runtime, script, { "getEnduranceChange" }, "enduranceChange"),
+                dangerousUncooked = boolean(runtime, script, { "isDangerousUncooked" }, "dangerousUncooked"), poison = boolean(runtime, script, { "isPoison" }, "poison"), poisonPower = metric(runtime, script, { "getPoisonPower" }, "poisonPower"),
+                foodSicknessChange = metric(runtime, script, { "getFoodSicknessChange" }, "foodSicknessChange"), alcoholic = boolean(runtime, script, { "isAlcoholic" }, "alcoholic"), alcoholPower = metric(runtime, script, { "getAlcoholPower" }, "alcoholPower"),
+                reduceFoodSickness = metric(runtime, script, { "getReduceFoodSickness" }, "reduceFoodSickness"), reduceInfectionPower = metric(runtime, script, { "getReduceInfectionPower" }, "reduceInfectionPower"), painReduction = metric(runtime, script, { "getPainReduction", "getPainChange" }, "painReduction"), fluReduction = metric(runtime, script, { "getFluReduction" }, "fluReduction"), feverReduction = metric(runtime, script, { "getFeverReduction", "getReduceFever" }, "feverReduction"),
+                bandagePower = metric(runtime, script, { "getBandagePower" }, "bandagePower"), alcoholPowerMedical = metric(runtime, script, { "getAlcoholPower" }, "alcoholPower"), useDelta = metric(runtime, script, { "getUseDelta" }, "useDelta"),
+                isDrink = boolean(runtime, script, { "isDrink", "getIsDrink" }, "isDrink"),
+                cantEat = boolean(runtime, script, { "isCantEat", "getCantEat" }, "cantEat"),
+                eatType = tostring(call(script, "getEatType") or field(script, "eatType") or ""), customEatSound = tostring(call(script, "getCustomEatSound") or field(script, "customEatSound") or ""),
+                foodType = tostring(call(script, "getFoodType") or field(script, "foodType") or ""), replaceOnUse = tostring(call(script, "getReplaceOnUse") or field(script, "replaceOnUse") or ""), replaceOnDeplete = tostring(call(script, "getReplaceOnDeplete") or field(script, "replaceOnDeplete") or ""),
+                onCooked = tostring(call(runtime, "getOnCooked") or call(script, "getOnCooked") or field(script, "onCooked") or ""), cookingSound = tostring(call(runtime, "getCookingSound") or call(script, "getCookingSound") or field(script, "cookingSound") or ""), evolvedRecipeName = tostring(call(script, "getEvolvedRecipeName") or field(script, "evolvedRecipeName") or ""), evolvedRecipes = tostring(call(script, "getEvolvedRecipe") or field(script, "evolvedRecipe") or ""), replaceOnCooked = tostring(call(runtime, "getReplaceOnCooked") or call(script, "getReplaceOnCooked") or field(script, "replaceOnCooked") or ""),
+                removeNegativeEffectOnCooked = boolean(runtime, script, { "isRemoveNegativeEffectOnCooked", "isRemoveUnhappinessWhenCooked", "getRemoveUnhappinessWhenCooked" }, "removeUnhappinessWhenCooked"),
+            }
+            -- DisplayCategory=Cooking is intentionally *not* food evidence:
+            -- B42 places pans, tins, utensils and preparation containers in
+            -- that category.  They enter only if they also expose edible
+            -- nutrition/hydration or actual cookability.
+            local foodTyped = itemType == "food" or lower(display) == "food"
+            local medical = hasMedicalEffect(m) or lower(display) == "firstaid" or field(script, "medical") == true
+            local nutritive = (m.hungerChange or 0) ~= 0 or (m.thirstChange or 0) ~= 0 or (m.calories or 0) ~= 0 or (m.carbohydrates or 0) ~= 0 or (m.proteins or 0) ~= 0 or (m.lipids or 0) ~= 0
+            -- Freshness fields default to 1e9 even on weapons, books and
+            -- containers. They are reportable only after Food is established,
+            -- never evidence that the item itself is edible.
+            local foodEvidence = foodTyped or nutritive or m.cookable or string.find(tags, "food", 1, true) ~= nil
+            if foodEvidence and medical then
+                excludedMedical = excludedMedical + 1
+            elseif foodEvidence then
+                m.uses = realUses(m, string.find(itemType, "drainable", 1, true) ~= nil)
+                m.hungerBenefit = math.max(0, -(m.hungerChange or 0))
+                m.thirstBenefit = math.max(0, -(m.thirstChange or 0))
+                m.hungerPerWeight = m.hungerBenefit / math.max(.01, m.weight or 1)
+                m.caloriesPerWeight = math.max(0, m.calories or 0) / math.max(.01, m.weight or 1)
+                -- Structural preparation evidence only. A food is not made
+                -- partial merely because it can be cooked: raw meat remains
+                -- directly consumable (with a risk). The Food runtime object
+                -- exposes the actual OnCooked callback and cooked-negative
+                -- transformation flag. EvolvedRecipe alone only means that an
+                -- item *can be an ingredient*, so it is diagnostic evidence
+                -- but deliberately not a preparation classifier.
+                m.preparationRequired = m.cookable and (m.onCooked ~= "")
+                m.preparationAmbiguous = (not m.preparationRequired) and (m.removeNegativeEffectOnCooked or (m.replaceOnCooked ~= "" and m.replaceOnCooked ~= "[]"))
+                local group, flags = primaryGroup(m), flagsFor(m)
+                local status = (m.hungerBenefit > 0 or m.thirstBenefit > 0 or (m.calories or 0) > 0) and "MECHANICAL_VALUE_KNOWN" or "MECHANICAL_VALUE_PARTIAL"
+                local partialReason = nil
+                if m.cantEat then partialReason = "CANT_EAT_REQUIRED"
+                elseif m.preparationRequired then partialReason = "PREPARATION_REQUIRED"
+                elseif m.preparationAmbiguous then partialReason = "PREPARATION_AMBIGUOUS"
+                elseif status == "MECHANICAL_VALUE_PARTIAL" then partialReason = "SPECIAL_UNQUANTIFIED" end
+                local preliminaryFunction = foodFunction(m, tags, status)
+                if not partialReason and preliminaryFunction == "INGREDIENT" then partialReason = "INGREDIENT_UNQUANTIFIED" end
+                local utilityStatus = partialReason and "PARTIAL" or "ELIGIBLE"
+                local profile = table.concat({ group, tostring(m.hungerChange), tostring(m.thirstChange), tostring(m.calories), tostring(m.carbohydrates), tostring(m.proteins), tostring(m.lipids), tostring(m.daysFresh), tostring(m.daysTotallyRotten), tostring(m.cookable), tostring(m.minutesToCook), tostring(m.unhappyChange), tostring(m.boredomChange), tostring(m.stressChange), tostring(m.dangerousUncooked), tostring(m.poison), tostring(m.poisonPower), tostring(m.alcoholic), tostring(m.alcoholPower), tostring(m.uses) }, ":")
+                local record = { data=data, m=m, group=group, functionalGroup=preliminaryFunction, flags=flags, status=status, foodUtilityStatus=utilityStatus, foodPartialReason=partialReason, display=display, itemType=itemType, tags=tags, profile=profile }
+                table.insert(records, record); profiles[profile] = profiles[profile] or {}; table.insert(profiles[profile], record)
+                groups[group] = groups[group] or {}; table.insert(groups[group], record)
+            end
+        end
+    end
+    table.sort(records, function(a,b) return a.data.fullType < b.data.fullType end)
+    local function values(metric)
+        local out, seen = {}, {}
+        for _, r in ipairs(records) do if not seen[r.profile] then seen[r.profile] = true; table.insert(out, r.m[metric] or 0) end end
+        return sortedCopy(out)
+    end
+    local function distribution(writer, metric)
+        local v=values(metric); if #v == 0 then return end
+        writer:write(string.format("%s | min=%s p10=%s p25=%s p50=%s p75=%s p90=%s p95=%s max=%s\\n", metric, number(quantile(v,0)), number(quantile(v,10)), number(quantile(v,25)), number(quantile(v,50)), number(quantile(v,75)), number(quantile(v,90)), number(quantile(v,95)), number(quantile(v,100))))
+    end
+    local function writeRank(writer, label, metric, descending)
+        local rows={}; for _, r in ipairs(records) do if r.status == "MECHANICAL_VALUE_KNOWN" then table.insert(rows,r) end end
+        table.sort(rows,function(a,b)
+            local av,bv=a.m[metric] or 0,b.m[metric] or 0
+            if av == bv then return a.data.fullType < b.data.fullType end
+            if descending then return av > bv end
+            return av < bv
+        end)
+        writer:write("\\n"..label.." (top/bottom 15; unique mechanics are marked by first occurrence)\\nfullType | value | hunger | calories | weight | flags | ScarcityTier\\n")
+        local count, seen=0,{}; for _,r in ipairs(rows) do if not seen[r.profile] then seen[r.profile]=true; count=count+1; writer:write(string.format("%s | %s | %s | %s | %s | %s | %s\\n",r.data.fullType,number(r.m[metric]),number(r.m.hungerBenefit),number(r.m.calories),number(r.m.weight),r.flags,tostring(r.data.baseScarcityTier or r.data.rarityTier))); if count>=15 then break end end end
+    end
+    local function writeDefaults(writer, metric)
+        local counts={}; for _,r in ipairs(records) do local key=tostring(r.m[metric] or 0); counts[key]=(counts[key] or 0)+1 end
+        local rows={}; for value,count in pairs(counts) do table.insert(rows,{value=value,count=count}) end; table.sort(rows,function(a,b) return a.count == b.count and a.value < b.value or a.count > b.count end)
+        local out={}; for i,row in ipairs(rows) do if i>5 then break end; table.insert(out,row.value.."="..row.count) end; writer:write(metric.." defaults/frequent values: "..table.concat(out,", ").."\\n")
+    end
+    local unique=0; for _ in pairs(profiles) do unique=unique+1 end
+    local foodExperiment = nil -- implemented in FoodRuntimeAudit.lua after this raw audit is split.
+    local writer=getFileWriter("ItemRarity_FoodRuntimeAudit.txt",true,false); if not writer then return end
+    writer:write("Item Rarity FOOD runtime audit (REPORT ONLY)\\nNo Utility, FinalRarityTier, registry, UI, or signature field is changed. Medical-functional items are excluded using quantified medical effects/FirstAid/Medical evidence, never fullType or name.\\n\\n")
+    writer:write(string.format("ITEMS=%d | UNIQUE_MECHANICAL_PROFILES=%d | EXCLUDED_AS_MEDICAL=%d\\n",#records,unique,excludedMedical))
+    writer:write("Primary group is descriptive only; flags preserve overlapping food roles. No FoodUtility or hypothetical tier is calculated.\\n\\nGROUPS\\n")
+    local groupNames={}; for group in pairs(groups) do table.insert(groupNames,group) end; table.sort(groupNames)
+    for _,group in ipairs(groupNames) do local seen,n={},0; for _,r in ipairs(groups[group]) do if not seen[r.profile] then seen[r.profile]=true;n=n+1 end end; writer:write(group.." | items="..#groups[group].." | unique_profiles="..n.."\\n") end
+    writer:write("\\nFoodQuality experiment was temporarily split out after hitting the B42 compiler's 200-local limit. Raw Food audit remains valid; no active data or tiers changed.\\n")
+    writer:write("\\nATTRIBUTE DISTRIBUTIONS (unique mechanical profiles)\\n")
+    for _,metric in ipairs({"hungerBenefit","thirstBenefit","calories","carbohydrates","proteins","lipids","weight","daysFresh","daysTotallyRotten","minutesToCook","minutesToBurn","unhappyChange","boredomChange","stressChange","fatigueChange","enduranceChange","poisonPower","foodSicknessChange","alcoholPower","uses"}) do distribution(writer,metric) end
+    writer:write("\\nDEFAULTS / FREQUENT VALUES (all candidates; zero can be a generic runtime default, not necessarily an explicit declaration)\\n")
+    for _,metric in ipairs({"hungerChange","thirstChange","calories","daysFresh","daysTotallyRotten","cookable","unhappyChange","boredomChange","stressChange","dangerousUncooked","poison","alcoholic","useDelta"}) do writeDefaults(writer,metric) end
+    writeRank(writer,"TOP HUNGER BENEFIT","hungerBenefit",true); writeRank(writer,"BOTTOM HUNGER BENEFIT","hungerBenefit",false)
+    writeRank(writer,"TOP CALORIES","calories",true); writeRank(writer,"BOTTOM CALORIES","calories",false)
+    writeRank(writer,"TOP HUNGER / WEIGHT (diagnostic only)","hungerPerWeight",true); writeRank(writer,"BOTTOM HUNGER / WEIGHT (diagnostic only)","hungerPerWeight",false)
+    writeRank(writer,"TOP CALORIES / WEIGHT (diagnostic only)","caloriesPerWeight",true); writeRank(writer,"BOTTOM CALORIES / WEIGHT (diagnostic only)","caloriesPerWeight",false)
+    writeRank(writer,"BEST CONSERVATION: DaysTotallyRotten","daysTotallyRotten",true); writeRank(writer,"LOWEST CONSERVATION: DaysTotallyRotten","daysTotallyRotten",false)
+    writer:write("\\nFUNCTIONAL GROUP EXAMPLES\\ngroup | fullType | HungerChange | ThirstChange | Calories | Fresh/Rotten | cookable | flags | ScarcityTier | ScarcityPercentile\\n")
+    for _,group in ipairs(groupNames) do local count=0; for _,r in ipairs(groups[group]) do count=count+1; if count<=12 then local m=r.m; writer:write(string.format("%s | %s | %s | %s | %s | %s/%s | %s | %s | %s | %s\\n",group,r.data.fullType,number(m.hungerChange),number(m.thirstChange),number(m.calories),number(m.daysFresh),number(m.daysTotallyRotten),tostring(m.cookable),r.flags,tostring(r.data.baseScarcityTier or r.data.rarityTier),number(r.data.scarcityPercentile or (r.data.tableAvailability and r.data.tableAvailability.routeWeightedPercentile)))) end end end
+    writer:write("\\nSPECIAL / AMBIGUOUS FOOD (PARTIAL or risk/special flags)\\nfullType | primary group | status | flags | hunger | thirst | calories | poison | food sickness | alcohol | tags | DisplayCategory\\n")
+    for _,r in ipairs(records) do local m=r.m; if r.status ~= "MECHANICAL_VALUE_KNOWN" or string.find(r.flags,"RAW_RISK",1,true) or string.find(r.flags,"TOXIN_RISK",1,true) or string.find(r.flags,"ALCOHOL",1,true) then writer:write(string.format("%s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s\\n",r.data.fullType,r.group,r.status,r.flags,number(m.hungerChange),number(m.thirstChange),number(m.calories),tostring(m.poison),number(m.foodSicknessChange),tostring(m.alcoholic),r.tags,r.display)) end end
+    writer:write("\\nALL FOOD CANDIDATES\\nfullType | originalCategory | DisplayCategory | ItemType | primaryGroup | flags | status | HungerChange | ThirstChange | Calories | Carbs | Proteins | Lipids | weight | Hunger/weight | Calories/weight | DaysFresh | DaysTotallyRotten | cookable | MinutesToCook | MinutesToBurn | Unhappy | Boredom | Stress | Fatigue | Endurance | DangerousUncooked | Poison | PoisonPower | FoodSickness | Alcoholic | AlcoholPower | uses | tags | ScarcityTier | ScarcityPercentile\\n")
+    for _,r in ipairs(records) do local d,m=r.data,r.m; local row={d.fullType,d.category or "",r.display,r.itemType,r.group,r.flags,r.status,number(m.hungerChange),number(m.thirstChange),number(m.calories),number(m.carbohydrates),number(m.proteins),number(m.lipids),number(m.weight),number(m.hungerPerWeight),number(m.caloriesPerWeight),number(m.daysFresh),number(m.daysTotallyRotten),tostring(m.cookable),number(m.minutesToCook),number(m.minutesToBurn),number(m.unhappyChange),number(m.boredomChange),number(m.stressChange),number(m.fatigueChange),number(m.enduranceChange),tostring(m.dangerousUncooked),tostring(m.poison),number(m.poisonPower),number(m.foodSicknessChange),tostring(m.alcoholic),number(m.alcoholPower),number(m.uses),r.tags,tostring(d.baseScarcityTier or d.rarityTier),number(d.scarcityPercentile or (d.tableAvailability and d.tableAvailability.routeWeightedPercentile))}; writer:write(table.concat(row," | ").."\\n") end
+    writer:close(); ItemRarityUtils.info(string.format("FOOD runtime audit written: %d items, %d unique profiles; medical excluded=%d (report only).",#records,unique,excludedMedical))
+    if ItemRarityFoodQualityExperiment and ItemRarityFoodQualityExperiment.write then ItemRarityFoodQualityExperiment.write(records) end
+end
+
+ItemRarityFoodRuntimeAudit = ItemRarityFoodRuntimeAudit or {}
+ItemRarityFoodRuntimeAudit.write = writeFoodRuntimeAudit
+
 if reloadedActivePipelineForDevelopment and ItemRarityScanner and ItemRarityScanner.results then
     writeAccessoryMechanicalValueAudit(ItemRarityScanner.results)
     writeTrivialPolicySimulation(ItemRarityScanner.results)
     writeMedicalRuntimeAudit(ItemRarityScanner.results)
+    writeFoodRuntimeAudit(ItemRarityScanner.results)
 end

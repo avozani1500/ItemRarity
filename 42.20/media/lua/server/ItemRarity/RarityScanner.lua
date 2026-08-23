@@ -219,11 +219,11 @@ local function buildResultSignature(results)
     for fullType in pairs(results) do table.insert(fullTypes, fullType) end
     table.sort(fullTypes)
 
-    local rows = {}
+    local rows, rowsByFullType = {}, {}
     for _, fullType in ipairs(fullTypes) do
         local data = results[fullType]
         local availability = data.tableAvailability or {}
-        table.insert(rows, table.concat({
+        local row = table.concat({
             fullType,
             stableValue(data.baseScarcityTier),
             stableValue(data.rarityTier),
@@ -238,10 +238,51 @@ local function buildResultSignature(results)
             stableValue(data.utilitySubgroup),
             stableValue(data.utilitySubgroupRank),
             stableValue(data.utilityParentPercentile),
-        }, "\t"))
+        }, "\t")
+        table.insert(rows, row)
+        rowsByFullType[fullType] = row
     end
 
-    return table.concat(rows, "\n"), #fullTypes
+    return table.concat(rows, "\n"), #fullTypes, rowsByFullType
+end
+
+local SIGNATURE_FIELDS = {
+    "fullType", "baseScarcityTier", "rarityTier", "finalRarityTier",
+    "routeWeighted", "routeWeightedPercentile", "utility", "utilityPercentile",
+    "utilityConfidence", "utilityEligible", "utilityKind", "utilitySubgroup",
+    "utilitySubgroupRank", "utilityParentPercentile",
+}
+
+local function splitSignatureRow(row)
+    local values = {}
+    for value in string.gmatch((row or "") .. "\t", "(.-)\t") do table.insert(values, value) end
+    return values
+end
+
+local function logSignatureDifferences(previousRows, currentRows)
+    if type(previousRows) ~= "table" or type(currentRows) ~= "table" then return end
+    local fullTypes = {}
+    for fullType in pairs(previousRows) do fullTypes[fullType] = true end
+    for fullType in pairs(currentRows) do fullTypes[fullType] = true end
+    local ordered = {}
+    for fullType in pairs(fullTypes) do table.insert(ordered, fullType) end
+    table.sort(ordered)
+    local changed, examples = 0, {}
+    for _, fullType in ipairs(ordered) do
+        local before, after = previousRows[fullType], currentRows[fullType]
+        if before ~= after then
+            changed = changed + 1
+            if #examples < 8 then
+                local oldValues, newValues, fields = splitSignatureRow(before), splitSignatureRow(after), {}
+                for index, name in ipairs(SIGNATURE_FIELDS) do
+                    if oldValues[index] ~= newValues[index] then table.insert(fields, name) end
+                end
+                table.insert(examples, fullType .. " [" .. table.concat(fields, ",") .. "]")
+            end
+        end
+    end
+    ItemRarityUtils.warn("Determinism diff: " .. changed .. " items changed"
+        .. (#examples > 0 and " | " .. table.concat(examples, " ; ") or ""))
 end
 
 local function fingerprint(signature)
@@ -373,6 +414,48 @@ local function logMechanicalValueValidation(results)
             ))
         end
     end
+    local food = { known = 0, partial = 0, changed = 0, COMMON = 0, UNCOMMON = 0, RARE = 0, EPIC = 0, EXOTIC = 0 }
+    for _, data in pairs(results) do
+        if data.utilityKind == "FOOD" then
+            if data.foodValueStatus == "MECHANICAL_VALUE_KNOWN" then food.known = food.known + 1 end
+            if data.foodValueStatus == "MECHANICAL_VALUE_PARTIAL" then food.partial = food.partial + 1 end
+            if data.finalRarityTier ~= data.baseScarcityTier then food.changed = food.changed + 1 end
+            if food[data.finalRarityTier] ~= nil then food[data.finalRarityTier] = food[data.finalRarityTier] + 1 end
+        end
+    end
+    ItemRarityUtils.info(string.format("FoodUtility V1 | known=%d | partial=%d | tier-changed=%d | C/U/R/E/X=%d/%d/%d/%d/%d | H60 Mood20 E12 P5 C3 | POWER15 | SAT600 | final=95%% quality +5%% scarcity", food.known, food.partial, food.changed, food.COMMON, food.UNCOMMON, food.RARE, food.EPIC, food.EXOTIC))
+    for _, fullType in ipairs({ "Base.Icecream", "Base.IcecreamMelted", "Base.PizzaWhole", "Base.Chocolate_HeartBox", "Base.MapleSyrup", "Base.PeanutButter", "Base.Cereal", "Base.DogfoodOpen", "Base.Toast", "Base.CannedFruitBeverageOpen" }) do
+        local data = results[fullType]
+        if data then
+            ItemRarityUtils.info(string.format(
+                "Food validation %s | group=%s | status=%s | Scarcity=%s | Quality=%s | finalScore=%s | percentile=%s | utilityConfidence=%s | rankingConfidence=%s | before=%s | after=%s",
+                fullType, tostring(data.utilitySubgroup), tostring(data.foodValueStatus), tostring(data.baseScarcityTier), tostring(data.foodQuality), tostring(data.foodFinalScore),
+                tostring(data.foodQualityPercentile), tostring(data.foodUtilityConfidence), tostring(data.foodRankingConfidence), tostring(data.baseScarcityTier), tostring(data.finalRarityTier)
+            ))
+        end
+    end
+
+    -- Fish is a deterministic fullType model: log its small, complete
+    -- population so integration can be verified without inspecting a random
+    -- caught-fish instance. This is diagnostic output only.
+    local fish = { total = 0, referenceSpecies = 0, COMMON = 0, UNCOMMON = 0, RARE = 0, EPIC = 0, EXOTIC = 0 }
+    for _, data in pairs(results) do
+        if data.utilityKind == "FISH" then
+            fish.total = fish.total + 1
+            fish.referenceSpecies = math.max(fish.referenceSpecies, tonumber(data.utilityProfileCount) or 0)
+            if fish[data.finalRarityTier] ~= nil then fish[data.finalRarityTier] = fish[data.finalRarityTier] + 1 end
+        end
+    end
+    ItemRarityUtils.info(string.format("FishUtility V1 | Fishing API species=%d | registry fish=%d | tiers C/U/R/E/X=%d/%d/%d/%d/%d | Yield H80 Cal20(SAT2000) | Difficulty S60 P20 B20 | Model C; Strategy D excluded",
+        fish.referenceSpecies, fish.total, fish.COMMON, fish.UNCOMMON, fish.RARE, fish.EPIC, fish.EXOTIC))
+    for _, fullType in ipairs({ "Base.AligatorGar", "Base.BlueCatfish", "Base.FlatheadCatfish", "Base.Paddlefish", "Base.Muskellunge", "Base.StripedBass", "Base.Walleye", "Base.LargemouthBass", "Base.FreshwaterDrum", "Base.Bluegill" }) do
+        local data = results[fullType]
+        if data and data.utilityKind == "FISH" then
+            ItemRarityUtils.info(string.format("Fish validation %s | yield=%.2f | difficulty=%.2f | ceiling=%s | position=%s | tier=%s",
+                fullType, data.fishExpectedFoodYield or -1, data.catchDifficulty or -1,
+                tostring(data.fishYieldTierCeiling), tostring(data.fishPositionTier), tostring(data.finalRarityTier)))
+        end
+    end
 end
 
 local function runFullScan(source, force)
@@ -395,6 +478,15 @@ local function runFullScan(source, force)
     end
 
     local previousSignature = ItemRarityScanner.lastScanSignature
+    local previousSignatureRows = ItemRarityScanner.lastScanSignatureRows
+    -- A hot-reloaded scanner may not yet have row snapshots, while the prior
+    -- registry is still live. Rebuild only the read-only comparison rows so
+    -- the very next rescan can report a diff without requiring a seed scan.
+    if previousSignatureRows == nil and type(ItemRarityScanner.results) == "table" then
+        local liveSignature, _, liveRows = buildResultSignature(ItemRarityScanner.results)
+        previousSignature = previousSignature or liveSignature
+        previousSignatureRows = liveRows
+    end
     local manualStarted = nowMs()
     if force then
         ItemRarityUtils.info("manual rescan started")
@@ -483,10 +575,11 @@ local function runFullScan(source, force)
         counters.mappedRoutes = counters.mappedRoutes + poolData.routeCount
         if poolData.routeCount == 0 then counters.poolsWithoutKnownRoutes = counters.poolsWithoutKnownRoutes + 1 end
     end
-    local signature, signatureItemCount = buildResultSignature(ItemRarityScanner.results)
+    local signature, signatureItemCount, signatureRows = buildResultSignature(ItemRarityScanner.results)
     counters.resultSignature = fingerprint(signature)
     counters.resultSignatureItemCount = signatureItemCount
     ItemRarityScanner.lastScanSignature = signature
+    ItemRarityScanner.lastScanSignatureRows = signatureRows
     ItemRarityScanner.lastScanSignatureFingerprint = counters.resultSignature
     ItemRarityUtils.info(string.format("Scan completed: %d item types (%d Base, %d modded), %d entries, %d procedural distributions, %d static distributions.", counters.itemTypes, vanilla, modded, counters.entries, counters.proceduralDistributions, counters.staticDistributions))
     ItemRarityUtils.info(string.format("Pool exposure registry: %d pools, %d mapped routes, %d pools without a known route.", (function() local n=0 for _ in pairs(registry) do n=n+1 end return n end)(), counters.mappedRoutes, counters.poolsWithoutKnownRoutes))
@@ -510,6 +603,7 @@ local function runFullScan(source, force)
         ItemRarityUtils.info(string.format("manual rescan scan completed - %d items", counters.itemTypes))
         ItemRarityUtils.info("manual rescan deterministic comparison: " .. (sameAsPrevious and "MATCH" or "CHANGED")
             .. " | signature=" .. counters.resultSignature)
+        if not sameAsPrevious then logSignatureDifferences(previousSignatureRows, signatureRows) end
         ItemRarityUtils.info(string.format("manual rescan completed in %d ms", nowMs() - manualStarted))
     end
     return ItemRarityScanner.results
@@ -526,8 +620,13 @@ function ItemRarityScanner.rescan(source)
     local results = runFullScan(source or "manual", true)
     -- Temporary forensic capture for baseline-regression investigation. The
     -- writer is read-only and runs after the completed pipeline/signature.
+    -- Use the fingerprint in the filename so two different scans can be
+    -- compared item-by-item without asking the player to save snapshots.
+    if getFileWriter then
+        require "ItemRarity/Diagnostics/RegistrySnapshot"
+    end
     if ItemRarityRegistrySnapshot and ItemRarityRegistrySnapshot.write then
-        ItemRarityRegistrySnapshot.write("CURRENT")
+        ItemRarityRegistrySnapshot.write("AUTO_" .. tostring(ItemRarityScanner.lastScanSignatureFingerprint or "UNKNOWN"))
     end
     return results
 end

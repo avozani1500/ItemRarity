@@ -110,11 +110,47 @@ function ItemRarity.writeClothingMechanicalValueAudit()
     return nil, message
 end
 
+-- Read-only Food runtime audit.  It runs server-side and is deliberately
+-- separate from FoodUtility, which has not been implemented yet.
+function ItemRarity.writeFoodRuntimeAudit()
+    if ItemRarityFoodRuntimeAudit and type(ItemRarityFoodRuntimeAudit.write) == "function" and ItemRarityScanner then
+        return ItemRarityFoodRuntimeAudit.write(ItemRarityScanner.results)
+    end
+    local player = getSpecificPlayer and getSpecificPlayer(0) or (getPlayer and getPlayer() or nil)
+    if sendClientCommand and player then
+        sendClientCommand(player, "ItemRarity", "foodRuntimeAudit", {})
+        local message = "ItemRarity Food runtime audit requested from the client; waiting for the host report."
+        if ItemRarityUtils and ItemRarityUtils.info then ItemRarityUtils.info(message) else print(message) end
+        return true, message
+    end
+    local message = "ItemRarity Food runtime audit is unavailable: this Lua context cannot reach the host registry."
+    if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+    return nil, message
+end
+
+-- Read-only audit of the static ScriptItem bridge against fresh runtime Food
+-- instances. It never republishes a registry or recalculates a tier.
+function ItemRarity.writeFoodStaticSourceAudit()
+    if ItemRarityFoodStaticSourceAudit and type(ItemRarityFoodStaticSourceAudit.write) == "function" and ItemRarityScanner then
+        return ItemRarityFoodStaticSourceAudit.write(ItemRarityScanner.results)
+    end
+    local player = getSpecificPlayer and getSpecificPlayer(0) or (getPlayer and getPlayer() or nil)
+    if sendClientCommand and player then
+        sendClientCommand(player, "ItemRarity", "foodStaticSourceAudit", {})
+        local message = "ItemRarity Food static-source audit requested from the client; waiting for the host report."
+        if ItemRarityUtils and ItemRarityUtils.info then ItemRarityUtils.info(message) else print(message) end
+        return true, message
+    end
+    local message = "ItemRarity Food static-source audit is unavailable: this Lua context cannot reach the host registry."
+    if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+    return nil, message
+end
+
 -- Reloads an explicitly permitted server-side diagnostic writer.  Normal
 -- ItemRarity runtime files remain intentionally outside this API; changing
 -- active pipeline code still requires the normal controlled validation flow.
 function ItemRarity.reloadDiagnostic(key)
-    local allowed = { clothingMechanicalValue=true, clothingCostCalibration=true }
+    local allowed = { clothingMechanicalValue=true, clothingCostCalibration=true, foodRuntimeAudit=true, foodStaticSourceAudit=true }
     if not allowed[key] then
         local message = "ItemRarity.reloadDiagnostic() rejected an unknown diagnostic key."
         if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end

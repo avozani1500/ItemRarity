@@ -108,6 +108,28 @@ ItemRarityConfig.utility = {
             attachments = 0.05,
         },
         essential = { "capacity", "weightReduction" },
+        -- ContainerUtility V2 compares only structurally equivalent slots.
+        -- Each group's reference population is vanilla-only; loaded mods are
+        -- scored against that stable reference but never reshape it.
+        v2 = {
+            utilityVersion = "V2_STRUCTURAL_VANILLA_REFERENCE",
+            groups = {
+                BACK = {
+                    weights = { capacity = 0.35, weightReduction = 0.35, emptyWeight = 0.15, attachments = 0.05 },
+                    essential = { "capacity", "weightReduction" },
+                },
+                TORSO_GENERAL = {
+                    weights = { capacity = 0.25, weightReduction = 0.30, attachments = 0.30, emptyWeight = 0.15 },
+                    essential = { "capacity", "weightReduction" },
+                },
+                FANNY_PACK = {
+                    weights = { capacity = 0.50, weightReduction = 0.30, emptyWeight = 0.20 },
+                    essential = { "capacity", "weightReduction" },
+                },
+                TORSO_AMMO = { weights = {}, essential = {} },
+                KEY_CONTAINER = { weights = {}, essential = {} },
+            },
+        },
     },
 
     meleeWeapon = {
@@ -147,5 +169,72 @@ ItemRarityConfig.utility = {
         weightWeight = 0.00,
         mediumConfidenceProfiles = 2,
         highConfidenceProfiles = 8,
+    },
+
+    -- FoodUtility V1 deliberately has a different rarity philosophy from
+    -- weapons/clothing: direct consumption quality establishes the tier band;
+    -- scarcity is only a small refinement and an EXOTIC companion condition.
+    food = {
+        utilityVersion = "V1_H60_M20_E12_P5_C3_POWER15_SAT600",
+        food = { hunger = 0.60, mood = 0.20, energy = 0.12, preservation = 0.05, convenience = 0.03 },
+        mood = { unhappy = 0.50, boredom = 0.20, stress = 0.30, capPercentile = 90 },
+        drink = { hunger = 0.10, energy = 0.10, hydration = 0.60, preservation = 0.10, convenience = 0.10 },
+        energyHalfSaturationCalories = 600,
+        negativePower = 1.5,
+        negativeFactor = 0.80,
+        scarcityWeight = 0.05,
+        mediumConfidenceProfiles = 8,
+        highConfidenceProfiles = 20,
+        -- FoodQuality bands are intentionally absolute-quality bands, not
+        -- percentiles. Scarcity may qualify an otherwise exceptional FOOD
+        -- for EXOTIC but cannot rescue a weak consumable.
+        tiers = { uncommon = 30, rare = 50, epic = 70, exotic = 85, exoticMinimumScarcity = 60 },
+    },
+
+    -- FishUtility is intentionally independent from FoodUtility. Fish stats
+    -- are generated per instance from Fishing.onCreateFish, so this V1
+    -- integrates the declared species size distribution instead of reading a
+    -- random InventoryItem. Yield determines the ceiling; catch difficulty
+    -- can only position a species inside that ceiling.
+    fish = {
+        utilityVersion = "V1_YIELD_H80_CAL20_SAT2000_DIFFICULTY_S60_P20_B20_MODEL_C",
+        expectedYield = { hunger = 0.80, calories = 0.20, caloriesHalfSaturation = 2000 },
+        catchDifficulty = { minimumSkill = 0.60, predatorReel = 0.20, baitProfile = 0.20 },
+        position = { expectedYield = 0.80, catchDifficulty = 0.20 },
+        -- All vanilla Fishing.onCreateFish species declare 159 base kcal in
+        -- B42. The ScriptItem bridge does not reliably expose that component;
+        -- this is a documented B42 fishing-system fallback, not an item rule.
+        declaredBaseCaloriesFallback = 159,
+        yieldTiers = { uncommon = 20, rare = 30, epic = 60, exotic = 85 },
+    },
+
+    -- Literature V1 is structural: SkillBook position alone owns its tier;
+    -- reading mood has a bounded RARE ceiling; permanent recipes are scored
+    -- from their unique LearnedRecipes; all remaining special literature is
+    -- PARTIAL until its distinct mechanics are measured.
+    literature = {
+        utilityVersion = "V1_SKILLBOOK_MAP_MOOD_RECIPE_TRIVIAL",
+        skillbookTiers = { [1] = "COMMON", [2] = "UNCOMMON", [3] = "RARE", [4] = "EPIC", [5] = "EXOTIC" },
+        -- `LootMaps.Init[MapID]` is client-only vanilla Lua, while the
+        -- scanner owns the server registry.  These are the MapIDs whose
+        -- callbacks were verified in the local B42.20.2 ISMapDefinitions.lua.
+        -- The key is MapID (the game's structural map identity), never an
+        -- item fullType or city/display name. Unknown/modded MapIDs remain
+        -- SPECIAL_PARTIAL until a client-to-server callback bridge exists.
+        confirmedRevealMapIds = {
+            LouisvilleMap1 = true, LouisvilleMap2 = true, LouisvilleMap3 = true,
+            LouisvilleMap4 = true, LouisvilleMap5 = true, LouisvilleMap6 = true,
+            LouisvilleMap7 = true, LouisvilleMap8 = true, LouisvilleMap9 = true,
+            MarchRidgeMap = true, MuldraughMap = true, RiversideMap = true,
+            RosewoodMap = true, WestpointMap = true,
+        },
+        mapFinalTier = "RARE",
+        entertainment = { unhappyCap = 40, boredomCap = 50, stressCap = 50, uncommonMinimum = 25, rareMinimum = 60 },
+        recipe = {
+            recipeValueDenominatorOffset = 3,
+            recipeValueWeight = 0.70,
+            scarcityStrengthWeight = 0.30,
+            tiers = { uncommon = 30, rare = 50, epic = 70, exotic = 85 },
+        },
     },
 }

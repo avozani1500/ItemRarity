@@ -154,7 +154,14 @@ local function containerSubgroup(scriptItem, runtimeItem)
         or readString(runtimeItem, "getBodyLocation", nil)
         or readString(scriptItem, "getBodyLocation", nil)
         or ""
+    local accept = readString(runtimeItem, "getAcceptItemFunction", nil)
+        or readString(scriptItem, "getAcceptItemFunction", nil)
+        or ""
+    local tags = readString(scriptItem, "getTags", nil) or ""
     body = string.lower(body)
+    accept = string.lower(accept)
+    tags = string.lower(tags)
+    if contains(accept, "keyring") or contains(tags, "keyring") then return "KEY_CONTAINER" end
     local capacity = readNumber(runtimeItem, "getCapacity", nil, 0) or 0
     local maxItemSize = readNumber(scriptItem, "getMaxItemSize", "maxItemSize", 0) or 0
     if capacity <= 0 then return "NON_WEARABLE_CONTAINER" end
@@ -163,11 +170,10 @@ local function containerSubgroup(scriptItem, runtimeItem)
     if body == "" or contains(body, "none") or contains(body, "null") then
         return maxItemSize > 0 and "CASE" or "NON_WEARABLE_CONTAINER"
     end
-    if contains(body, "belt") or contains(body, "holster") or contains(body, "ammo_strap") or contains(body, "webbing") then
-        return "BELT_OR_ATTACHMENT_CONTAINER"
-    end
-    if contains(body, "back") then return "BACKPACK" end
-    if contains(body, "satchel") or contains(body, "fanny") then return "WEARABLE_BAG" end
+    if contains(body, "ammo") then return "TORSO_AMMO" end
+    if contains(body, "back") then return "BACK" end
+    if contains(body, "fanny") then return "FANNY_PACK" end
+    if contains(body, "webbing") or contains(body, "satchel") then return "TORSO_GENERAL" end
 
     -- Do not infer equipability from capacity alone. The Lua bridge can expose
     -- a generic InventoryItem body location when `canBeEquipped()` is null;
@@ -578,6 +584,8 @@ local function makeMedicalCandidate(data, scriptItem)
     local displayCategory = string.lower(tostring(data.displayCategory or readString(scriptItem, "getDisplayCategory", "displayCategory") or ""))
     local tags = string.lower(tostring(readString(scriptItem, "getTags", "tags") or ""))
     local itemType = string.lower(tostring(readString(scriptItem, "getItemType", "itemType") or ""))
+    local declaredFoodSickness = readNumber(scriptItem, "getFoodSicknessChange", "foodSicknessChange", nil)
+    if declaredFoodSickness == nil then declaredFoodSickness = readNumber(runtimeItem, "getFoodSicknessChange", "foodSicknessChange", nil) end
     local metrics = {
         bandagePower = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getBandagePower", "bandagePower"),
         alcoholPower = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getAlcoholPower", "alcoholPower"),
@@ -587,7 +595,10 @@ local function makeMedicalCandidate(data, scriptItem)
         fluReduction = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getFluReduction", "fluReduction"),
         feverReduction = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getFeverReduction", "feverReduction")
             or readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getReduceFever", "feverReduction"),
-        foodSicknessChange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getFoodSicknessChange", "foodSicknessChange"),
+        -- This field decides whether a food-like item belongs to Medical.
+        -- Keep the declared ScriptItem value authoritative so a transient
+        -- Food instance cannot move an item between the two populations.
+        foodSicknessChange = declaredFoodSickness,
         useDelta = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getUseDelta", "useDelta"),
         weight = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getActualWeight", "actualWeight"),
     }
@@ -598,7 +609,11 @@ local function makeMedicalCandidate(data, scriptItem)
         or (metrics.foodSicknessChange or 0) < 0
     local procedure = contains(tags, "removebullet") or contains(tags, "removeglass") or contains(tags, "tweezers")
     local unpackRecipe = readString(scriptItem, "getDoubleClickRecipe", "doubleClickRecipe")
-    local hasOnEat = readField(scriptItem, "onEat") ~= nil or callMethod(scriptItem, "getOnEat") ~= nil
+    -- The B42 bridge exposes an empty OnEat representation for ordinary Food;
+    -- non-nil is therefore not evidence of a special callback. Only a real,
+    -- nonempty callback declaration makes direct FoodUtility unsafe.
+    local onEat = readRuntimeOrScriptString(runtimeItem, scriptItem, "getOnEat", "onEat") or ""
+    local hasOnEat = onEat ~= "" and string.lower(onEat) ~= "nil"
     local firstAid = displayCategory == "firstaid"
     local declaredMedical = data.category == "MEDICAL" or firstAid
     if not declaredMedical and not canBandage and not hasNumericEffect and not procedure then return nil end
@@ -654,6 +669,275 @@ local function makeMedicalCandidate(data, scriptItem)
     }
 end
 
+-- FoodUtility V1 evaluates only direct consumption.  The script/runtime does
+-- not expose a positive "CanEat" flag, so known preparation states are kept
+-- PARTIAL rather than being silently treated as ready meals.  This classifier
+-- uses only runtime/script properties and tags, never names or fullTypes.
+local function makeFoodCandidate(data, scriptItem)
+    -- B42 does not expose every declared Food value through ScriptItem. Build
+    -- one isolated instance for the missing bridge fields, then explicitly
+    -- reset mutable Food state so it represents the base fullType rather than
+    -- the world's age, cooking or spoilage state.
+    local function newCanonicalRuntimeFood()
+        local ok, item = pcall(function() return scriptItem:InstanceItem(nil, false) end)
+        if not ok then return nil end
+        callMethodWithArgs(item, "setAge", 0)
+        callMethodWithArgs(item, "setCooked", false)
+        callMethodWithArgs(item, "setBurnt", false)
+        callMethodWithArgs(item, "setRotten", false)
+        callMethodWithArgs(item, "setFreezingTime", 0)
+        return item
+    end
+    local runtimeItem = newCanonicalRuntimeFood()
+    -- Some B42 Food OnCreate callbacks generate nutrition per instance (such
+    -- as the size of a caught fish). Detect this behavior mechanically rather
+    -- than by callback name or fullType: variable fullTypes have no single
+    -- honest base FoodQuality and remain PARTIAL.
+    local function runtimeFoodSignature(item)
+        local values = {
+            readNumber(item, "getHungerChange", "hungerChange", nil), readNumber(item, "getThirstChange", "thirstChange", nil),
+            readNumber(item, "getCalories", "calories", nil), readNumber(item, "getDaysTotallyRotten", "daysTotallyRotten", nil),
+            readNumber(item, "getUnhappyChange", "unhappyChange", nil), readNumber(item, "getBoredomChange", "boredomChange", nil),
+            readNumber(item, "getStressChange", "stressChange", nil), readNumber(item, "getFoodSicknessChange", "foodSicknessChange", nil),
+            readBoolean(item, "isCookable", "isCookable"), readBoolean(item, "isDangerousUncooked", "dangerousUncooked"),
+            readBoolean(item, "isPoison", "poison"), readBoolean(item, "isAlcoholic", "alcoholic"),
+        }
+        local parts = {}
+        for _, value in ipairs(values) do
+            table.insert(parts, type(value) == "number" and string.format("%.8f", value) or (value == nil and "-" or tostring(value)))
+        end
+        return table.concat(parts, ":")
+    end
+    local verificationItem = newCanonicalRuntimeFood()
+    local variableInstanceValue = runtimeItem and verificationItem
+        and runtimeFoodSignature(runtimeItem) ~= runtimeFoodSignature(verificationItem) or false
+    local function foodNumber(getter, field)
+        local value = callMethod(scriptItem, getter)
+        if value == nil then value = readField(scriptItem, field) end
+        value = tonumber(value)
+        if value ~= nil then return value end -- includes declared zero
+        return readNumber(runtimeItem, getter, field, nil)
+    end
+    local function foodBoolean(getter, field)
+        local value = callMethod(scriptItem, getter)
+        if value == nil then value = readField(scriptItem, field) end
+        if value ~= nil then return value == true end -- includes declared false
+        return readBoolean(runtimeItem, getter, field)
+    end
+    local function foodString(getter, field)
+        local value = readString(scriptItem, getter, field)
+        if value ~= nil then return value end -- includes a declared empty string
+        return readString(runtimeItem, getter, field)
+    end
+    local displayCategory = string.lower(tostring(data.displayCategory or readString(scriptItem, "getDisplayCategory", "displayCategory") or ""))
+    local itemType = string.lower(tostring(readString(scriptItem, "getType", "type") or ""))
+    local tags = string.lower(tostring(readString(scriptItem, "getTags", "tags") or ""))
+    local metrics = {
+        hungerChange = foodNumber("getHungerChange", "hungerChange"), thirstChange = foodNumber("getThirstChange", "thirstChange"),
+        calories = foodNumber("getCalories", "calories"), daysTotallyRotten = foodNumber("getDaysTotallyRotten", "daysTotallyRotten"),
+        cookable = foodBoolean("isCookable", "isCookable"), minutesToCook = foodNumber("getMinutesToCook", "minutesToCook"),
+        unhappyChange = foodNumber("getUnhappyChange", "unhappyChange"), boredomChange = foodNumber("getBoredomChange", "boredomChange"), stressChange = foodNumber("getStressChange", "stressChange"),
+        foodSicknessChange = foodNumber("getFoodSicknessChange", "foodSicknessChange"), dangerousUncooked = foodBoolean("isDangerousUncooked", "dangerousUncooked"),
+        poison = foodBoolean("isPoison", "poison"), alcoholic = foodBoolean("isAlcoholic", "alcoholic"), useDelta = foodNumber("getUseDelta", "useDelta"),
+        cantEat = foodBoolean("isCantEat", "cantEat"), eatType = foodString("getEatType", "eatType") or "", customEatSound = foodString("getCustomEatSound", "customEatSound") or "",
+        foodType = foodString("getFoodType", "foodType") or "", onCooked = foodString("getOnCooked", "onCooked") or "", replaceOnCooked = foodString("getReplaceOnCooked", "replaceOnCooked") or "",
+        onCreate = foodString("getOnCreate", "onCreate") or "",
+        removeNegativeEffectOnCooked = foodBoolean("isRemoveNegativeEffectOnCooked", "removeNegativeEffectOnCooked"),
+    }
+    local nutritive = (metrics.hungerChange or 0) ~= 0 or (metrics.thirstChange or 0) ~= 0 or (metrics.calories or 0) ~= 0
+    local foodEvidence = itemType == "food" or displayCategory == "food" or nutritive or metrics.cookable or contains(tags, "food")
+    if not foodEvidence then return nil end
+    -- B42 serializes Java nulls and empty collections through the Lua bridge
+    -- as text. Those sentinels are absence, never a recipe callback.
+    local function declaredValue(value)
+        local text = string.lower(tostring(value or ""))
+        return text ~= "" and text ~= "nil" and text ~= "null" and text ~= "[]"
+    end
+    local ingredient = contains(tags, "ingredient") or contains(tags, "isseed") or contains(tags, "iscutting") or contains(tags, "pizzasauce")
+    local onEat = foodString("getOnEat", "onEat") or ""
+    local hasOnEat = declaredValue(onEat)
+    local hungerBenefit = math.max(0, -(metrics.hungerChange or 0))
+    local thirstBenefit = math.max(0, -(metrics.thirstChange or 0))
+    local partialReason = nil
+    if metrics.cantEat then partialReason = "CANT_EAT_REQUIRED"
+    elseif declaredValue(metrics.onCooked) then partialReason = "PREPARATION_REQUIRED"
+    elseif metrics.removeNegativeEffectOnCooked or declaredValue(metrics.replaceOnCooked) then partialReason = "PREPARATION_AMBIGUOUS"
+    elseif ingredient then partialReason = "INGREDIENT_UNQUANTIFIED"
+    elseif variableInstanceValue then partialReason = "VARIABLE_INSTANCE_VALUE"
+    -- B42 callbacks can create an item whose food values vary per instance
+    -- (for example caught fish size). A fullType has no single truthful
+    -- FoodQuality in that case, so retain Scarcity and mark the effect
+    -- PARTIAL instead of scoring whichever random instance was generated.
+    elseif declaredValue(metrics.onCreate) then partialReason = "SPECIAL_UNQUANTIFIED"
+    elseif metrics.alcoholic or metrics.poison or hasOnEat then partialReason = "SPECIAL_UNQUANTIFIED" end
+    if not partialReason and hungerBenefit <= 0 and thirstBenefit <= 0 and (metrics.calories or 0) <= 0 then
+        partialReason = "SPECIAL_UNQUANTIFIED"
+    end
+    local eatType, eatSound = string.lower(metrics.eatType), string.lower(metrics.customEatSound)
+    local functionalGroup = contains(eatType, "drink") and contains(eatSound, "drinking") and thirstBenefit > hungerBenefit and "DRINK" or "FOOD"
+    local isDrainable = contains(itemType, "drainable")
+    local uses = 1
+    if isDrainable and metrics.useDelta and metrics.useDelta > 0 and metrics.useDelta <= 1 then uses = math.max(1, math.floor(1 / metrics.useDelta + .5)) end
+    metrics.hungerBenefit, metrics.thirstBenefit, metrics.uses = hungerBenefit, thirstBenefit, uses
+    local known = partialReason == nil
+    return {
+        data = data,
+        kind = "FOOD",
+        subgroup = functionalGroup,
+        functionalGroup = functionalGroup,
+        parentGroup = "FOOD",
+        metrics = metrics,
+        foodValueStatus = known and "MECHANICAL_VALUE_KNOWN" or "MECHANICAL_VALUE_PARTIAL",
+        foodPartialReason = partialReason,
+        profile = table.concat({ functionalGroup, tostring(hungerBenefit), tostring(thirstBenefit), tostring(metrics.calories), tostring(metrics.daysTotallyRotten), tostring(metrics.unhappyChange), tostring(metrics.boredomChange), tostring(metrics.stressChange), tostring(metrics.foodSicknessChange), tostring(metrics.dangerousUncooked), tostring(metrics.cookable), tostring(metrics.minutesToCook), tostring(uses) }, ":"),
+        utilityEligible = known,
+        ineligibleReason = partialReason and ("FoodUtility V1 PARTIAL: " .. partialReason) or nil,
+        config = UTILITY.food,
+        directions = {},
+    }
+end
+
+-- Fishing.onCreateFish mutates Food statistics from the randomly generated
+-- fish size.  FishUtility reads the deterministic Fishing.FishConfig tables
+-- instead, so a fullType never inherits a random instance's nutrition.
+local function fishingConfigurations()
+    if not Fishing or not Fishing.fishes then pcall(require, "Fishing/fishing_properties") end
+    if not Fishing or not Fishing.Utils then pcall(require, "Fishing/FishingUtils") end
+    return Fishing and Fishing.fishes or nil
+end
+
+local function fishConfigurationFor(fullType)
+    local configurations = fishingConfigurations()
+    if not configurations then return nil end
+    for _, configuration in ipairs(configurations) do
+        if configuration.itemType == fullType then return configuration end
+    end
+    return nil
+end
+
+local function fishMinimumSkill(configuration)
+    local limits = Fishing and Fishing.Utils and Fishing.Utils.skillSizeLimit or nil
+    if not limits or not configuration or not configuration.maxWeight then return nil end
+    for level = 0, 10 do
+        if limits[level] and configuration.maxWeight <= limits[level] then return level end
+    end
+    return nil
+end
+
+local function fishExpectedWeight(configuration)
+    local minimumLength = tonumber(configuration.minLength) or 10
+    local maximumLength = tonumber(configuration.maxLength)
+    local maximumWeight = tonumber(configuration.maxWeight)
+    if not maximumLength or not maximumWeight or maximumLength <= minimumLength then return nil end
+    local delta = maximumLength - minimumLength
+    local smallEnd = math.floor(minimumLength + delta * 0.3333)
+    local mediumEnd = math.floor(minimumLength + delta * 0.6666)
+    local weightedSum, chanceSum = 0, 0
+    for length = minimumLength, maximumLength do
+        local chance, weight
+        if length <= smallEnd then
+            local denominator = math.max(1, smallEnd - minimumLength)
+            chance = 60
+            weight = 0.1 + ((length - minimumLength) / denominator) * (maximumWeight * 0.2 - 0.1)
+        elseif length <= mediumEnd then
+            local start = smallEnd + 1
+            local denominator = math.max(1, mediumEnd - start)
+            chance = 30
+            weight = maximumWeight * 0.2 + ((length - start) / denominator) * (maximumWeight * 0.4)
+        else
+            local start = mediumEnd + 1
+            local denominator = math.max(1, maximumLength - start)
+            chance = 10
+            weight = maximumWeight * 0.6 + ((length - start) / denominator) * (maximumWeight * 0.4)
+        end
+        -- Fishing.FishConfig:initFishSizeData() imposes the same 45 lb cap.
+        weight = math.min(weight, 45 / 2.2)
+        weightedSum = weightedSum + weight * chance
+        chanceSum = chanceSum + chance
+    end
+    return chanceSum > 0 and weightedSum / chanceSum or nil
+end
+
+local function fishBaitProfile(configuration)
+    local configurations = fishingConfigurations()
+    if not configurations or not configuration or type(configuration.lure) ~= "table" then return nil, nil end
+    local allBaits, totals = {}, {}
+    for _, other in ipairs(configurations) do
+        if other.isHaveDifferentSizes ~= false and type(other.lure) == "table" then
+            for bait, coefficient in pairs(other.lure) do
+                coefficient = tonumber(coefficient) or 0
+                if coefficient > 0 then
+                    allBaits[bait] = true
+                    totals[bait] = (totals[bait] or 0) + coefficient
+                end
+            end
+        end
+    end
+    local totalBaits, compatibleBaits, conditionalSum = 0, 0, 0
+    for _ in pairs(allBaits) do totalBaits = totalBaits + 1 end
+    for bait, coefficient in pairs(configuration.lure) do
+        coefficient = tonumber(coefficient) or 0
+        if coefficient > 0 and totals[bait] and totals[bait] > 0 then
+            compatibleBaits = compatibleBaits + 1
+            conditionalSum = conditionalSum + coefficient / totals[bait]
+        end
+    end
+    local conditionalMean = compatibleBaits > 0 and conditionalSum / compatibleBaits or 0
+    return compatibleBaits, conditionalMean, totalBaits
+end
+
+-- Builds a deterministic species record from the same Fishing.FishConfig
+-- source used by Fishing.onCreateFish. `scriptItem` is optional because the
+-- FishUtility reference universe also includes valid catchable species that
+-- have no current loot-table route (and therefore no scanner registry row).
+local function fishMetricsForConfiguration(configuration, scriptItem)
+    if not configuration or configuration.isHaveDifferentSizes == false then return nil end
+    local expectedWeight = fishExpectedWeight(configuration)
+    local minimumSkill = fishMinimumSkill(configuration)
+    local weightFactor = tonumber(configuration.weightFactor)
+    if not expectedWeight or minimumSkill == nil or not weightFactor or weightFactor <= 0 then return nil end
+    local baseCalories = readNumber(scriptItem, "getCalories", "calories", nil)
+    if not baseCalories or baseCalories <= 0 then
+        baseCalories = UTILITY.fish.declaredBaseCaloriesFallback
+    end
+    local baitCount, conditionalShare, totalBaits = fishBaitProfile(configuration)
+    if not baitCount or totalBaits <= 0 then return nil end
+    return {
+        expectedWeight = expectedWeight,
+        expectedHunger = math.max(0.05, expectedWeight / weightFactor) * 100,
+        expectedCalories = baseCalories * (2.2 * expectedWeight / 0.4),
+        minimumFishingSkill = minimumSkill,
+        predator = configuration.isPredator == true,
+        baitCount = baitCount,
+        conditionalSpeciesShare = conditionalShare,
+        baitUniverseSize = totalBaits,
+    }
+end
+
+local function makeFishCandidate(data, scriptItem)
+    local configuration = fishConfigurationFor(data.fullType)
+    -- BaitFish is a fishing configuration but not a dynamically-sized caught
+    -- food item. `isHaveDifferentSizes == false` is the structural separator.
+    if not configuration or configuration.isHaveDifferentSizes == false then return nil end
+    local metrics = fishMetricsForConfiguration(configuration, scriptItem)
+    if not metrics then return nil end
+    return {
+        data = data,
+        kind = "FISH",
+        subgroup = "FISH",
+        functionalGroup = "FISH",
+        parentGroup = "FISH",
+        metrics = metrics,
+        profile = table.concat({ data.fullType, string.format("%.5f", metrics.expectedWeight), tostring(metrics.minimumFishingSkill), tostring(configuration.isPredator == true), tostring(metrics.baitCount), string.format("%.5f", metrics.conditionalSpeciesShare) }, ":"),
+        utilityEligible = true,
+        utilityConfidence = "HIGH",
+        validAttributeCount = 6,
+        essentialsPresent = true,
+        config = UTILITY.fish,
+        directions = {},
+    }
+end
+
 local function makeContainerCandidate(data, scriptItem)
     -- The temporary object is never put into an inventory and is never
     -- transmitted. It exists only long enough to read the B42 runtime API.
@@ -675,17 +959,21 @@ local function makeContainerCandidate(data, scriptItem)
         runSpeedModifier = runSpeedModifier,
         attachments = attachments,
     }
+    local v2 = UTILITY.container.v2 and UTILITY.container.v2.groups or {}
+    local groupConfig = v2[subgroup]
     return {
         data = data,
         kind = "CONTAINER",
         subgroup = subgroup,
-        parentGroup = "WEARABLE_CONTAINER",
+        parentGroup = "CONTAINER_V2",
         metrics = metrics,
         profile = profileKey(metrics, { "capacity", "weightReduction", "emptyWeight", "runSpeedModifier", "attachments" }),
-        utilityEligible = subgroup == "BACKPACK" or subgroup == "WEARABLE_BAG" or subgroup == "BELT_OR_ATTACHMENT_CONTAINER",
-        ineligibleReason = (subgroup == "BACKPACK" or subgroup == "WEARABLE_BAG" or subgroup == "BELT_OR_ATTACHMENT_CONTAINER") and nil or "container is not wearable",
-        config = UTILITY.container,
+        utilityEligible = groupConfig ~= nil,
+        ineligibleReason = groupConfig and nil or "container group is deferred or not structurally safe for ContainerUtility V2",
+        config = groupConfig or UTILITY.container,
         directions = { capacity = false, weightReduction = false, emptyWeight = true, runSpeedModifier = false, attachments = false },
+        containerV2Group = subgroup,
+        containerV2Config = groupConfig,
     }
 end
 
@@ -755,6 +1043,176 @@ local function makeMeleeCandidate(data, scriptItem)
     }
 end
 
+local function literatureStructuralPosition(level)
+    return ({ [1] = 1, [3] = 2, [5] = 3, [7] = 4, [9] = 5 })[level]
+end
+
+-- LearnedRecipes is the only Recipe Literature signal intentionally used by
+-- V1.  ScriptItem exposes a Java list in normal B42 builds; the text fallback
+-- preserves deterministic support for bridge variants without consulting
+-- callback names or individual recipe contents.
+local function literatureUniqueRecipes(scriptItem)
+    -- Do not instantiate Literature here: B42 `OnCreate` callbacks can add
+    -- recipes dynamically. Recipe Literature V1 is deliberately restricted
+    -- to the static ScriptItem LearnedRecipes declaration.
+    local source = callMethod(scriptItem, "getLearnedRecipes")
+    local recipes, seen = {}, {}
+    local size = tonumber(callMethod(source, "size"))
+    if size then
+        for i = 0, size - 1 do
+            local recipe = tostring(callMethodWithArgs(source, "get", i) or "")
+            if recipe ~= "" and not seen[recipe] then
+                seen[recipe] = true
+                table.insert(recipes, recipe)
+            end
+        end
+    else
+        local raw = tostring(source or ""):gsub("^%[", ""):gsub("%]$", "")
+        for recipe in string.gmatch(raw, "[^,;]+") do
+            recipe = recipe:gsub("^%s+", ""):gsub("%s+$", "")
+            if recipe ~= "" and recipe ~= "nil" and recipe ~= "null" and not seen[recipe] then
+                seen[recipe] = true
+                table.insert(recipes, recipe)
+            end
+        end
+    end
+    table.sort(recipes)
+    return recipes
+end
+
+local function recipeLiteratureTier(score, tiers)
+    if score >= tiers.exotic then return "EXOTIC" end
+    if score >= tiers.epic then return "EPIC" end
+    if score >= tiers.rare then return "RARE" end
+    if score >= tiers.uncommon then return "UNCOMMON" end
+    return "COMMON"
+end
+
+local function makeLiteratureCandidate(data, scriptItem)
+    if data.category ~= "LITERATURE" then return nil end
+    -- Preserve the established ScriptItem/runtime bridge for frozen
+    -- SkillBook/Entertainment behavior. RecipeValue itself never consults
+    -- this instance: `literatureUniqueRecipes` above reads static ScriptItem
+    -- LearnedRecipes only and therefore never uses OnCreate-injected data.
+    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
+    if not ok then runtimeItem = nil end
+    -- The B42 bridge serializes absent String/list properties as "nil",
+    -- "null" or "[]" for some ScriptItem types. They are not declared map,
+    -- recipe or callback mechanics and must not divert ordinary literature to
+    -- SPECIAL_PARTIAL.
+    local function declaredText(value)
+        local s = tostring(value or "")
+        local low = string.lower(s)
+        return (s == "" or low == "nil" or low == "null" or low == "[]") and "" or s
+    end
+    local function read(getter, scriptField)
+        local scriptValue = declaredText(readString(scriptItem, getter, scriptField))
+        if scriptValue ~= "" then return scriptValue end
+        return declaredText(readString(runtimeItem, getter, scriptField))
+    end
+    local function readMetric(getter, scriptField, fallback)
+        local v = readNumber(scriptItem, getter, scriptField, nil)
+        return v ~= nil and v or readNumber(runtimeItem, getter, scriptField, fallback)
+    end
+    local skill = read("getSkillTrained", "skillTrained") or ""
+    local level = readMetric("getLvlSkillTrained", "lvlSkillTrained", nil)
+    local itemType = string.lower(read("getItemType", "itemType") or "")
+    local displayCategory = string.lower(read("getDisplayCategory", "displayCategory") or "")
+    local recipes = literatureUniqueRecipes(scriptItem)
+    local mapId = read("getMapID", "map") or read("getMapId", "mapId") or read("getMap", "map") or ""
+    local onRead = read("getOnRead", "onRead") or ""
+    local doubleClickRecipe = read("getDoubleClickRecipe", "doubleClickRecipe") or ""
+    local unhappy = readMetric("getUnhappyChange", "unhappyChange", 0) or 0
+    local boredom = readMetric("getBoredomChange", "boredomChange", 0) or 0
+    local stress = readMetric("getStressChange", "stressChange", 0) or 0
+    local position = skill ~= "" and literatureStructuralPosition(level) or nil
+    local metrics = {
+        skill = skill, level = level, mapId = mapId, uniqueRecipeCount = #recipes,
+        onRead = onRead, doubleClickRecipe = doubleClickRecipe,
+        unhappy = unhappy, boredom = boredom, stress = stress,
+    }
+    local literature = UTILITY.literature
+    if position then
+        return {
+            data = data, kind = "LITERATURE", subgroup = "SKILLBOOK_TIER_" .. position,
+            functionalGroup = "SKILLBOOK", literatureStructuralTier = position,
+            literatureFinalTier = literature.skillbookTiers[position], metrics = metrics,
+            profile = "LITERATURE:SKILLBOOK:TIER_" .. position,
+            utilityEligible = true, utility = position * 20, utilityConfidence = "HIGH",
+            profileCount = 24, validAttributeCount = 2,
+            normalizationGroup = "LITERATURE:SKILLBOOK:STRUCTURAL", utilityScoreVersion = literature.utilityVersion,
+        }
+    end
+    -- MapItem reading invokes the matching vanilla LootMaps.Init[MapID]
+    -- callback, whose bounds are then revealed through WorldMapVisited. The
+    -- server bridge cannot enumerate arbitrary client/mod callbacks, so only
+    -- MapIDs verified from the local B42.20.2 callback registry are eligible.
+    -- This is intentionally a direct structural RARE: no scarcity, area, city
+    -- label or item fullType differentiates confirmed maps.
+    if mapId ~= "" and literature.confirmedRevealMapIds and literature.confirmedRevealMapIds[mapId] then
+        return {
+            data = data, kind = "LITERATURE", subgroup = "MAP_REVEAL", functionalGroup = "MAP",
+            literatureFinalTier = literature.mapFinalTier, metrics = metrics,
+            profile = "LITERATURE:MAP_REVEAL", utilityEligible = true, utility = 50,
+            utilityConfidence = "HIGH", validAttributeCount = 1, profileCount = 14,
+            normalizationGroup = "LITERATURE:MAP:CONFIRMED_REVEAL", utilityScoreVersion = literature.utilityVersion,
+            mapId = mapId,
+        }
+    end
+    if #recipes > 0 then
+        local r = literature.recipe
+        local recipeValue = 100 * #recipes / (#recipes + r.recipeValueDenominatorOffset)
+        local scarcityPercentile = data.scarcityPercentile
+            or (data.tableAvailability and data.tableAvailability.routeWeightedPercentile) or 50
+        local scarcityStrength = 100 - scarcityPercentile
+        local finalScore = recipeValue * r.recipeValueWeight + scarcityStrength * r.scarcityStrengthWeight
+        return {
+            data = data, kind = "LITERATURE", subgroup = "RECIPE_LITERATURE", functionalGroup = "RECIPE_LITERATURE",
+            literatureFinalTier = recipeLiteratureTier(finalScore, r.tiers), metrics = metrics,
+            profile = "LITERATURE:RECIPE:" .. table.concat(recipes, ","),
+            utilityEligible = true, utility = finalScore, utilityConfidence = "HIGH", validAttributeCount = 2,
+            profileCount = #recipes, normalizationGroup = "LITERATURE:RECIPE:UNIQUE_RECIPES",
+            utilityScoreVersion = literature.utilityVersion,
+            recipeUniqueCount = #recipes, recipeValue = recipeValue,
+            recipeScarcityStrength = scarcityStrength, recipeFinalScore = finalScore,
+        }
+    end
+    -- Map/recipe/callback/container literature has a real function that V1
+    -- does not quantify. It remains on the established generic fallback.
+    if mapId ~= "" or itemType == "base:map" or onRead ~= "" or doubleClickRecipe ~= "" or itemType == "base:container" or displayCategory == "reciperesource" then
+        return {
+            data = data, kind = "LITERATURE", functionalGroup = "SPECIAL_PARTIAL", metrics = metrics,
+            profile = "LITERATURE:SPECIAL_PARTIAL:" .. itemType,
+            utilityEligible = false, utilityConfidence = "NONE", validAttributeCount = 0,
+            ineligibleReason = "LiteratureUtility V1 SPECIAL_PARTIAL: map/recipe/callback/container function is not quantified",
+            utilityScoreVersion = literature.utilityVersion,
+        }
+    end
+    if unhappy < 0 or boredom < 0 or stress < 0 then
+        local e = literature.entertainment
+        local unhappyBenefit = clamp(math.max(0, -unhappy) / e.unhappyCap, 0, 1) * 100
+        local boredomBenefit = clamp(math.max(0, -boredom) / e.boredomCap, 0, 1) * 100
+        local stressBenefit = clamp(math.max(0, -stress) / e.stressCap, 0, 1) * 100
+        local benefit = (unhappyBenefit + boredomBenefit + stressBenefit) / 3
+        local tier = benefit >= e.rareMinimum and "RARE" or benefit >= e.uncommonMinimum and "UNCOMMON" or "COMMON"
+        metrics.unhappyBenefit, metrics.boredomBenefit = unhappyBenefit, boredomBenefit
+        metrics.stressBenefit, metrics.moodBenefit = stressBenefit, benefit
+        return {
+            data = data, kind = "LITERATURE", subgroup = "ENTERTAINMENT_MOOD", functionalGroup = "ENTERTAINMENT_LITERATURE",
+            literatureFinalTier = tier, metrics = metrics,
+            profile = profileKey(metrics, { "unhappy", "boredom", "stress" }),
+            utilityEligible = true, utility = benefit, utilityConfidence = "HIGH", validAttributeCount = 3,
+            normalizationGroup = "LITERATURE:ENTERTAINMENT_MOOD", utilityScoreVersion = literature.utilityVersion,
+        }
+    end
+    return {
+        data = data, kind = "LITERATURE", subgroup = "TRIVIAL", functionalGroup = "TRIVIAL_LITERATURE",
+        literatureFinalTier = "COMMON", metrics = metrics, profile = "LITERATURE:TRIVIAL",
+        utilityEligible = true, utility = 0, utilityConfidence = "HIGH", validAttributeCount = 3,
+        normalizationGroup = "LITERATURE:TRIVIAL", utilityScoreVersion = literature.utilityVersion,
+    }
+end
+
 local function candidateFor(data)
     local manager = getScriptManager and getScriptManager() or nil
     local scriptItem = manager and manager:FindItem(data.fullType) or nil
@@ -763,6 +1221,12 @@ local function candidateFor(data)
     end
     local medical = makeMedicalCandidate(data, scriptItem)
     if medical then return medical end
+    local fish = makeFishCandidate(data, scriptItem)
+    if fish then return fish end
+    local food = makeFoodCandidate(data, scriptItem)
+    if food then return food end
+    local literature = makeLiteratureCandidate(data, scriptItem)
+    if literature then return literature end
     if data.category == "CONTAINER" then return makeContainerCandidate(data, scriptItem) end
     if data.category == "CLOTHING" then return makeClothingDiscoveryCandidate(data, scriptItem) end
     if data.category == "ACCESSORY" or string.lower(tostring(data.displayCategory or "")) == "accessory" then
@@ -889,6 +1353,90 @@ local function scoreGroup(group)
         candidate.validAttributeCount = validCount
         candidate.essentialsPresent = essentials
         if not essentials then candidate.ineligibleReason = "missing essential Utility attribute" end
+    end
+end
+
+local function containerRankingConfidence(profileCount)
+    if profileCount >= 12 then return "HIGH" end
+    if profileCount >= 5 then return "MEDIUM" end
+    return "LOW"
+end
+
+-- Active ContainerUtility V2.  Unlike the retired generic wearable-container
+-- pass, every safe structural group is scored against only its vanilla
+-- mechanical profiles.  Mods are members, never reference points.
+local function scoreContainerV2(candidates)
+    local groups = {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "CONTAINER" and candidate.utilityEligible and candidate.containerV2Group then
+            local group = candidate.containerV2Group
+            groups[group] = groups[group] or { members = {}, vanilla = {} }
+            table.insert(groups[group].members, candidate)
+            if tostring(candidate.data.fullType or ""):match("^Base%.") then table.insert(groups[group].vanilla, candidate) end
+        end
+    end
+    for groupName, group in pairs(groups) do
+        local representativesByProfile = {}
+        for _, candidate in ipairs(group.vanilla) do
+            if not representativesByProfile[candidate.profile] then representativesByProfile[candidate.profile] = candidate end
+        end
+        local references = {}
+        for _, candidate in pairs(representativesByProfile) do table.insert(references, candidate) end
+        table.sort(references, function(a, b) return tostring(a.data.fullType) < tostring(b.data.fullType) end)
+        local profileCount = #references
+        local rankingConfidence = containerRankingConfidence(profileCount)
+        local config = UTILITY.container.v2.groups[groupName]
+        if groupName == "KEY_CONTAINER" or groupName == "TORSO_AMMO" then
+            for _, candidate in ipairs(group.members) do
+                candidate.utility = 50
+                candidate.utilityConfidence = "HIGH"
+                candidate.containerRankingConfidence = "LOW"
+                candidate.profileCount = profileCount
+                candidate.validAttributeCount = 0
+                candidate.essentialsPresent = true
+                candidate.normalizationGroup = "CONTAINER_V2:" .. groupName .. ":VANILLA_REFERENCE"
+                candidate.utilityScoreVersion = UTILITY.container.v2.utilityVersion
+            end
+        else
+            local ranks = {}
+            for metricName in pairs(config.weights) do
+                local values = {}
+                for _, candidate in ipairs(references) do
+                    local value = candidate.metrics[metricName]
+                    if value ~= nil then table.insert(values, value) end
+                end
+                if #values > 0 then
+                    local sorted = sortedCopy(values)
+                    local low = quantile(sorted, NORMALIZATION.winsorLowPercentile)
+                    local high = quantile(sorted, NORMALIZATION.winsorHighPercentile)
+                    local bounded = {}
+                    for _, value in ipairs(values) do table.insert(bounded, clamp(value, low, high)) end
+                    ranks[metricName] = { low = low, high = high, values = uniqueSorted(bounded) }
+                end
+            end
+            for _, candidate in ipairs(group.members) do
+                local numerator, denominator, valid = 0, 0, 0
+                candidate.metricPercentiles = {}
+                for metricName, weight in pairs(config.weights) do
+                    local rank = ranks[metricName]
+                    local value = candidate.metrics[metricName]
+                    if rank and value ~= nil then
+                        local percentile = percentileRank(rank.values, clamp(value, rank.low, rank.high), candidate.directions[metricName])
+                        candidate.metricPercentiles[metricName] = percentile
+                        numerator, denominator, valid = numerator + percentile * weight, denominator + weight, valid + 1
+                    end
+                end
+                candidate.utility = denominator > 0 and numerator / denominator or nil
+                candidate.validAttributeCount = valid
+                candidate.essentialsPresent = essentialsPresent(candidate)
+                candidate.utilityConfidence = candidate.essentialsPresent and "HIGH" or "LOW"
+                candidate.containerRankingConfidence = rankingConfidence
+                candidate.profileCount = profileCount
+                candidate.normalizationGroup = "CONTAINER_V2:" .. groupName .. ":VANILLA_REFERENCE"
+                candidate.utilityScoreVersion = UTILITY.container.v2.utilityVersion
+                if not candidate.essentialsPresent then candidate.ineligibleReason = "missing essential ContainerUtility V2 attribute" end
+            end
+        end
     end
 end
 
@@ -1446,6 +1994,285 @@ local function scoreMedicalUtility(candidates)
     end
 end
 
+local function foodPositiveRank(values, value)
+    if value == nil or value <= 0 then return 0 end
+    local positives, below, equal = {}, 0, 0
+    for _, candidate in ipairs(values) do if candidate > 0 then table.insert(positives, candidate) end end
+    if #positives == 0 then return 0 end
+    if #positives == 1 then return 50 end
+    for _, candidate in ipairs(positives) do
+        if candidate < value then below = below + 1 elseif candidate == value then equal = equal + 1 end
+    end
+    return clamp(((below + equal * .5) / #positives) * 100, 0, 100)
+end
+
+local function foodPositiveQuantile(values, percentile)
+    local positives = {}
+    for _, value in ipairs(values) do if value and value > 0 then table.insert(positives, value) end end
+    table.sort(positives)
+    if #positives == 0 then return 0 end
+    local index = math.max(1, math.min(#positives, math.floor((#positives - 1) * (percentile / 100) + 1.5)))
+    return positives[index]
+end
+
+local function foodPreservation(metrics)
+    local days = metrics.daysTotallyRotten or 0
+    return days >= 100000000 and 1000000000 or days
+end
+
+local function foodRankingConfidence(profileCount)
+    return profileCount >= UTILITY.food.highConfidenceProfiles and "HIGH"
+        or (profileCount >= UTILITY.food.mediumConfidenceProfiles and "MEDIUM" or "LOW")
+end
+
+local function foodUtilityConfidence(metrics)
+    -- Confidence concerns data presence, not reference-population size. Zero
+    -- is valid data for food components, so only nil is treated as absent.
+    local fields = { metrics.hungerChange, metrics.thirstChange, metrics.calories, metrics.daysTotallyRotten, metrics.cookable, metrics.unhappyChange, metrics.boredomChange, metrics.stressChange, metrics.dangerousUncooked }
+    local present = 0
+    for _, value in ipairs(fields) do if value ~= nil then present = present + 1 end end
+    return present >= 8 and "HIGH" or (present >= 6 and "MEDIUM" or "LOW")
+end
+
+local function foodNegativeEffects(metrics)
+    local rawRisk = metrics.dangerousUncooked and 35 or 0
+    return math.min(100, math.max(0, metrics.unhappyChange or 0) * 1.5
+        + math.max(0, metrics.boredomChange or 0) * 2
+        + math.max(0, metrics.stressChange or 0) * 100
+        + math.max(0, metrics.foodSicknessChange or 0) * 2
+        + (metrics.poison and 100 or 0) + rawRisk)
+end
+
+local function foodNegativeMultiplier(negative)
+    local x = clamp((negative or 0) / 100, 0, 1)
+    return math.max(0, 1 - UTILITY.food.negativeFactor * (x ^ UTILITY.food.negativePower))
+end
+
+local function foodCappedBenefit(value, cap)
+    if not value or value <= 0 or not cap or cap <= 0 then return 0 end
+    return 100 * math.min(value, cap) / cap
+end
+
+local function foodFinalTier(candidate)
+    local quality, scarcity = candidate.utility or 0, candidate.foodScarcityStrength or 0
+    -- FoodQuality remains the dominant absolute value. Scarcity only refines
+    -- close calls through the frozen 95/5 blend; it cannot independently
+    -- qualify a weak food for EXOTIC.
+    local position = candidate.foodFinalScore or quality
+    local tiers = UTILITY.food.tiers
+    if position < tiers.uncommon then return "COMMON" end
+    if position < tiers.rare then return "UNCOMMON" end
+    if position < tiers.epic then return "RARE" end
+    if position < tiers.exotic then return "EPIC" end
+    -- A tiny direct-DRINK population cannot create an EXOTIC solely from an
+    -- uninformative p100; its low ranking confidence is evidence only.
+    if candidate.functionalGroup == "DRINK" and candidate.foodRankingConfidence == "LOW" then return "EPIC" end
+    return quality >= tiers.exotic and scarcity >= tiers.exoticMinimumScarcity and "EXOTIC" or "EPIC"
+end
+
+local function fishTierFromScore(score)
+    local tiers = UTILITY.fish.yieldTiers
+    if score < tiers.uncommon then return "COMMON" end
+    if score < tiers.rare then return "UNCOMMON" end
+    if score < tiers.epic then return "RARE" end
+    if score < tiers.exotic then return "EPIC" end
+    return "EXOTIC"
+end
+
+-- FishUtility V1 is intentionally an absolute species model. Its input is
+-- derived from Fishing.FishConfig, not Strategy D and not an InventoryItem.
+-- Yield owns the maximum visual tier; difficulty only refines within it.
+local function scoreFishUtility(candidates)
+    local members = {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "FISH" and candidate.utilityEligible then
+            table.insert(members, candidate)
+        end
+    end
+    if #members == 0 then return end
+
+    -- The comparison population is the complete, deterministic Fishing API,
+    -- not just species that happen to have a loot-table route. This keeps
+    -- species scores stable while preserving the scanner's 3416-item scope.
+    local references, byFullType = {}, {}
+    for _, configuration in ipairs(fishingConfigurations() or {}) do
+        local metrics = fishMetricsForConfiguration(configuration, nil)
+        if metrics then
+            local reference = { fullType = configuration.itemType, metrics = metrics }
+            table.insert(references, reference)
+            byFullType[configuration.itemType] = reference
+        end
+    end
+    table.sort(references, function(a, b) return a.fullType < b.fullType end)
+    if #references == 0 then return end
+
+    local maxHunger, minShare, maxShare, maxBaitCount = 0, nil, nil, 0
+    for _, reference in ipairs(references) do
+        local metrics = reference.metrics
+        maxHunger = math.max(maxHunger, metrics.expectedHunger or 0)
+        minShare = minShare == nil and (metrics.conditionalSpeciesShare or 0) or math.min(minShare, metrics.conditionalSpeciesShare or 0)
+        maxShare = maxShare == nil and (metrics.conditionalSpeciesShare or 0) or math.max(maxShare, metrics.conditionalSpeciesShare or 0)
+        maxBaitCount = math.max(maxBaitCount, metrics.baitCount or 0)
+    end
+    local scores = {}
+    for _, reference in ipairs(references) do
+        local metrics = reference.metrics
+        local hunger = maxHunger > 0 and 100 * (metrics.expectedHunger or 0) / maxHunger or 0
+        local calories = math.max(0, metrics.expectedCalories or 0)
+        local caloriesSaturated = 100 * calories / (calories + UTILITY.fish.expectedYield.caloriesHalfSaturation)
+        local expectedFoodYield = hunger * UTILITY.fish.expectedYield.hunger
+            + caloriesSaturated * UTILITY.fish.expectedYield.calories
+        local baitBreadth = maxBaitCount > 0 and (metrics.baitCount or 0) / maxBaitCount or 0
+        local shareRange = (maxShare or 0) - (minShare or 0)
+        local baitShare = shareRange > 0 and ((metrics.conditionalSpeciesShare or 0) - minShare) / shareRange or 0.5
+        local baitDifficulty = 100 * (1 - (baitBreadth * 0.5 + baitShare * 0.5))
+        local catchDifficulty = 100 * (metrics.minimumFishingSkill or 0) / 10 * UTILITY.fish.catchDifficulty.minimumSkill
+            + (metrics.predator and 100 or 0) * UTILITY.fish.catchDifficulty.predatorReel
+            + baitDifficulty * UTILITY.fish.catchDifficulty.baitProfile
+        local positionScore = expectedFoodYield * UTILITY.fish.position.expectedYield
+            + catchDifficulty * UTILITY.fish.position.catchDifficulty
+        reference.expectedFoodYield = expectedFoodYield
+        reference.catchDifficulty = catchDifficulty
+        reference.fishingScarcity = catchDifficulty
+        reference.fishYieldTierCeiling = fishTierFromScore(expectedFoodYield)
+        reference.fishPositionTier = fishTierFromScore(positionScore)
+        local ceilingIndex = TIER_INDEX[reference.fishYieldTierCeiling]
+        local positionIndex = TIER_INDEX[reference.fishPositionTier]
+        reference.fishFinalTier = TIER_STRENGTH[math.min(ceilingIndex, positionIndex)]
+        reference.utility = expectedFoodYield
+        reference.utilityComponents = {
+            expectedHunger = hunger,
+            expectedCaloriesSaturated = caloriesSaturated,
+            expectedFoodYield = expectedFoodYield,
+            baitDifficulty = baitDifficulty,
+            catchDifficulty = catchDifficulty,
+            positionScore = positionScore,
+        }
+        reference.utilityConfidence = "HIGH"
+        reference.profileCount = #references
+        reference.utilityScoreVersion = UTILITY.fish.utilityVersion
+        table.insert(scores, expectedFoodYield)
+    end
+    scores = sortedCopy(scores)
+    for _, candidate in ipairs(members) do
+        local reference = byFullType[candidate.data.fullType]
+        if reference then
+            candidate.utility = reference.utility
+            candidate.utilityComponents = reference.utilityComponents
+            candidate.utilityConfidence = reference.utilityConfidence
+            candidate.profileCount = reference.profileCount
+            candidate.validAttributeCount = 6
+            candidate.essentialsPresent = true
+            candidate.normalizationGroup = "FISH:SPECIES"
+            candidate.utilityScoreVersion = reference.utilityScoreVersion
+            candidate.expectedFoodYield = reference.expectedFoodYield
+            candidate.catchDifficulty = reference.catchDifficulty
+            candidate.fishingScarcity = reference.fishingScarcity
+            candidate.fishYieldTierCeiling = reference.fishYieldTierCeiling
+            candidate.fishPositionTier = reference.fishPositionTier
+            candidate.fishFinalTier = reference.fishFinalTier
+            candidate.data.utilityPercentile = percentileRank(scores, candidate.utility, false)
+        end
+    end
+end
+
+-- Active FoodUtility V1. FOOD and DRINK are isolated populations; PARTIAL
+-- foods retain base Scarcity because their preparation/special value is not
+-- yet safely quantifiable.  Hunger dominates FOOD, while DRINK is hydration-
+-- dominant. Food tiers use absolute quality bands, not the weapon/clothing
+-- Scarcity × percentile matrix.
+local function scoreFoodUtility(candidates)
+    local grouped = {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "FOOD" and candidate.utilityEligible then
+            grouped[candidate.functionalGroup] = grouped[candidate.functionalGroup] or {}
+            table.insert(grouped[candidate.functionalGroup], candidate)
+        end
+    end
+    for group, members in pairs(grouped) do
+        local representatives, seen = {}, {}
+        for _, candidate in ipairs(members) do
+            if not seen[candidate.profile] then seen[candidate.profile] = candidate; table.insert(representatives, candidate) end
+        end
+        local samples = { hunger={}, thirst={}, calories={}, preservation={}, moodUnhappy={}, moodBoredom={}, moodStress={} }
+        for _, candidate in ipairs(representatives) do
+            local metrics = candidate.metrics
+            table.insert(samples.hunger, metrics.hungerBenefit or 0)
+            table.insert(samples.thirst, metrics.thirstBenefit or 0)
+            table.insert(samples.calories, metrics.calories or 0)
+            table.insert(samples.preservation, foodPreservation(metrics))
+            table.insert(samples.moodUnhappy, math.max(0, -(metrics.unhappyChange or 0)))
+            table.insert(samples.moodBoredom, math.max(0, -(metrics.boredomChange or 0)))
+            table.insert(samples.moodStress, math.max(0, -(metrics.stressChange or 0)))
+        end
+        local profileCount = #representatives
+        local rankingConfidence = foodRankingConfidence(profileCount)
+        local moodCaps = {
+            unhappy = foodPositiveQuantile(samples.moodUnhappy, UTILITY.food.mood.capPercentile),
+            boredom = foodPositiveQuantile(samples.moodBoredom, UTILITY.food.mood.capPercentile),
+            stress = foodPositiveQuantile(samples.moodStress, UTILITY.food.mood.capPercentile),
+        }
+        local scores = {}
+        for _, candidate in ipairs(representatives) do
+            local metrics = candidate.metrics
+            local rawRisk = metrics.dangerousUncooked and 35 or 0
+            local cook = metrics.cookable and math.min(100, ((metrics.minutesToCook or 60) / 60) * 55) or 0
+            local convenience = math.max(0, 100 - cook - rawRisk)
+            local moodUnhappy = foodCappedBenefit(math.max(0, -(metrics.unhappyChange or 0)), moodCaps.unhappy)
+            local moodBoredom = foodCappedBenefit(math.max(0, -(metrics.boredomChange or 0)), moodCaps.boredom)
+            local moodStress = foodCappedBenefit(math.max(0, -(metrics.stressChange or 0)), moodCaps.stress)
+            local mood = moodUnhappy * UTILITY.food.mood.unhappy + moodBoredom * UTILITY.food.mood.boredom + moodStress * UTILITY.food.mood.stress
+            local components = {
+                sustenance = foodPositiveRank(samples.hunger, metrics.hungerBenefit or 0),
+                energy = 100 * math.max(0, metrics.calories or 0) / (math.max(0, metrics.calories or 0) + UTILITY.food.energyHalfSaturationCalories),
+                hydration = foodPositiveRank(samples.thirst, metrics.thirstBenefit or 0),
+                preservation = foodPositiveRank(samples.preservation, foodPreservation(metrics)),
+                convenience = convenience,
+                mood = mood, moodUnhappy = moodUnhappy, moodBoredom = moodBoredom, moodStress = moodStress,
+                negative = foodNegativeEffects(metrics),
+            }
+            local weights = group == "DRINK" and UTILITY.food.drink or UTILITY.food.food
+            local benefit
+            if group == "DRINK" then
+                benefit = components.sustenance * weights.hunger + components.energy * weights.energy + components.hydration * weights.hydration + components.preservation * weights.preservation + components.convenience * weights.convenience
+            else
+                benefit = components.sustenance * weights.hunger + components.mood * weights.mood + components.energy * weights.energy + components.preservation * weights.preservation + components.convenience * weights.convenience
+            end
+            candidate.utility = benefit * foodNegativeMultiplier(components.negative)
+            candidate.utilityComponents = components
+            candidate.utilityConfidence = foodUtilityConfidence(metrics)
+            candidate.foodRankingConfidence = rankingConfidence
+            candidate.profileCount = profileCount
+            candidate.validAttributeCount = 9
+            candidate.essentialsPresent = candidate.utilityConfidence ~= "LOW"
+            candidate.normalizationGroup = "FOOD:" .. group
+            candidate.utilityScoreVersion = UTILITY.food.utilityVersion
+            candidate.foodScarcityStrength = 100 - (candidate.data.scarcityPercentile or (candidate.data.tableAvailability and candidate.data.tableAvailability.routeWeightedPercentile) or 50)
+            candidate.foodFinalScore = candidate.utility * (1 - UTILITY.food.scarcityWeight)
+                + candidate.foodScarcityStrength * UTILITY.food.scarcityWeight
+            table.insert(scores, candidate.utility)
+        end
+        scores = sortedCopy(scores)
+        for _, candidate in ipairs(members) do
+            local representative = seen[candidate.profile]
+            candidate.utility = representative.utility
+            candidate.utilityComponents = representative.utilityComponents
+            candidate.utilityConfidence = representative.utilityConfidence
+            candidate.foodRankingConfidence = representative.foodRankingConfidence
+            candidate.profileCount = representative.profileCount
+            candidate.validAttributeCount = representative.validAttributeCount
+            candidate.essentialsPresent = representative.essentialsPresent
+            candidate.normalizationGroup = representative.normalizationGroup
+            candidate.utilityScoreVersion = representative.utilityScoreVersion
+            candidate.foodScarcityStrength = 100 - (candidate.data.scarcityPercentile or (candidate.data.tableAvailability and candidate.data.tableAvailability.routeWeightedPercentile) or 50)
+            candidate.foodFinalScore = candidate.utility * (1 - UTILITY.food.scarcityWeight)
+                + candidate.foodScarcityStrength * UTILITY.food.scarcityWeight
+            candidate.data.utilityPercentile = percentileRank(scores, candidate.utility, false)
+            candidate.foodFinalTier = foodFinalTier(candidate)
+        end
+    end
+end
+
 local function utilitySupportStatus(candidate)
     if candidate.utilitySupport then return candidate.utilitySupport end
     if candidate.kind == "MEDICAL" and candidate.medicalValueStatus == "MECHANICAL_VALUE_PARTIAL" then return "UTILITY_PARTIAL" end
@@ -1480,6 +2307,8 @@ local function publishCandidateFields(candidates)
         data.utilityComponents = candidate.utilityComponents
         data.utilityNormalizationGroup = candidate.normalizationGroup
         data.utilityScoreVersion = candidate.utilityScoreVersion or "V1_LEGACY"
+        data.containerV2Group = candidate.containerV2Group
+        data.containerRankingConfidence = candidate.containerRankingConfidence
         data.utilitySupport = utilitySupportStatus(candidate)
         data.clothingDiscovery = candidate.clothingDiscovery
         data.clothingUtilityPercentile = candidate.clothingUtilityPercentile
@@ -1508,6 +2337,26 @@ local function publishCandidateFields(candidates)
         data.medicalProcedure = candidate.medicalProcedure
         data.medicalUnpackRecipe = candidate.medicalUnpackRecipe
         data.medicalOnEat = candidate.medicalOnEat
+        data.foodValueStatus = candidate.foodValueStatus
+        data.foodPartialReason = candidate.foodPartialReason
+        data.foodUtilityConfidence = candidate.kind == "FOOD" and (candidate.utilityConfidence or "NONE") or nil
+        data.foodRankingConfidence = candidate.foodRankingConfidence
+        data.foodQuality = candidate.kind == "FOOD" and candidate.utility and round(candidate.utility) or nil
+        data.foodQualityPercentile = candidate.kind == "FOOD" and data.utilityPercentile or nil
+        data.foodScarcityStrength = candidate.foodScarcityStrength
+        data.foodFinalScore = candidate.kind == "FOOD" and candidate.foodFinalScore and round(candidate.foodFinalScore) or nil
+        data.fishExpectedWeight = candidate.kind == "FISH" and candidate.metrics.expectedWeight or nil
+        data.fishExpectedHunger = candidate.kind == "FISH" and candidate.metrics.expectedHunger or nil
+        data.fishExpectedCalories = candidate.kind == "FISH" and candidate.metrics.expectedCalories or nil
+        data.fishExpectedFoodYield = candidate.kind == "FISH" and candidate.expectedFoodYield or nil
+        data.catchDifficulty = candidate.kind == "FISH" and candidate.catchDifficulty or nil
+        data.fishingScarcity = candidate.kind == "FISH" and candidate.fishingScarcity or nil
+        data.fishYieldTierCeiling = candidate.kind == "FISH" and candidate.fishYieldTierCeiling or nil
+        data.fishPositionTier = candidate.kind == "FISH" and candidate.fishPositionTier or nil
+        data.literatureFunctionalGroup = candidate.kind == "LITERATURE" and candidate.functionalGroup or nil
+        data.literatureStructuralTier = candidate.kind == "LITERATURE" and candidate.literatureStructuralTier or nil
+        data.literatureMoodBenefit = candidate.kind == "LITERATURE" and candidate.metrics and candidate.metrics.moodBenefit or nil
+        data.literatureSpecialReason = candidate.kind == "LITERATURE" and candidate.ineligibleReason or nil
     end
 end
 
@@ -1543,6 +2392,12 @@ local function applyTierAdjustment(data, candidate)
     data.utilityMetricPercentiles = candidate.metricPercentiles
     data.utilityProfile = candidate.profile
     data.utilityKind = candidate.kind
+    data.recipeUniqueCount = candidate.recipeUniqueCount
+    data.recipeValue = candidate.recipeValue
+    data.recipeScarcityStrength = candidate.recipeScarcityStrength
+    data.recipeFinalScore = candidate.recipeFinalScore
+    data.containerV2Group = candidate.containerV2Group
+    data.containerRankingConfidence = candidate.containerRankingConfidence
     data.utilitySupport = utilitySupportStatus(candidate)
     data.clothingDirectSlotFunction = candidate.directSlotFunctionalGroup
     data.slotQualityPercentile = candidate.slotQualityPercentile
@@ -1552,6 +2407,39 @@ local function applyTierAdjustment(data, candidate)
     data.clothingDiscovery = candidate.clothingDiscovery
     data.clothingUtilityPercentile = candidate.clothingUtilityPercentile
     data.utilityAdjustmentReason = candidate.ineligibleReason or "no eligible Utility data"
+
+    -- Literature V1 is deliberately function-specific: structural progression
+    -- or quantified mood benefit owns the visual tier, never table scarcity.
+    if candidate.kind == "LITERATURE" and candidate.utilityEligible and candidate.literatureFinalTier then
+        data.finalRarityTier = candidate.literatureFinalTier
+        if candidate.functionalGroup == "SKILLBOOK" then
+            data.utilityAdjustmentReason = "LiteratureUtility V1: structural SkillBook progression; Scarcity, skill identity, pages and absolute XP multiplier ignored"
+        elseif candidate.functionalGroup == "ENTERTAINMENT_LITERATURE" then
+            data.utilityAdjustmentReason = "LiteratureUtility V1: bounded real reading mood benefit; RARE ceiling"
+        elseif candidate.functionalGroup == "RECIPE_LITERATURE" then
+            data.utilityAdjustmentReason = "RecipeLiterature V1: 70% unique LearnedRecipes value + 30% ScarcityStrength"
+        elseif candidate.functionalGroup == "MAP" then
+            data.utilityAdjustmentReason = "MapUtility V1: confirmed MapID reveal callback; direct RARE, no Scarcity or RevealArea differentiation"
+        else
+            data.utilityAdjustmentReason = "LiteratureUtility V1: no measurable reading benefit; always COMMON"
+        end
+        return
+    end
+
+    -- ContainerUtility V2 is deliberately scoped to five structural groups.
+    -- Deferred cases (handheld/specialized/trivial) retain their pre-V2
+    -- scarcity result exactly until their content restrictions can be read
+    -- safely through the B42 bridge.
+    if candidate.kind == "CONTAINER" and not candidate.utilityEligible then
+        data.utilityAdjustmentReason = "ContainerUtility V2 deferred for this structural group"
+        return
+    end
+
+    if candidate.kind == "CONTAINER" and candidate.containerV2Group == "KEY_CONTAINER" then
+        data.finalRarityTier = trivialWearableFinalTier(data.baseScarcityTier)
+        data.utilityAdjustmentReason = "ContainerUtility V2 KEY_CONTAINER policy: scarcity COMMON/UNCOMMON->COMMON, RARE+->UNCOMMON"
+        return
+    end
 
     -- Scarcity is an internal potential, never a visual EPIC/EXOTIC grant by
     -- itself. Any unsupported, missing, or unreliable Utility may retain its
@@ -1564,6 +2452,10 @@ local function applyTierAdjustment(data, candidate)
         -- promoted, but it also receives no automatic visual cap.
         if candidate.kind == "MEDICAL" and candidate.medicalValueStatus == "MECHANICAL_VALUE_PARTIAL" then
             data.utilityAdjustmentReason = "MedicalUtility V1 PARTIAL: no quantified promotion and no automatic cap"
+            return
+        end
+        if candidate.kind == "FOOD" and candidate.foodValueStatus == "MECHANICAL_VALUE_PARTIAL" then
+            data.utilityAdjustmentReason = "FoodUtility V1 PARTIAL: no quantified promotion or cap"
             return
         end
         if data.baseScarcityTier == "EPIC" or data.baseScarcityTier == "EXOTIC" then data.finalRarityTier = "RARE" end
@@ -1634,6 +2526,23 @@ local function applyTierAdjustment(data, candidate)
         local tier, reason = matrixTierFromAxes(data, data.utilityPercentile, { p70=70, p80=80, p90=90, p95=95 })
         data.finalRarityTier = tier
         data.utilityAdjustmentReason = "MedicalUtility V1 (effect 90%, real uses 10%, no weight): " .. reason
+        return
+    end
+
+    if candidate.kind == "FOOD" then
+        data.finalRarityTier = candidate.foodFinalTier or data.baseScarcityTier
+        data.utilityAdjustmentReason = "FoodUtility V1 (H60 Mood20 E12 P5 C3, POWER15, SAT600; scarcity 5%): absolute FoodQuality band"
+        return
+    end
+
+    if candidate.kind == "FISH" then
+        data.finalRarityTier = candidate.fishFinalTier or "COMMON"
+        data.utilityAdjustmentReason = "FishUtility V1 Model C: ExpectedFoodYield sets ceiling; CatchDifficulty positions within ceiling; Strategy D excluded"
+        return
+    end
+
+    if candidate.kind == "CONTAINER" and candidate.containerRankingConfidence == "LOW" then
+        data.utilityAdjustmentReason = "ContainerUtility V2 low RankingConfidence: no mechanical promotion in small structural group"
         return
     end
 
@@ -2235,17 +3144,27 @@ function ItemRarityUtilityCalculator.calculate(results)
     if not UTILITY.enabled then return results end
     local candidates = {}
     for _, data in pairs(results) do table.insert(candidates, candidateFor(data)) end
-    -- Containers retain their active score through the generic normalized
-    -- container group. Melee and Clothing are scored only by their active
-    -- V2/V1 calculators below; historical V1 snapshots are diagnostics-only.
-    local groups = resolveGroups(candidates)
-    for _, group in pairs(groups) do scoreGroup(group) end
-    -- Containers keep their existing score. Every eligible melee HandWeapon
-    -- (including TOOL combat items) is then recalculated as V2 Model C10.
+    -- Every score pass deduplicates profiles by keeping the first candidate it
+    -- sees.  `pairs(results)` has no defined order, so establish one stable
+    -- fullType order before any grouping, reference selection or percentile
+    -- construction.  This changes no formula; it only makes equivalent
+    -- rescans choose the same profile representative every time.
+    table.sort(candidates, function(a, b)
+        return tostring(a.data.fullType or "") < tostring(b.data.fullType or "")
+    end)
+    -- ContainerUtility V2 scores only its approved structural groups against
+    -- vanilla-only references. Melee and Clothing use their own frozen
+    -- calculators below; historical generic-container snapshots stay
+    -- diagnostics-only.
+    scoreContainerV2(candidates)
+    -- Every eligible melee HandWeapon (including TOOL combat items) is then
+    -- recalculated as V2 Model C10.
     scoreMeleeV2(candidates)
     scoreClothingUtility(candidates)
     scoreClothingDirectSlotV1(candidates)
     scoreMedicalUtility(candidates)
+    scoreFishUtility(candidates)
+    scoreFoodUtility(candidates)
     assignClothingMechanicalValueStatus(candidates)
     assignAccessoryMechanicalValueStatus(candidates)
     publishCandidateFields(candidates)
