@@ -18,6 +18,10 @@ local function reloadActivePipelineForDevelopment()
         "media/lua/server/ItemRarity/UtilityCalculator.lua",
         "media/lua/server/ItemRarity/RarityRegistryPublisher.lua",
         "media/lua/server/ItemRarity/RarityScanner.lua",
+        -- Bootstrap owns the allow-listed client diagnostic commands. Keep it
+        -- in this trusted development reload bridge so a newly added
+        -- read-only report does not require restarting the whole world.
+        "media/lua/server/ItemRarity/ItemRarityBootstrap.lua",
     }
     for _, path in ipairs(files) do reloadLuaFile(path) end
     if ItemRarityUtils then

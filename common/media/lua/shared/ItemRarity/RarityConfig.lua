@@ -146,6 +146,22 @@ ItemRarityConfig.utility = {
         },
     },
 
+    -- FirearmUtility V1 is intentionally independent from the generic
+    -- Scarcity x Utility matrix. Combat quality owns the tier; route
+    -- scarcity is only a 5% refinement. All transforms use the vanilla
+    -- firearm population as their fixed reference, so loaded mods are scored
+    -- against vanilla rather than redefining its scale.
+    firearm = {
+        utilityVersion = "V1_MODEL_B_VANILLA_ABSOLUTE_95_5_SCARCITY",
+        offense = { damage = 0.50, capacity = 0.20, handling = 0.20, range = 0.10 },
+        offenseComponents = { averageDamage = 0.70, multiHit = 0.20, critical = 0.10 },
+        handling = { recoil = 0.30, aiming = 0.25, reload = 0.25, weight = 0.15, sound = 0.05 },
+        relativeWeight = { LOW = 0.10, MEDIUM = 0.25, HIGH = 0.40 },
+        rankingConfidence = { mediumProfiles = 4, highProfiles = 8 },
+        scarcityWeight = 0.05,
+        tiers = { uncommon = 40, rare = 55, epic = 70, exotic = 85 },
+    },
+
     -- ClothingUtility is calculated for diagnostics only in this stage. Its
     -- score intentionally does not participate in active FinalRarityTier or
     -- UI publication until its simulation has been reviewed.

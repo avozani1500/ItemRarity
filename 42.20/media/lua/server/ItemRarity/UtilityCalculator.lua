@@ -1043,6 +1043,108 @@ local function makeMeleeCandidate(data, scriptItem)
     }
 end
 
+-- Firearms are identified from their actual ranged/ammunition mechanism, not
+-- from display category or names.  A ranged weapon case, for example, has no
+-- usable ammo mechanism and therefore does not enter FirearmUtility.
+local function firearmNumber(runtimeItem, scriptItem, getters, fields)
+    for _, getter in ipairs(getters or {}) do
+        local value = readNumber(runtimeItem, getter, nil, nil)
+        if value ~= nil then return value end
+        value = readNumber(scriptItem, getter, nil, nil)
+        if value ~= nil then return value end
+    end
+    for _, field in ipairs(fields or {}) do
+        local value = readNumber(runtimeItem, nil, field, nil)
+        if value ~= nil then return value end
+        value = readNumber(scriptItem, nil, field, nil)
+        if value ~= nil then return value end
+    end
+    return nil
+end
+
+local function firearmString(runtimeItem, scriptItem, getters, fields)
+    for _, getter in ipairs(getters or {}) do
+        local value = readString(runtimeItem, getter, nil)
+        if value ~= nil and value ~= "" then return value end
+        value = readString(scriptItem, getter, nil)
+        if value ~= nil and value ~= "" then return value end
+    end
+    for _, field in ipairs(fields or {}) do
+        local value = readString(runtimeItem, nil, field)
+        if value ~= nil and value ~= "" then return value end
+        value = readString(scriptItem, nil, field)
+        if value ~= nil and value ~= "" then return value end
+    end
+    return ""
+end
+
+local function firearmFamily(fireMode, ammoType, attachmentType, maxRange)
+    if string.lower(tostring(fireMode or "")) == "auto" then return "AUTOMATIC_RIFLE" end
+    if contains(ammoType, "shotgun") then return "SHOTGUN" end
+    if contains(attachmentType, "holster") then return "HANDGUN" end
+    if (maxRange or 0) >= 25 then return "RIFLE" end
+    return "LONG_GUN"
+end
+
+local function makeFirearmCandidate(data, scriptItem)
+    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
+    if not ok then runtimeItem = nil end
+    local ranged = readBoolean(runtimeItem, "isRanged", "ranged") or readBoolean(scriptItem, "isRanged", "ranged")
+    local ammoType = firearmString(runtimeItem, scriptItem, { "getAmmoType" }, { "ammoType" })
+    local maxAmmo = firearmNumber(runtimeItem, scriptItem, { "getMaxAmmo" }, { "maxAmmo" }) or 0
+    if not ranged or ammoType == "" or maxAmmo <= 0 then return nil end
+    local minDamage = firearmNumber(runtimeItem, scriptItem, { "getMinDamage" }, { "minDamage" })
+    local maxDamage = firearmNumber(runtimeItem, scriptItem, { "getMaxDamage" }, { "maxDamage" })
+    local maxRange = firearmNumber(runtimeItem, scriptItem, { "getMaxRange" }, { "maxRange" })
+    local fireMode = firearmString(runtimeItem, scriptItem, { "getFireMode" }, { "fireMode" })
+    local attachmentType = firearmString(runtimeItem, scriptItem, { "getAttachmentType" }, { "attachmentType" })
+    local magazineType = firearmString(runtimeItem, scriptItem, { "getMagazineType" }, { "magazineType" })
+    local gunType = firearmString(runtimeItem, scriptItem, { "getGunType" }, { "gunType" })
+    local partType = firearmString(runtimeItem, scriptItem, { "getPartType" }, { "partType" })
+    local mountOn = firearmString(runtimeItem, scriptItem, { "getMountOn" }, { "mountOn" })
+    local aimingTimeModifier = firearmNumber(runtimeItem, scriptItem, { "getAimingTimeModifier" }, { "aimingTimeModifier" })
+    local reloadTimeModifier = firearmNumber(runtimeItem, scriptItem, { "getReloadTimeModifier" }, { "reloadTimeModifier" })
+    local recoilDelayModifier = firearmNumber(runtimeItem, scriptItem, { "getRecoilDelayModifier" }, { "recoilDelayModifier" })
+    local hitChanceModifier = firearmNumber(runtimeItem, scriptItem, { "getHitChanceModifier" }, { "hitChanceModifier" })
+    local maxRangeModifier = firearmNumber(runtimeItem, scriptItem, { "getMaxRangeModifier" }, { "maxRangeModifier" })
+    local metrics = {
+        averageDamage = minDamage and maxDamage and (minDamage + maxDamage) / 2 or nil,
+        maxRange = maxRange,
+        maxAmmo = maxAmmo,
+        maxHitCount = firearmNumber(runtimeItem, scriptItem, { "getMaxHitCount" }, { "maxHitCount", "maxHitcount" }) or 1,
+        criticalChance = firearmNumber(runtimeItem, scriptItem, { "getCriticalChance" }, { "criticalChance" }) or 0,
+        criticalMultiplier = firearmNumber(runtimeItem, scriptItem, { "getCriticalDamageMultiplier", "getCritDmgMultiplier" }, { "criticalDamageMultiplier", "critDmgMultiplier" }) or 0,
+        recoilDelay = firearmNumber(runtimeItem, scriptItem, { "getRecoilDelay" }, { "recoilDelay" }),
+        aimingTime = firearmNumber(runtimeItem, scriptItem, { "getAimingTime" }, { "aimingTime", "aimingtime" }),
+        reloadTime = firearmNumber(runtimeItem, scriptItem, { "getReloadTime" }, { "reloadTime", "reloadtime" }),
+        weight = firearmNumber(runtimeItem, scriptItem, { "getActualWeight", "getWeight" }, { "actualWeight", "weight" }),
+        soundRadius = firearmNumber(runtimeItem, scriptItem, { "getSoundRadius" }, { "soundRadius" }),
+    }
+    local essentialNames = { "averageDamage", "maxRange", "maxAmmo", "recoilDelay", "aimingTime", "reloadTime", "weight", "soundRadius" }
+    local essential = true
+    for _, name in ipairs(essentialNames) do if metrics[name] == nil then essential = false end end
+    local family = firearmFamily(fireMode, ammoType, attachmentType, maxRange)
+    return {
+        data = data, kind = "FIREARM", subgroup = family, functionalGroup = family,
+        metrics = metrics,
+        -- This structural fingerprint intentionally matches the validated A/B
+        -- laboratory's vanilla reference population. It is not a second
+        -- formula: it determines only which mechanically equivalent script
+        -- declarations share one normalization representative.
+        -- Keep Lua's explicit `nil` token in this fingerprint.  The approved
+        -- vanilla reference set distinguishes an undeclared modifier from an
+        -- empty declaration; collapsing both to "" incorrectly merged two
+        -- firearm profiles and shifted the p05/p95 anchors from 21 to 19.
+        profile = table.concat({ "FIREARM", family, tostring(ammoType), tostring(magazineType), tostring(gunType),
+            tostring(minDamage), tostring(maxDamage), tostring(maxRange), tostring(maxAmmo), tostring(partType), tostring(mountOn),
+            tostring(aimingTimeModifier), tostring(reloadTimeModifier), tostring(recoilDelayModifier), tostring(hitChanceModifier), tostring(maxRangeModifier) }, ":"),
+        utilityEligible = essential,
+        ineligibleReason = essential and nil or "FirearmUtility V1: missing confirmed combat attribute",
+        config = UTILITY.firearm,
+        utilityScoreVersion = UTILITY.firearm.utilityVersion,
+    }
+end
+
 local function literatureStructuralPosition(level)
     return ({ [1] = 1, [3] = 2, [5] = 3, [7] = 4, [9] = 5 })[level]
 end
@@ -1282,12 +1384,21 @@ local function candidateFor(data)
     if lightFire then return lightFire end
     local literature = makeLiteratureCandidate(data, scriptItem)
     if literature then return literature end
+    -- Firearm eligibility is structural (ranged + an actual ammunition
+    -- mechanism), not dependent on the scanner's broad display/category
+    -- label.  Cap guns are the important vanilla case: they are part of the
+    -- approved firearm reference population although they are not tagged as
+    -- WEAPON/TOOL by the generic classifier.
+    local firearm = makeFirearmCandidate(data, scriptItem)
+    if firearm then return firearm end
     if data.category == "CONTAINER" then return makeContainerCandidate(data, scriptItem) end
     if data.category == "CLOTHING" then return makeClothingDiscoveryCandidate(data, scriptItem) end
     if data.category == "ACCESSORY" or string.lower(tostring(data.displayCategory or "")) == "accessory" then
         return makeAccessoryMechanicalCandidate(data, scriptItem)
     end
-    if data.category == "WEAPON" or data.category == "TOOL" then return makeMeleeCandidate(data, scriptItem) end
+    if data.category == "WEAPON" or data.category == "TOOL" then
+        return makeMeleeCandidate(data, scriptItem)
+    end
     return { data = data, utilityEligible = false, ineligibleReason = "category is not implemented for Utility" }
 end
 
@@ -1572,6 +1683,210 @@ local function scoreMeleeV2(candidates)
         candidate.essentialsPresent = essentials
         candidate.normalizationGroup = "MELEE_WEAPON:V2_GLOBAL"
         candidate.utilityScoreVersion = UTILITY.meleeWeapon.utilityVersion
+    end
+end
+
+local function firearmRankingConfidence(profileCount)
+    if profileCount >= UTILITY.firearm.rankingConfidence.highProfiles then return "HIGH" end
+    if profileCount >= UTILITY.firearm.rankingConfidence.mediumProfiles then return "MEDIUM" end
+    return "LOW"
+end
+
+local function firearmRepresentatives(candidates)
+    local representatives, seen = {}, {}
+    for _, candidate in ipairs(candidates) do
+        if not seen[candidate.profile] then
+            seen[candidate.profile] = true
+            table.insert(representatives, candidate)
+        end
+    end
+    return representatives
+end
+
+local function firearmScale(references, selector)
+    local values = {}
+    for _, candidate in ipairs(references) do table.insert(values, selector(candidate) or 0) end
+    local sorted = sortedCopy(values)
+    local low, high = quantile(sorted, NORMALIZATION.winsorLowPercentile), quantile(sorted, NORMALIZATION.winsorHighPercentile)
+    return function(value)
+        if low == nil or high == nil or high <= low then return 50 end
+        return clamp(((value or 0) - low) * 100 / (high - low), 0, 100)
+    end
+end
+
+local function firearmComponents(rows, references)
+    local scales = {
+        damage = firearmScale(references, function(c) return c.metrics.averageDamage end),
+        multiHit = firearmScale(references, function(c) return math.sqrt(clamp(c.metrics.maxHitCount or 1, 1, 9)) end),
+        critical = firearmScale(references, function(c) return (c.metrics.criticalChance or 0) * (c.metrics.criticalMultiplier or 0) end),
+        range = firearmScale(references, function(c) return c.metrics.maxRange end),
+        capacity = firearmScale(references, function(c) return c.metrics.maxAmmo end),
+        weight = firearmScale(references, function(c) return c.metrics.weight end),
+        recoil = firearmScale(references, function(c) return c.metrics.recoilDelay end),
+        aiming = firearmScale(references, function(c) return c.metrics.aimingTime end),
+        reload = firearmScale(references, function(c) return c.metrics.reloadTime end),
+        sound = firearmScale(references, function(c) return c.metrics.soundRadius end),
+    }
+    local weights, offenseWeights, handlingWeights = UTILITY.firearm.offense, UTILITY.firearm.offenseComponents, UTILITY.firearm.handling
+    local result = {}
+    for _, candidate in ipairs(rows) do
+        local m = candidate.metrics
+        local damage = scales.damage(m.averageDamage)
+        local multiHit = scales.multiHit(math.sqrt(clamp(m.maxHitCount or 1, 1, 9)))
+        local critical = scales.critical((m.criticalChance or 0) * (m.criticalMultiplier or 0))
+        local offense = damage * offenseWeights.averageDamage + multiHit * offenseWeights.multiHit + critical * offenseWeights.critical
+        local capacity, range = scales.capacity(m.maxAmmo), scales.range(m.maxRange)
+        local handling = (100 - scales.recoil(m.recoilDelay)) * handlingWeights.recoil
+            + (100 - scales.aiming(m.aimingTime)) * handlingWeights.aiming
+            + (100 - scales.reload(m.reloadTime)) * handlingWeights.reload
+            + (100 - scales.weight(m.weight)) * handlingWeights.weight
+            + (100 - scales.sound(m.soundRadius)) * handlingWeights.sound
+        result[candidate] = {
+            offense = offense, capacity = capacity, handling = handling, range = range,
+            raw = offense * weights.damage + capacity * weights.capacity + handling * weights.handling + range * weights.range,
+        }
+    end
+    return result
+end
+
+-- FirearmUtility deliberately owns this compact reference pass instead of
+-- borrowing a generic category scale.  The A/B laboratory uses the same
+-- p05/p95 transform and, critically, chooses one profile representative in
+-- deterministic fullType order.  This keeps the vanilla anchors stable when
+-- two scripts share a combat declaration.
+local function firearmV1Representatives(rows)
+    local ordered, seen, representatives = {}, {}, {}
+    for _, row in ipairs(rows) do table.insert(ordered, row) end
+    table.sort(ordered, function(a, b) return tostring(a.data.fullType or "") < tostring(b.data.fullType or "") end)
+    for _, row in ipairs(ordered) do
+        if not seen[row.profile] then
+            seen[row.profile] = true
+            table.insert(representatives, row)
+        end
+    end
+    return representatives
+end
+
+local function firearmV1Scale(references, selector)
+    local values = {}
+    for _, candidate in ipairs(references) do table.insert(values, selector(candidate) or 0) end
+    values = sortedCopy(values)
+    local low = quantile(values, 5)
+    local high = quantile(values, 95)
+    local function scale(value)
+        if high == nil or low == nil or high <= low then return 50 end
+        return clamp(((value or 0) - low) * 100 / (high - low), 0, 100)
+    end
+    return scale, { p05 = low, p95 = high }
+end
+
+local function firearmV1Components(rows, references)
+    local damage, damageBounds = firearmV1Scale(references, function(c) return c.metrics.averageDamage end)
+    local multiHit, multiHitBounds = firearmV1Scale(references, function(c) return math.sqrt(clamp(c.metrics.maxHitCount or 1, 1, 9)) end)
+    local critical, criticalBounds = firearmV1Scale(references, function(c) return (c.metrics.criticalChance or 0) * (c.metrics.criticalMultiplier or 0) end)
+    local range, rangeBounds = firearmV1Scale(references, function(c) return c.metrics.maxRange end)
+    local capacity, capacityBounds = firearmV1Scale(references, function(c) return c.metrics.maxAmmo end)
+    local weight, weightBounds = firearmV1Scale(references, function(c) return c.metrics.weight end)
+    local recoil, recoilBounds = firearmV1Scale(references, function(c) return c.metrics.recoilDelay end)
+    local aiming, aimingBounds = firearmV1Scale(references, function(c) return c.metrics.aimingTime end)
+    local reload, reloadBounds = firearmV1Scale(references, function(c) return c.metrics.reloadTime end)
+    local sound, soundBounds = firearmV1Scale(references, function(c) return c.metrics.soundRadius end)
+    local scales = {
+        damage = damage, multiHit = multiHit, critical = critical, range = range, capacity = capacity,
+        weight = weight, recoil = recoil, aiming = aiming, reload = reload, sound = sound,
+    }
+    local weights, offenseWeights, handlingWeights = UTILITY.firearm.offense, UTILITY.firearm.offenseComponents, UTILITY.firearm.handling
+    local result = {}
+    for _, candidate in ipairs(rows) do
+        local m = candidate.metrics
+        local offense = offenseWeights.averageDamage * scales.damage(m.averageDamage)
+            + offenseWeights.multiHit * scales.multiHit(math.sqrt(clamp(m.maxHitCount or 1, 1, 9)))
+            + offenseWeights.critical * scales.critical((m.criticalChance or 0) * (m.criticalMultiplier or 0))
+        local handling = handlingWeights.recoil * (100 - scales.recoil(m.recoilDelay))
+            + handlingWeights.aiming * (100 - scales.aiming(m.aimingTime))
+            + handlingWeights.reload * (100 - scales.reload(m.reloadTime))
+            + handlingWeights.weight * (100 - scales.weight(m.weight))
+            + handlingWeights.sound * (100 - scales.sound(m.soundRadius))
+        local capacity, range = scales.capacity(m.maxAmmo), scales.range(m.maxRange)
+        result[candidate] = {
+            offense = offense, capacity = capacity, handling = handling, range = range,
+            raw = weights.damage * offense + weights.capacity * capacity + weights.handling * handling + weights.range * range,
+        }
+    end
+    return result, {
+        damage = damageBounds, multiHit = multiHitBounds, critical = criticalBounds,
+        range = rangeBounds, capacity = capacityBounds, weight = weightBounds,
+        recoil = recoilBounds, aiming = aimingBounds, reload = reloadBounds, sound = soundBounds,
+    }
+end
+
+-- Active FirearmUtility V1 mirrors the validated Model B diagnostic.  It
+-- retains an absolute vanilla-anchored combat score even when a family has a
+-- tiny sample; family position only refines that score according to its
+-- RankingConfidence.
+local function scoreFirearmUtility(candidates)
+    local firearms, vanilla, families = {}, {}, {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "FIREARM" and candidate.utilityEligible then
+            table.insert(firearms, candidate)
+            if tostring(candidate.data.fullType or ""):match("^Base%.") then table.insert(vanilla, candidate) end
+            families[candidate.subgroup] = families[candidate.subgroup] or { members = {}, vanilla = {} }
+            table.insert(families[candidate.subgroup].members, candidate)
+            if tostring(candidate.data.fullType or ""):match("^Base%.") then table.insert(families[candidate.subgroup].vanilla, candidate) end
+        end
+    end
+    local vanillaReferences = firearmV1Representatives(vanilla)
+    if #vanillaReferences == 0 then return end
+    local absoluteParts, absoluteBounds = firearmV1Components(firearms, vanillaReferences)
+    local absoluteScale, absoluteRawBounds = firearmV1Scale((function()
+        local rows = {}
+        for _, candidate in ipairs(vanillaReferences) do
+            local proxy = { metrics = { raw = absoluteParts[candidate].raw } }
+            table.insert(rows, proxy)
+        end
+        return rows
+    end)(), function(proxy) return proxy.metrics.raw end)
+    -- Diagnostic-only in-memory snapshot. It is intentionally not published
+    -- into item records, so it cannot affect registry contents or signatures.
+    ItemRarityUtilityCalculator.lastFirearmNormalizationBounds = {
+        referenceProfiles = #vanillaReferences,
+        components = absoluteBounds,
+        absoluteRaw = absoluteRawBounds,
+    }
+
+    for _, family in pairs(families) do
+        local familyReferences = firearmV1Representatives(family.vanilla)
+        local profileCount = #familyReferences
+        local rankingConfidence = firearmRankingConfidence(profileCount)
+        local relativeWeight = UTILITY.firearm.relativeWeight[rankingConfidence] or 0
+        local relativeParts = profileCount > 0 and firearmV1Components(family.members, familyReferences) or nil
+        for _, candidate in ipairs(family.members) do
+            local absolute = absoluteParts[candidate]
+            local relative = relativeParts and relativeParts[candidate]
+            local relativeScore = relative and relative.raw or 50
+            local absoluteValue = absoluteScale(absolute.raw)
+            local combined = (1 - relativeWeight) * absoluteValue + relativeWeight * relativeScore
+            local scarcityStrength = 100 - (candidate.data.scarcityPercentile or (candidate.data.tableAvailability and candidate.data.tableAvailability.routeWeightedPercentile) or 50)
+            local finalScore = combined * (1 - UTILITY.firearm.scarcityWeight) + scarcityStrength * UTILITY.firearm.scarcityWeight
+            candidate.utility = finalScore
+            candidate.utilityConfidence = "HIGH"
+            candidate.profileCount = profileCount
+            candidate.validAttributeCount = 10
+            candidate.essentialsPresent = true
+            candidate.normalizationGroup = "FIREARM:" .. candidate.subgroup .. ":VANILLA_REFERENCE"
+            candidate.utilityScoreVersion = UTILITY.firearm.utilityVersion
+            candidate.firearmAbsoluteValue = absoluteValue
+            candidate.firearmRelativeFamilyScore = relativeScore
+            candidate.firearmRankingConfidence = rankingConfidence
+            candidate.firearmCombinedScore = combined
+            candidate.firearmScarcityStrength = scarcityStrength
+            candidate.firearmFinalScore = finalScore
+            candidate.utilityComponents = {
+                offense = absolute.offense, capacity = absolute.capacity, handling = absolute.handling, range = absolute.range,
+                relativeOffense = relative and relative.offense or nil, relativeCapacity = relative and relative.capacity or nil,
+                relativeHandling = relative and relative.handling or nil, relativeRange = relative and relative.range or nil,
+            }
+        end
     end
 end
 
@@ -2336,6 +2651,15 @@ local function lightFireTierForScore(score)
     return "COMMON"
 end
 
+local function firearmFinalTier(score)
+    local tiers = UTILITY.firearm.tiers
+    if score >= tiers.exotic then return "EXOTIC" end
+    if score >= tiers.epic then return "EPIC" end
+    if score >= tiers.rare then return "RARE" end
+    if score >= tiers.uncommon then return "UNCOMMON" end
+    return "COMMON"
+end
+
 local function cappedTier(tier, maximum)
     local index, cap = TIER_INDEX[tier] or 1, TIER_INDEX[maximum] or #TIER_STRENGTH
     return TIER_STRENGTH[math.min(index, cap)]
@@ -2487,6 +2811,12 @@ local function publishCandidateFields(candidates)
         data.fireUtility = candidate.kind == "LIGHTFIRE" and candidate.fireUtility or nil
         data.fireTier = candidate.kind == "LIGHTFIRE" and candidate.fireTier or nil
         data.lightFireSelectedFunction = candidate.kind == "LIGHTFIRE" and candidate.lightFireSelectedFunction or nil
+        data.firearmAbsoluteValue = candidate.kind == "FIREARM" and candidate.firearmAbsoluteValue or nil
+        data.firearmRelativeFamilyScore = candidate.kind == "FIREARM" and candidate.firearmRelativeFamilyScore or nil
+        data.firearmRankingConfidence = candidate.kind == "FIREARM" and candidate.firearmRankingConfidence or nil
+        data.firearmCombinedScore = candidate.kind == "FIREARM" and candidate.firearmCombinedScore or nil
+        data.firearmScarcityStrength = candidate.kind == "FIREARM" and candidate.firearmScarcityStrength or nil
+        data.firearmFinalScore = candidate.kind == "FIREARM" and candidate.firearmFinalScore or nil
         data.literatureFunctionalGroup = candidate.kind == "LITERATURE" and candidate.functionalGroup or nil
         data.literatureStructuralTier = candidate.kind == "LITERATURE" and candidate.literatureStructuralTier or nil
         data.literatureMoodBenefit = candidate.kind == "LITERATURE" and candidate.metrics and candidate.metrics.moodBenefit or nil
@@ -2530,6 +2860,12 @@ local function applyTierAdjustment(data, candidate)
     data.recipeValue = candidate.recipeValue
     data.recipeScarcityStrength = candidate.recipeScarcityStrength
     data.recipeFinalScore = candidate.recipeFinalScore
+    data.firearmAbsoluteValue = candidate.kind == "FIREARM" and candidate.firearmAbsoluteValue or nil
+    data.firearmRelativeFamilyScore = candidate.kind == "FIREARM" and candidate.firearmRelativeFamilyScore or nil
+    data.firearmRankingConfidence = candidate.kind == "FIREARM" and candidate.firearmRankingConfidence or nil
+    data.firearmCombinedScore = candidate.kind == "FIREARM" and candidate.firearmCombinedScore or nil
+    data.firearmScarcityStrength = candidate.kind == "FIREARM" and candidate.firearmScarcityStrength or nil
+    data.firearmFinalScore = candidate.kind == "FIREARM" and candidate.firearmFinalScore or nil
     data.containerV2Group = candidate.containerV2Group
     data.containerRankingConfidence = candidate.containerRankingConfidence
     data.utilitySupport = utilitySupportStatus(candidate)
@@ -2584,6 +2920,15 @@ local function applyTierAdjustment(data, candidate)
         else
             data.utilityAdjustmentReason = "LightFireUtility V1: absolute estimated start-fire uses; EPIC ceiling"
         end
+        return
+    end
+
+    -- FirearmUtility V1 is combat-quality-led.  Its tiny 5% scarcity
+    -- refinement has already been applied to firearmFinalScore; firearms do
+    -- not pass through the generic Scarcity x Utility matrix.
+    if candidate.kind == "FIREARM" and candidate.utilityEligible and candidate.firearmFinalScore then
+        data.finalRarityTier = firearmFinalTier(candidate.firearmFinalScore)
+        data.utilityAdjustmentReason = "FirearmUtility V1 Model B: 95% vanilla-anchored CombinedFirearmScore + 5% ScarcityStrength; direct firearm tier bands"
         return
     end
 
@@ -3306,6 +3651,7 @@ function ItemRarityUtilityCalculator.calculate(results)
     -- Every eligible melee HandWeapon (including TOOL combat items) is then
     -- recalculated as V2 Model C10.
     scoreMeleeV2(candidates)
+    scoreFirearmUtility(candidates)
     scoreClothingUtility(candidates)
     scoreClothingDirectSlotV1(candidates)
     scoreMedicalUtility(candidates)

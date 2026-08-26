@@ -77,6 +77,20 @@ if Events and Events.OnClientCommand then
             if ItemRarityLightFireAudit and ItemRarityLightFireAudit.write then
                 ItemRarityLightFireAudit.write(ItemRarityScanner.results)
             end
+        elseif module == "ItemRarity" and command == "firearmAudit" then
+            ItemRarityUtils.info("FIREARM audit request received")
+            local ok, result = pcall(function()
+                require "ItemRarity/Diagnostics/FirearmAudit"
+                if ItemRarityFirearmAudit and ItemRarityFirearmAudit.write then
+                    return ItemRarityFirearmAudit.write(ItemRarityScanner.results)
+                end
+                return false
+            end)
+            if not ok then
+                ItemRarityUtils.warn("FIREARM audit failed: " .. tostring(result))
+            elseif not result then
+                ItemRarityUtils.warn("FIREARM audit did not produce a report")
+            end
         elseif module == "ItemRarity" and command == "reloadDiagnostic" then
             -- The debug console is client-side, but report writers run on the
             -- host.  Restrict server-side reload to an explicit allow-list;
@@ -86,12 +100,20 @@ if Events and Events.OnClientCommand then
                 clothingMechanicalValue = "media/lua/server/ItemRarity/Diagnostics/ClothingMechanicalValueReport.lua",
                 foodRuntimeAudit = "media/lua/server/ItemRarity/Diagnostics/ClothingMechanicalValueReport.lua",
                 clothingCostCalibration = "media/lua/server/ItemRarity/Diagnostics/ClothingCostCalibration.lua",
+                firearmAudit = "media/lua/server/ItemRarity/Diagnostics/FirearmAudit.lua",
             }
             local key = args and tostring(args.key or "") or ""
             local path = files[key]
             if path and reloadLuaFile then
                 reloadLuaFile(path)
                 ItemRarityUtils.info("Server diagnostic reloaded: " .. key)
+                if key == "firearmAudit" then
+                    if ItemRarityFirearmAudit and ItemRarityFirearmAudit.write then
+                        ItemRarityFirearmAudit.write(ItemRarityScanner.results)
+                    else
+                        ItemRarityUtils.warn("FIREARM audit did not expose a writer after reload")
+                    end
+                end
             elseif not path then
                 ItemRarityUtils.warn("Rejected unknown server diagnostic reload request: " .. key)
             end
