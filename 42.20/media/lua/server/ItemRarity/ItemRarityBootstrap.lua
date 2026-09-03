@@ -91,6 +91,22 @@ if Events and Events.OnClientCommand then
             elseif not result then
                 ItemRarityUtils.warn("FIREARM audit did not produce a report")
             end
+        elseif module == "ItemRarity" and command == "reloadRuntimePipeline" then
+            -- Deliberately fixed, small server-side reload path for normal
+            -- development.  It does not load any diagnostics and therefore
+            -- cannot trigger the historical Clothing report workload.
+            if reloadLuaFile and ItemRarityScanner and not ItemRarityScanner.isScanning then
+                local files = {
+                    "media/lua/shared/ItemRarity/RarityConfig.lua",
+                    "media/lua/server/ItemRarity/UtilityCalculator.lua",
+                    "media/lua/server/ItemRarity/RarityRegistryPublisher.lua",
+                }
+                for _, path in ipairs(files) do reloadLuaFile(path) end
+                ItemRarityUtils.info("Server runtime pipeline reloaded (lightweight)")
+                ItemRarityScanner.rescan("lightweight runtime reload")
+            else
+                ItemRarityUtils.warn("Runtime pipeline reload skipped while scanner is busy or unavailable")
+            end
         elseif module == "ItemRarity" and command == "reloadDiagnostic" then
             -- The debug console is client-side, but report writers run on the
             -- host.  Restrict server-side reload to an explicit allow-list;

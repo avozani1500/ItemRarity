@@ -1090,11 +1090,17 @@ local function makeFirearmCandidate(data, scriptItem)
     local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
     if not ok then runtimeItem = nil end
     local ranged = readBoolean(runtimeItem, "isRanged", "ranged") or readBoolean(scriptItem, "isRanged", "ranged")
+    local weaponScript = contains(string.lower(tostring(data.scriptType or "")), "weapon")
     local ammoType = firearmString(runtimeItem, scriptItem, { "getAmmoType" }, { "ammoType" })
     local maxAmmo = firearmNumber(runtimeItem, scriptItem, { "getMaxAmmo" }, { "maxAmmo" }) or 0
-    if not ranged or ammoType == "" or maxAmmo <= 0 then return nil end
     local minDamage = firearmNumber(runtimeItem, scriptItem, { "getMinDamage" }, { "minDamage" })
     local maxDamage = firearmNumber(runtimeItem, scriptItem, { "getMaxDamage" }, { "maxDamage" })
+    -- B42's bridge may return false for `isRanged`, but ScriptItem.Type is
+    -- explicit: a ranged weapon is a weapon script with an ammo mechanism.
+    -- Runtime instances of magazines expose default zero damage, so damage
+    -- values cannot safely be used as the discriminator here.
+    ranged = ranged or weaponScript
+    if not ranged or ammoType == "" or maxAmmo <= 0 then return nil end
     local maxRange = firearmNumber(runtimeItem, scriptItem, { "getMaxRange" }, { "maxRange" })
     local fireMode = firearmString(runtimeItem, scriptItem, { "getFireMode" }, { "fireMode" })
     local attachmentType = firearmString(runtimeItem, scriptItem, { "getAttachmentType" }, { "attachmentType" })
@@ -1126,6 +1132,7 @@ local function makeFirearmCandidate(data, scriptItem)
     local family = firearmFamily(fireMode, ammoType, attachmentType, maxRange)
     return {
         data = data, kind = "FIREARM", subgroup = family, functionalGroup = family,
+        firearmAmmoType = ammoType,
         metrics = metrics,
         -- This structural fingerprint intentionally matches the validated A/B
         -- laboratory's vanilla reference population. It is not a second
@@ -1142,6 +1149,59 @@ local function makeFirearmCandidate(data, scriptItem)
         ineligibleReason = essential and nil or "FirearmUtility V1: missing confirmed combat attribute",
         config = UTILITY.firearm,
         utilityScoreVersion = UTILITY.firearm.utilityVersion,
+    }
+end
+
+-- Magazine eligibility is structural: the script must declare both its ammo
+-- family and one or more compatible firearms, plus a positive MaxAmmo. This
+-- deliberately does not use category, display name or a magazine fullType.
+local function makeMagazineCandidate(data, scriptItem)
+    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
+    if not ok then runtimeItem = nil end
+    local ammoType = firearmString(runtimeItem, scriptItem, { "getAmmoType" }, { "ammoType" })
+    local gunType = firearmString(runtimeItem, scriptItem, { "getGunType" }, { "gunType" })
+    local maxAmmo = firearmNumber(runtimeItem, scriptItem, { "getMaxAmmo" }, { "maxAmmo" }) or 0
+    if contains(string.lower(tostring(data.scriptType or "")), "weapon") then return nil end
+    if ammoType == "" or gunType == "" or maxAmmo <= 0 then return nil end
+    local metrics = { maxAmmo = maxAmmo, ammoType = ammoType, gunType = gunType }
+    return {
+        data = data, kind = "MAGAZINE", subgroup = "MAGAZINE", functionalGroup = "MAGAZINE",
+        metrics = metrics,
+        profile = table.concat({ "MAGAZINE", tostring(ammoType), tostring(gunType), tostring(maxAmmo) }, ":"),
+        utilityEligible = true,
+        utilityConfidence = "HIGH",
+        validAttributeCount = 3,
+        essentialsPresent = true,
+        utilityScoreVersion = UTILITY.magazine.utilityVersion,
+    }
+end
+
+-- Direct ammunition has no independent combat value.  B42 exposes it as a
+-- non-container `base:ammo` script item; its family is resolved generically
+-- against the ammunition family declared by firearm scripts.  Opening boxes,
+-- ammo straps and ammo bags are excluded because they either transform via a
+-- recipe or expose container capacity.
+local function ammoFamilyKey(value)
+    local key = string.lower(tostring(value or "")):gsub("[^%w]", "")
+    return key:gsub("base", ""):gsub("bullets", ""):gsub("ammo", "")
+end
+
+local function makeAmmoCandidate(data, scriptItem)
+    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
+    if not ok then runtimeItem = nil end
+    local tags = string.lower(readString(scriptItem, "getTags", nil) or readString(runtimeItem, "getTags", nil) or "")
+    local capacity = readNumber(runtimeItem, "getCapacity", nil, 0) or 0
+    local openingRecipe = firearmString(runtimeItem, scriptItem, { "getDoubleClickRecipe" }, { "doubleClickRecipe" })
+    if string.lower(tostring(openingRecipe)) == "null" or string.lower(tostring(openingRecipe)) == "nil" then openingRecipe = "" end
+    local weaponScript = contains(string.lower(tostring(data.scriptType or "")), "weapon")
+    if weaponScript or not contains(tags, "base:ammo") or capacity > 0 or openingRecipe ~= "" then return nil end
+    local familyKey = ammoFamilyKey(data.fullType)
+    if familyKey == "" then return nil end
+    return {
+        data = data, kind = "AMMO", subgroup = "DIRECT_AMMO", functionalGroup = "DIRECT_AMMO",
+        metrics = { familyKey = familyKey }, profile = "AMMO:DIRECT:" .. familyKey,
+        utilityEligible = true, utilityConfidence = "HIGH", validAttributeCount = 2,
+        essentialsPresent = true, utilityScoreVersion = "V1_HIGHEST_COMPATIBLE_FIREARM_TIER",
     }
 end
 
@@ -1391,6 +1451,12 @@ local function candidateFor(data)
     -- WEAPON/TOOL by the generic classifier.
     local firearm = makeFirearmCandidate(data, scriptItem)
     if firearm then return firearm end
+    -- A firearm can also declare GunType and MaxAmmo, so it must be resolved
+    -- first.  Only the remaining compatible-ammo scripts are magazines.
+    local magazine = makeMagazineCandidate(data, scriptItem)
+    if magazine then return magazine end
+    local ammo = makeAmmoCandidate(data, scriptItem)
+    if ammo then return ammo end
     if data.category == "CONTAINER" then return makeContainerCandidate(data, scriptItem) end
     if data.category == "CLOTHING" then return makeClothingDiscoveryCandidate(data, scriptItem) end
     if data.category == "ACCESSORY" or string.lower(tostring(data.displayCategory or "")) == "accessory" then
@@ -1881,11 +1947,115 @@ local function scoreFirearmUtility(candidates)
             candidate.firearmCombinedScore = combined
             candidate.firearmScarcityStrength = scarcityStrength
             candidate.firearmFinalScore = finalScore
+            local tiers = UTILITY.firearm.tiers
+            candidate.firearmFinalTier = finalScore >= tiers.exotic and "EXOTIC" or finalScore >= tiers.epic and "EPIC"
+                or finalScore >= tiers.rare and "RARE" or finalScore >= tiers.uncommon and "UNCOMMON" or "COMMON"
             candidate.utilityComponents = {
                 offense = absolute.offense, capacity = absolute.capacity, handling = absolute.handling, range = absolute.range,
                 relativeOffense = relative and relative.offense or nil, relativeCapacity = relative and relative.capacity or nil,
                 relativeHandling = relative and relative.handling or nil, relativeRange = relative and relative.range or nil,
             }
+        end
+    end
+end
+
+local function canonicalFirearmFullType(value)
+    -- Bridge representations may add collection punctuation/spaces around a
+    -- declared fullType. Canonicalisation preserves the structural identity
+    -- while avoiding any item-specific compatibility table.
+    return string.lower(tostring(value or ""):gsub("%[", ""):gsub("%]", ""):gsub("%s", ""))
+end
+
+local function magazineTargets(value)
+    local targets, seen = {}, {}
+    -- The B42 bridge may render ScriptItem GunType lists as
+    -- "[Base.Pistol3]". Brackets are presentation syntax, not part of the
+    -- structural fullType used by the already-scored firearm registry.
+    local source = tostring(value or ""):gsub("%[", ""):gsub("%]", "")
+    for target in string.gmatch(source, "[^;,%s]+") do
+        local canonical = canonicalFirearmFullType(target)
+        if canonical ~= "" and not seen[canonical] then
+            seen[canonical] = true
+            table.insert(targets, canonical)
+        end
+    end
+    return targets
+end
+
+-- MagazineUtility V1 consumes the already-computed FirearmUtility V1 final
+-- score. It never rebuilds firearms, reference bounds or scarcity values.
+local function scoreMagazineUtility(candidates)
+    local firearms = {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "FIREARM" and candidate.utilityEligible and candidate.firearmFinalScore ~= nil then
+            firearms[canonicalFirearmFullType(candidate.data.fullType)] = candidate.firearmFinalScore
+        end
+    end
+    local config = UTILITY.magazine
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "MAGAZINE" and candidate.utilityEligible then
+            local compatible, values = magazineTargets(candidate.metrics.gunType), {}
+            for _, fullType in ipairs(compatible) do
+                if firearms[fullType] ~= nil then table.insert(values, firearms[fullType]) end
+            end
+            local best, total = nil, 0
+            for _, value in ipairs(values) do
+                best = best and math.max(best, value) or value
+                total = total + value
+            end
+            if not best then
+                candidate.utilityEligible = false
+                candidate.utilityConfidence = "LOW"
+                candidate.ineligibleReason = "MagazineUtility V1: no compatible published FirearmUtility value"
+            else
+                local capacityValue = 100 * candidate.metrics.maxAmmo / (candidate.metrics.maxAmmo + config.capacitySaturation)
+                local score = config.compatibleWeaponWeight * best + config.capacityWeight * capacityValue
+                candidate.magazineCompatibleWeaponValue = best
+                candidate.magazineCompatibleWeaponAverage = total / #values
+                candidate.magazineCapacityValue = capacityValue
+                candidate.magazineFinalScore = score
+                candidate.utility = score
+                candidate.utilityConfidence = "HIGH"
+                candidate.profileCount = #values
+                candidate.normalizationGroup = "MAGAZINE:CONTEXTUAL_FIREARM"
+                local tiers = UTILITY.firearm.tiers
+                local tier = score >= tiers.exotic and "EXOTIC" or score >= tiers.epic and "EPIC"
+                    or score >= tiers.rare and "RARE" or score >= tiers.uncommon and "UNCOMMON" or "COMMON"
+                candidate.magazineFinalTier = tier == "EXOTIC" and config.maxTier or tier
+                candidate.utilityComponents = { compatibleWeaponValue = best, capacityValue = capacityValue }
+            end
+        end
+    end
+end
+
+-- AmmoUtility intentionally has no score: direct ammunition inherits the
+-- strongest already-finalized firearm tier in its declared ammo family.
+local function scoreAmmoInheritance(candidates)
+    local firearmsByFamily = {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "FIREARM" and candidate.utilityEligible and candidate.firearmFinalTier then
+            local key = ammoFamilyKey(candidate.firearmAmmoType)
+            if key ~= "" then
+                firearmsByFamily[key] = firearmsByFamily[key] or {}
+                table.insert(firearmsByFamily[key], { fullType = candidate.data.fullType, tier = candidate.firearmFinalTier })
+            end
+        end
+    end
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "AMMO" and candidate.utilityEligible then
+            local compatible = firearmsByFamily[candidate.metrics.familyKey] or {}
+            local bestTier, compatibleNames = nil, {}
+            for _, firearm in ipairs(compatible) do
+                table.insert(compatibleNames, firearm.fullType)
+                if not bestTier or TIER_INDEX[firearm.tier] > TIER_INDEX[bestTier] then bestTier = firearm.tier end
+            end
+            table.sort(compatibleNames)
+            candidate.ammoCompatibleFirearms = compatibleNames
+            candidate.ammoInheritedFirearmTier = bestTier
+            if not bestTier then
+                candidate.utilityEligible = false
+                candidate.ineligibleReason = "AmmoUtility V1: no structurally compatible FirearmUtility result"
+            end
         end
     end
 end
@@ -2817,6 +2987,12 @@ local function publishCandidateFields(candidates)
         data.firearmCombinedScore = candidate.kind == "FIREARM" and candidate.firearmCombinedScore or nil
         data.firearmScarcityStrength = candidate.kind == "FIREARM" and candidate.firearmScarcityStrength or nil
         data.firearmFinalScore = candidate.kind == "FIREARM" and candidate.firearmFinalScore or nil
+        data.magazineCompatibleWeaponValue = candidate.kind == "MAGAZINE" and candidate.magazineCompatibleWeaponValue or nil
+        data.magazineCompatibleWeaponAverage = candidate.kind == "MAGAZINE" and candidate.magazineCompatibleWeaponAverage or nil
+        data.magazineCapacityValue = candidate.kind == "MAGAZINE" and candidate.magazineCapacityValue or nil
+        data.magazineFinalScore = candidate.kind == "MAGAZINE" and candidate.magazineFinalScore or nil
+        data.ammoCompatibleFirearms = candidate.kind == "AMMO" and candidate.ammoCompatibleFirearms or nil
+        data.ammoInheritedFirearmTier = candidate.kind == "AMMO" and candidate.ammoInheritedFirearmTier or nil
         data.literatureFunctionalGroup = candidate.kind == "LITERATURE" and candidate.functionalGroup or nil
         data.literatureStructuralTier = candidate.kind == "LITERATURE" and candidate.literatureStructuralTier or nil
         data.literatureMoodBenefit = candidate.kind == "LITERATURE" and candidate.metrics and candidate.metrics.moodBenefit or nil
@@ -2866,6 +3042,12 @@ local function applyTierAdjustment(data, candidate)
     data.firearmCombinedScore = candidate.kind == "FIREARM" and candidate.firearmCombinedScore or nil
     data.firearmScarcityStrength = candidate.kind == "FIREARM" and candidate.firearmScarcityStrength or nil
     data.firearmFinalScore = candidate.kind == "FIREARM" and candidate.firearmFinalScore or nil
+    data.magazineCompatibleWeaponValue = candidate.kind == "MAGAZINE" and candidate.magazineCompatibleWeaponValue or nil
+    data.magazineCompatibleWeaponAverage = candidate.kind == "MAGAZINE" and candidate.magazineCompatibleWeaponAverage or nil
+    data.magazineCapacityValue = candidate.kind == "MAGAZINE" and candidate.magazineCapacityValue or nil
+    data.magazineFinalScore = candidate.kind == "MAGAZINE" and candidate.magazineFinalScore or nil
+    data.ammoCompatibleFirearms = candidate.kind == "AMMO" and candidate.ammoCompatibleFirearms or nil
+    data.ammoInheritedFirearmTier = candidate.kind == "AMMO" and candidate.ammoInheritedFirearmTier or nil
     data.containerV2Group = candidate.containerV2Group
     data.containerRankingConfidence = candidate.containerRankingConfidence
     data.utilitySupport = utilitySupportStatus(candidate)
@@ -2929,6 +3111,18 @@ local function applyTierAdjustment(data, candidate)
     if candidate.kind == "FIREARM" and candidate.utilityEligible and candidate.firearmFinalScore then
         data.finalRarityTier = firearmFinalTier(candidate.firearmFinalScore)
         data.utilityAdjustmentReason = "FirearmUtility V1 Model B: 95% vanilla-anchored CombinedFirearmScore + 5% ScarcityStrength; direct firearm tier bands"
+        return
+    end
+
+    if candidate.kind == "MAGAZINE" and candidate.utilityEligible and candidate.magazineFinalTier then
+        data.finalRarityTier = candidate.magazineFinalTier
+        data.utilityAdjustmentReason = "MagazineUtility V1: 70% best compatible FirearmUtility V1 + 30% saturating capacity; Scarcity excluded; EPIC ceiling"
+        return
+    end
+
+    if candidate.kind == "AMMO" and candidate.utilityEligible and candidate.ammoInheritedFirearmTier then
+        data.finalRarityTier = candidate.ammoInheritedFirearmTier
+        data.utilityAdjustmentReason = "AmmoUtility V1: inherits the highest FinalFirearmTier among structurally compatible firearms; Scarcity excluded"
         return
     end
 
@@ -3652,6 +3846,8 @@ function ItemRarityUtilityCalculator.calculate(results)
     -- recalculated as V2 Model C10.
     scoreMeleeV2(candidates)
     scoreFirearmUtility(candidates)
+    scoreMagazineUtility(candidates)
+    scoreAmmoInheritance(candidates)
     scoreClothingUtility(candidates)
     scoreClothingDirectSlotV1(candidates)
     scoreMedicalUtility(candidates)

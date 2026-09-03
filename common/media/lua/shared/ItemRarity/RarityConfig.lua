@@ -162,6 +162,18 @@ ItemRarityConfig.utility = {
         tiers = { uncommon = 40, rare = 55, epic = 70, exotic = 85 },
     },
 
+    -- MagazineUtility V1 is contextual rather than capacity-only: a magazine
+    -- inherits most of its value from the strongest published firearm that
+    -- structurally declares it as compatible. Capacity has a saturating,
+    -- secondary contribution. Scarcity is intentionally absent in V1.
+    magazine = {
+        utilityVersion = "V1_COMPATIBLE_FIREARM_70_CAPACITY_30_EPIC_CAP",
+        compatibleWeaponWeight = 0.70,
+        capacityWeight = 0.30,
+        capacitySaturation = 10,
+        maxTier = "EPIC",
+    },
+
     -- ClothingUtility is calculated for diagnostics only in this stage. Its
     -- score intentionally does not participate in active FinalRarityTier or
     -- UI publication until its simulation has been reviewed.

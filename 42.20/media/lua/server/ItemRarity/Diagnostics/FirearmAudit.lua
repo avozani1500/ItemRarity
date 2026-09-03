@@ -169,6 +169,7 @@ local function rowFor(data)
     local display = text(script, runtime, { "getDisplayCategory" }, { "displayCategory" })
     local itemType = text(script, runtime, { "getType", "getItemType" }, { "type", "itemType" })
     local ammoType = text(script, runtime, { "getAmmoType" }, { "ammoType" })
+    local doubleClickRecipe = text(script, runtime, { "getDoubleClickRecipe" }, { "doubleClickRecipe" })
     local gunType = text(script, runtime, { "getGunType" }, { "gunType" })
     local magazineType = text(script, runtime, { "getMagazineType" }, { "magazineType" })
     local partType = text(script, runtime, { "getPartType" }, { "partType" })
@@ -176,6 +177,7 @@ local function rowFor(data)
     local attachmentType = text(script, runtime, { "getAttachmentType" }, { "attachmentType" })
     local ranged = bool(script, runtime, { "isRanged" }, { "ranged" })
     local maxAmmo = num(script, runtime, { "getMaxAmmo" }, { "maxAmmo" }) or 0
+    local containerCapacity = num(script, runtime, { "getCapacity" }, { "capacity" }) or 0
     local magazine = gunType ~= "" and ammoType ~= "" and maxAmmo > 0
     local weaponPart = lower(display) == "weaponpart" or lower(itemType) == "base:weaponpart" or partType ~= "" or mountOn ~= ""
     -- Weapon cases can inherit Ranged from their underlying script class, but
@@ -185,7 +187,9 @@ local function rowFor(data)
     -- The broad technical AMMO category also contains traps, weapon cases and
     -- ammo containers.  Only the runtime ammo tag is enough evidence for
     -- direct ammunition; the remainder is intentionally deferred.
-    local ammo = not magazine and has(tags, "base:ammo")
+    -- `base:ammo` is also used by ammo straps and bags. Direct ammunition is
+    -- non-container ammunition with no opening/transformation recipe.
+    local ammo = not magazine and has(tags, "base:ammo") and containerCapacity <= 0 and doubleClickRecipe == ""
     local special = not firearm and not magazine and not weaponPart and not ammo
         and (data.category == "AMMO" or lower(display) == "ammo" or ranged or has(tags, "base:ammocase"))
     local kind = firearm and "FIREARM" or magazine and "MAGAZINE" or weaponPart and "WEAPON_PART" or ammo and "AMMO" or special and "SPECIAL_PARTIAL" or nil
@@ -208,7 +212,7 @@ local function rowFor(data)
     local record = {
         data = data, script = script, runtime = runtime, kind = kind,
         fullType = data.fullType, module = moduleOf(data.fullType), displayCategory = display, itemType = itemType, tags = tags,
-        ammoType = ammoType, gunType = gunType, magazineType = magazineType, partType = partType, mountOn = mountOn,
+        ammoType = ammoType, gunType = gunType, magazineType = magazineType, doubleClickRecipe = doubleClickRecipe, partType = partType, mountOn = mountOn,
         family = family,
         minDamage = minDamage, maxDamage = maxDamage, averageDamage = minDamage and maxDamage and (minDamage + maxDamage) / 2 or nil,
         minRange = num(script, runtime, { "getMinRange" }, { "minRange" }), maxRange = maxRange,
@@ -221,7 +225,7 @@ local function rowFor(data)
         soundRadius = num(script, runtime, { "getSoundRadius" }, { "soundRadius" }),
         conditionMax = num(script, runtime, { "getConditionMax" }, { "conditionMax" }),
         weight = num(script, runtime, { "getActualWeight", "getWeight" }, { "actualWeight", "weight" }),
-        maxAmmo = maxAmmo,
+        maxAmmo = maxAmmo, containerCapacity = containerCapacity,
         stackCount = num(script, runtime, { "getCount" }, { "count" }),
         piercing = bool(script, runtime, { "isPiercingBullets" }, { "piercingBullets" }),
         maxHitCount = maxHitCount,
@@ -636,6 +640,40 @@ local function writeMagazineUtilitySimulation(writer, magazines, results)
     end
 end
 
+local TIER_INDEX = { COMMON = 1, UNCOMMON = 2, RARE = 3, EPIC = 4, EXOTIC = 5 }
+local function higherTier(left, right)
+    if not left or (TIER_INDEX[right] or 0) > (TIER_INDEX[left] or 0) then return right end
+    return left
+end
+
+-- Direct ammunition is matched to firearm-declared AmmoType using the same
+-- normalized script identifier bridge used in the earlier structural audit.
+-- Boxes are reported separately: a DoubleClickRecipe identifies an opening
+-- transformation, but B42's public Item bridge does not expose that recipe's
+-- mapped output item reliably enough to inherit a tier yet.
+local function writeAmmoTierSimulation(writer, ammoRows, specialRows, firearmsByAmmo, results)
+    writer:write("\nAMMO TIER INHERITANCE SIMULATION (READ ONLY)\n")
+    writer:write("Direct ammo tier = highest FinalFirearmTier among structurally compatible firearms. No scarcity, quantity or separate AmmoUtility.\n")
+    writer:write("fullType | compatible firearms | inherited firearm tier | current FinalTier | status\n")
+    for _, row in ipairs(ammoRows) do
+        local compatible = firearmsByAmmo[ammoKey(row.fullType)] or firearmsByAmmo[ammoKey(row.ammoType)] or {}
+        local tier = nil
+        for _, firearm in ipairs(compatible) do
+            local data = results[firearm]
+            tier = higherTier(tier, data and data.finalRarityTier or nil)
+        end
+        writer:write(string.format("%s | %s | %s | %s | %s\n", row.fullType, join(compatible), safe(tier), safe(row.finalTier), tier and "DIRECT_AMMO" or "SPECIAL_PARTIAL: no reliable firearm link"))
+    end
+    writer:write("\nAMMO BOX / CARTON STRUCTURAL CANDIDATES\n")
+    writer:write("fullType | opening recipe | tags | current FinalTier | proposed status\n")
+    for _, row in ipairs(specialRows) do
+        if row.doubleClickRecipe ~= "" or has(row.tags, "base:ammocase") then
+            local status = row.doubleClickRecipe ~= "" and "PARTIAL: opening recipe declared; output link unavailable via public bridge" or "SPECIAL_PARTIAL: ammo container without declared output link"
+            writer:write(string.format("%s | %s | %s | %s | %s\n", row.fullType, safe(row.doubleClickRecipe), safe(row.tags), safe(row.finalTier), status))
+        end
+    end
+end
+
 function ItemRarityFirearmAudit.write(results)
     if type(results) ~= "table" or not getFileWriter then return nil end
     local groups = { FIREARM = {}, AMMO = {}, MAGAZINE = {}, WEAPON_PART = {}, SPECIAL_PARTIAL = {} }
@@ -673,22 +711,24 @@ function ItemRarityFirearmAudit.write(results)
         function(a,b) return (a.averageDamage or 0) == (b.averageDamage or 0) and a.fullType < b.fullType or (a.averageDamage or 0) > (b.averageDamage or 0) end)
 
     writeRows(writer, "AMMO", groups.AMMO,
-        "fullType | module | ammoKey | stackCount | weight | compatibleFirearms | occurrences | ScarcityTier | ScarcityPct | FinalTier | tags",
+        "fullType | module | ammoKey | stackCount | weight | compatibleFirearms | occurrences | ScarcityTier | ScarcityPct | ActiveKind | ActiveInheritedTier | ActiveCompatibleFirearms | FinalTier | tags",
         function(r)
             local compatible = firearmsByAmmo[ammoKey(r.fullType)] or firearmsByAmmo[ammoKey(r.ammoType)] or {}
-            return { r.fullType, r.module, r.ammoType ~= "" and r.ammoType or ammoKey(r.fullType), r.stackCount, r.weight, join(compatible), r.occurrences, r.scarcityTier, r.scarcityPercentile, r.finalTier, r.tags }
+            return { r.fullType, r.module, r.ammoType ~= "" and r.ammoType or ammoKey(r.fullType), r.stackCount, r.weight, join(compatible), r.occurrences, r.scarcityTier, r.scarcityPercentile, safe(r.data.utilityKind), safe(r.data.ammoInheritedFirearmTier), safe(join(r.data.ammoCompatibleFirearms or {})), r.finalTier, r.tags }
         end)
 
     writeRows(writer, "MAGAZINES", groups.MAGAZINE,
-        "fullType | module | ammoType | capacity | GunType declared | compatibleFirearms | weight | occurrences | ScarcityTier | ScarcityPct | FinalTier | tags",
+        "fullType | module | ammoType | capacity | GunType declared | compatibleFirearms | weight | occurrences | ScarcityTier | ScarcityPct | ActiveKind | ActiveMetricGunType | ActiveUtility | ActiveMagazineScore | ActiveReason | FinalTier | tags",
         function(r)
             local compatible, seen = splitTargets(r.gunType), {}
             for _, value in ipairs(compatible) do seen[value] = true end
             for _, value in ipairs(firearmsByMagazine[normalized(r.fullType)] or {}) do if not seen[value] then seen[value] = true; table.insert(compatible, value) end end
-            return { r.fullType, r.module, r.ammoType, r.maxAmmo, r.gunType, join(compatible), r.weight, r.occurrences, r.scarcityTier, r.scarcityPercentile, r.finalTier, r.tags }
+            return { r.fullType, r.module, r.ammoType, r.maxAmmo, r.gunType, join(compatible), r.weight, r.occurrences, r.scarcityTier, r.scarcityPercentile,
+                safe(r.data.utilityKind), safe(r.data.utilityMetrics and r.data.utilityMetrics.gunType), safe(r.data.utility), safe(r.data.magazineFinalScore), safe(r.data.utilityAdjustmentReason), r.finalTier, r.tags }
         end)
 
     writeMagazineUtilitySimulation(writer, groups.MAGAZINE, results)
+    writeAmmoTierSimulation(writer, groups.AMMO, groups.SPECIAL_PARTIAL, firearmsByAmmo, results)
 
     writeRows(writer, "WEAPON PARTS", groups.WEAPON_PART,
         "fullType | module | PartType | MountOn compatible firearms | aimingMod | reloadMod | recoilMod | hitChanceMod | rangeMod | sightMin/Max | spreadMod | weight | occurrences | ScarcityTier | ScarcityPct | FinalTier | tags",
