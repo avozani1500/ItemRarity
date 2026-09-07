@@ -2,7 +2,6 @@ require "ItemRarity/RarityUtils"
 require "ItemRarity/ItemClassifier"
 
 ItemRarityLootAnalyzer = ItemRarityLootAnalyzer or {}
-ItemRarityLootAnalyzer.items = {}
 
 local function addUnique(list, set, value)
     if value and not set[value] then
@@ -60,7 +59,5 @@ function ItemRarityLootAnalyzer.analyze(rawOccurrences)
         data.lootClassification = ItemRarityItemClassifier.getLootClassification(data.fullType, data)
     end
 
-    ItemRarityLootAnalyzer.items = results
     return results
 end
-

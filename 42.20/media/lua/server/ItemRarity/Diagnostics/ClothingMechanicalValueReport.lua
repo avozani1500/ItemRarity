@@ -5,36 +5,6 @@ require "ItemRarity/UtilityCalculator"
 -- value/tier. BodyLocation tokens below are used only to print audit sections.
 ItemRarityClothingMechanicalValueReport = ItemRarityClothingMechanicalValueReport or {}
 
--- Development-only bridge: the client debug console can already request a
--- reload of this allow-listed report on the authoritative host.  While the
--- scanner is idle, use that trusted request to reload the active clothing
--- pipeline too, then run its normal rescan path.  This avoids requiring a
--- world restart for an in-progress server-side Lua iteration.  It is never
--- entered when this report is loaded by the normal scan/report path.
-local function reloadActivePipelineForDevelopment()
-    if not reloadLuaFile or (ItemRarityScanner and ItemRarityScanner.isScanning) then return false end
-    local files = {
-        "media/lua/shared/ItemRarity/RarityConfig.lua",
-        "media/lua/server/ItemRarity/UtilityCalculator.lua",
-        "media/lua/server/ItemRarity/RarityRegistryPublisher.lua",
-        "media/lua/server/ItemRarity/RarityScanner.lua",
-        -- Bootstrap owns the allow-listed client diagnostic commands. Keep it
-        -- in this trusted development reload bridge so a newly added
-        -- read-only report does not require restarting the whole world.
-        "media/lua/server/ItemRarity/ItemRarityBootstrap.lua",
-    }
-    for _, path in ipairs(files) do reloadLuaFile(path) end
-    if ItemRarityUtils then
-        ItemRarityUtils.info("Development runtime pipeline reloaded via clothingMechanicalValue diagnostic bridge")
-    end
-    if ItemRarityScanner and ItemRarityScanner.rescan then
-        ItemRarityScanner.rescan("development runtime reload bridge")
-    end
-    return true
-end
-
-local reloadedActivePipelineForDevelopment = reloadActivePipelineForDevelopment()
-
 local API = ItemRarityUtilityCalculator.getClothingDiagnosticApi()
 local clamp, quantile, sortedCopy = API.clamp, API.quantile, API.sortedCopy
 
@@ -736,10 +706,3 @@ end
 
 ItemRarityFoodRuntimeAudit = ItemRarityFoodRuntimeAudit or {}
 ItemRarityFoodRuntimeAudit.write = writeFoodRuntimeAudit
-
-if reloadedActivePipelineForDevelopment and ItemRarityScanner and ItemRarityScanner.results then
-    writeAccessoryMechanicalValueAudit(ItemRarityScanner.results)
-    writeTrivialPolicySimulation(ItemRarityScanner.results)
-    writeMedicalRuntimeAudit(ItemRarityScanner.results)
-    writeFoodRuntimeAudit(ItemRarityScanner.results)
-end

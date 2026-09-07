@@ -98,8 +98,10 @@ if Events and Events.OnClientCommand then
             if reloadLuaFile and ItemRarityScanner and not ItemRarityScanner.isScanning then
                 local files = {
                     "media/lua/shared/ItemRarity/RarityConfig.lua",
+                    "media/lua/server/ItemRarity/TableAvailabilityCalculator.lua",
                     "media/lua/server/ItemRarity/UtilityCalculator.lua",
                     "media/lua/server/ItemRarity/RarityRegistryPublisher.lua",
+                    "media/lua/server/ItemRarity/RarityScanner.lua",
                 }
                 for _, path in ipairs(files) do reloadLuaFile(path) end
                 ItemRarityUtils.info("Server runtime pipeline reloaded (lightweight)")

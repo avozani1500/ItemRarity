@@ -71,49 +71,40 @@ local function assignCategoryPercentiles(results, field, percentileField)
 end
 
 function ItemRarityTableAvailabilityCalculator.calculate(results)
+    -- Production scans retain only the RouteWeighted/D inputs and percentile.
+    -- A/B/C are comparative diagnostics, so calculating their aggregates and
+    -- category percentiles here used to spend three extra sort passes on every
+    -- normal scan even when reports were disabled.
     for _, data in pairs(results) do
-        local relativeTotal, nominalTotal, routeWeightedNotFound = 0, 0, 1
+        local routeWeightedNotFound = 1
         local byPool = {}
         local modeledOccurrences = 0
         for _, occurrence in ipairs(data.occurrencesData) do
-            local relative = clamp(occurrence.relativeWeight or 0, 0, 1)
             -- ItemPickerJava compares Rand.Next(10000) with chance * 100 in
             -- the neutral, non-contextual case: raw table weight / 100.
             local nominal = chanceAtLeastOnce((occurrence.weight or 0) / 100, occurrence.rolls)
-            occurrence.nominalRolls = declaredEffectiveRolls(occurrence.rolls)
-            occurrence.nominalAvailability = nominal
-            relativeTotal = relativeTotal + relative
-            nominalTotal = nominalTotal + nominal
-            byPool[occurrence.source] = byPool[occurrence.source] or {}
-            table.insert(byPool[occurrence.source], occurrence)
+            local poolState = byPool[occurrence.source]
+            if not poolState then
+                poolState = { notFound = 1, exposure = occurrence.poolExposure or 0 }
+                byPool[occurrence.source] = poolState
+            end
+            poolState.notFound = poolState.notFound * (1 - nominal)
             local pool = ItemRarityScanner and ItemRarityScanner.pools and ItemRarityScanner.pools[occurrence.source]
             local resolution = pool and pool.routeResolution and pool.routeResolution.classification
             occurrence.hasModeledRoute = resolution ~= nil and resolution ~= "UNRESOLVED_AFTER_FINAL_MERGE"
             if occurrence.hasModeledRoute then modeledOccurrences = modeledOccurrences + 1 end
         end
 
-        local poolCombined, poolCount, modeledPoolCount = 1, 0, 0
-        for source, occurrences in pairs(byPool) do
-            local notFoundInPool = 1
-            for _, occurrence in ipairs(occurrences) do
-                notFoundInPool = notFoundInPool * (1 - occurrence.nominalAvailability)
-            end
-            poolCombined = poolCombined * notFoundInPool
+        local poolCount, modeledPoolCount = 0, 0
+        for source, poolState in pairs(byPool) do
             poolCount = poolCount + 1
-            local exposure = occurrences[1].poolExposure or 0
-            routeWeightedNotFound = routeWeightedNotFound * (1 - ((1 - notFoundInPool) * exposure))
+            routeWeightedNotFound = routeWeightedNotFound * (1 - ((1 - poolState.notFound) * poolState.exposure))
             local pool = ItemRarityScanner and ItemRarityScanner.pools and ItemRarityScanner.pools[source]
             local resolution = pool and pool.routeResolution and pool.routeResolution.classification
             if resolution ~= nil and resolution ~= "UNRESOLVED_AFTER_FINAL_MERGE" then modeledPoolCount = modeledPoolCount + 1 end
         end
 
         data.tableAvailability = {
-            -- A: relative composition only; it is not picker probability.
-            relativeWeightOnly = (relativeTotal / math.max(1, data.occurrences)) * 100,
-            -- B: confirmed per-entry roll behavior at neutral context.
-            nominalRollAware = (nominalTotal / math.max(1, data.occurrences)) * 100,
-            -- C: B merged by independent table pools under equal exposure.
-            equalPoolAggregate = (1 - poolCombined) * 100,
             -- D: B availability discounted by normalized route/pool exposure.
             -- It remains a table approximation: room/container population and
             -- runtime conditions are deliberately not world-frequency inputs.
@@ -128,9 +119,6 @@ function ItemRarityTableAvailabilityCalculator.calculate(results)
         data.confidence = ItemRarityTiers.getConfidence(data.occurrenceCoverage)
     end
 
-    assignCategoryPercentiles(results, "relativeWeightOnly", "relativeWeightOnlyPercentile")
-    assignCategoryPercentiles(results, "nominalRollAware", "nominalRollAwarePercentile")
-    assignCategoryPercentiles(results, "equalPoolAggregate", "equalPoolAggregatePercentile")
     assignCategoryPercentiles(results, "routeWeighted", "routeWeightedPercentile")
     for _, data in pairs(results) do
         local percentile = data.tableAvailability.routeWeightedPercentile
@@ -138,5 +126,39 @@ function ItemRarityTableAvailabilityCalculator.calculate(results)
         data.tableAvailability.rarityTier = data.rarityTier
         data.tableAvailability.percentileWithinCategory = percentile
     end
+    return results
+end
+
+-- A/B/C are intentionally computed only for an explicit development report.
+-- This function is read-only with respect to the active D tier fields.
+function ItemRarityTableAvailabilityCalculator.calculateDiagnosticStrategies(results)
+    for _, data in pairs(results) do
+        local relativeTotal, nominalTotal, poolCombined = 0, 0, 1
+        local byPool = {}
+        for _, occurrence in ipairs(data.occurrencesData) do
+            local relative = clamp(occurrence.relativeWeight or 0, 0, 1)
+            local nominal = chanceAtLeastOnce((occurrence.weight or 0) / 100, occurrence.rolls)
+            occurrence.nominalRolls = declaredEffectiveRolls(occurrence.rolls)
+            occurrence.nominalAvailability = nominal
+            relativeTotal = relativeTotal + relative
+            nominalTotal = nominalTotal + nominal
+            local poolState = byPool[occurrence.source]
+            if not poolState then
+                poolState = { notFound = 1 }
+                byPool[occurrence.source] = poolState
+            end
+            poolState.notFound = poolState.notFound * (1 - nominal)
+        end
+        for _, poolState in pairs(byPool) do poolCombined = poolCombined * poolState.notFound end
+
+        local availability = data.tableAvailability or {}
+        availability.relativeWeightOnly = (relativeTotal / math.max(1, data.occurrences)) * 100
+        availability.nominalRollAware = (nominalTotal / math.max(1, data.occurrences)) * 100
+        availability.equalPoolAggregate = (1 - poolCombined) * 100
+        data.tableAvailability = availability
+    end
+    assignCategoryPercentiles(results, "relativeWeightOnly", "relativeWeightOnlyPercentile")
+    assignCategoryPercentiles(results, "nominalRollAware", "nominalRollAwarePercentile")
+    assignCategoryPercentiles(results, "equalPoolAggregate", "equalPoolAggregatePercentile")
     return results
 end

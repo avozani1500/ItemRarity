@@ -68,7 +68,11 @@ end
 local function safe(value)
     if value == nil or value == "" then return "-" end
     if type(value) == "number" then return string.format("%.3f", value) end
-    return tostring(value):gsub("[\r\n|]", " ")
+    -- string.gsub returns both the rewritten string and its replacement
+    -- count. Keep only the string: forwarding both into table.insert() made
+    -- the targeted Clothing report pass an accidental third argument.
+    local cleaned = tostring(value):gsub("[\r\n|]", " ")
+    return cleaned
 end
 
 local function slash(...)
@@ -674,6 +678,1112 @@ local function writeAmmoTierSimulation(writer, ammoRows, specialRows, firearmsBy
     end
 end
 
+-- This report is deliberately derived from the already-published registry.
+-- It is a coverage inventory only: no candidate, tier, scanner state or
+-- signature field is mutated here.
+local function coverageOwner(data)
+    local reason = tostring(data.utilityAdjustmentReason or "")
+    local prefixes = {
+        { "WeaponUtility", "WeaponUtility V2" },
+        { "ClothingUtility", "ClothingUtility V1" },
+        { "Accessory MechanicalValue", "Accessory mechanical policy" },
+        { "Clothing MechanicalValue", "Clothing mechanical policy" },
+        { "MedicalUtility", "MedicalUtility V1" },
+        { "FoodUtility", "FoodUtility V1" },
+        { "FishUtility", "FishUtility V1" },
+        { "ContainerUtility", "ContainerUtility V2" },
+        { "LiteratureUtility", "LiteratureUtility V1" },
+        { "RecipeLiterature", "RecipeLiterature V1" },
+        { "MapUtility", "MapUtility V1" },
+        { "LightFireUtility", "LightFireUtility V1" },
+        { "FirearmUtility", "FirearmUtility V1" },
+        { "MagazineUtility", "MagazineUtility V1" },
+        { "AmmoUtility", "AmmoUtility V1" },
+    }
+    for _, entry in ipairs(prefixes) do
+        if string.find(reason, entry[1], 1, true) then return entry[2] end
+    end
+    -- Melee and the already-safe Container V2 groups may finish with a generic
+    -- matrix/threshold reason.  Their calculated Utility is the authoritative
+    -- signal here; they are not fallback items merely because the final reason
+    -- does not repeat the utility's name.
+    if data.utilityKind == "MELEE_WEAPON" and data.utility ~= nil then return "WeaponUtility V2" end
+    if data.utilityKind == "CONTAINER" and data.utility ~= nil and not string.find(reason, "deferred", 1, true) then return "ContainerUtility V2" end
+    return nil
+end
+
+local function coverageStatus(data)
+    local mechanical = data.clothingMechanicalValueStatus or data.accessoryMechanicalValueStatus
+    if mechanical == "MECHANICALLY_TRIVIAL" then return "TRIVIAL" end
+    if mechanical and string.find(mechanical, "PARTIAL", 1, true) then return "PARTIAL" end
+    local explicit = data.medicalValueStatus or data.foodValueStatus or data.utilitySupport or ""
+    explicit = tostring(explicit)
+    if string.find(explicit, "TRIVIAL", 1, true) then return "TRIVIAL" end
+    if string.find(explicit, "PARTIAL", 1, true) or string.find(explicit, "UNSUPPORTED", 1, true) then return "PARTIAL" end
+    if data.utilityFunctionalGroup == "TRIVIAL_LITERATURE" then return "TRIVIAL" end
+    if not data.utilityEligible then return "PARTIAL" end
+    return "KNOWN"
+end
+
+local function coverageFamily(data)
+    local category = tostring(data.category or data.itemType or "UNCLASSIFIED")
+    local display = tostring(data.displayCategory or "")
+    local kind = tostring(data.utilityKind or "")
+    return category .. " | " .. (display ~= "" and display or "-") .. " | " .. (kind ~= "" and kind or "NO_KIND")
+end
+
+local function coverageReadiness(rows)
+    local partial, metrics, valid = 0, 0, 0
+    for _, data in ipairs(rows) do
+        if coverageStatus(data) == "PARTIAL" then partial = partial + 1 end
+        if type(data.utilityMetrics) == "table" then metrics = metrics + 1 end
+        if (tonumber(data.utilityValidAttributeCount) or 0) >= 3 then valid = valid + 1 end
+    end
+    if partial == #rows then return "PARTIAL / bridge or model evidence incomplete" end
+    if valid > 0 or metrics > 0 then return "structural attributes present; targeted audit possible" end
+    return "no reliable active structural metric exposed"
+end
+
+local function writeSystemCoverageReport(results)
+    if type(results) ~= "table" or not getFileWriter then return nil end
+    local categories, fallbackFamilies = {}, {}
+    local total = 0
+    for _, data in pairs(results) do
+        total = total + 1
+        local category = tostring(data.category or data.itemType or "UNCLASSIFIED")
+        local bucket = categories[category] or { total = 0, active = 0, fallback = 0, partial = 0, trivial = 0, owners = {} }
+        categories[category] = bucket
+        bucket.total = bucket.total + 1
+        local owner, status = coverageOwner(data), coverageStatus(data)
+        if owner then bucket.active = bucket.active + 1; bucket.owners[owner] = (bucket.owners[owner] or 0) + 1 else
+            bucket.fallback = bucket.fallback + 1
+            local family = coverageFamily(data)
+            fallbackFamilies[family] = fallbackFamilies[family] or {}
+            table.insert(fallbackFamilies[family], data)
+        end
+        if status == "PARTIAL" then bucket.partial = bucket.partial + 1 end
+        if status == "TRIVIAL" then bucket.trivial = bucket.trivial + 1 end
+    end
+    local writer = getFileWriter("ItemRarity_SystemCoverage.txt", true, false)
+    if not writer then return nil end
+    writer:write("Item Rarity system coverage audit (READ ONLY)\n")
+    writer:write("Published registry only. This report does not alter tiers, registry, scanner state or signature.\n")
+    writer:write(string.format("PUBLISHED_ITEMS=%d\n\n", total))
+    writer:write("CATEGORY COVERAGE\ncategory | total | active Utility | fallback/Scarcity | PARTIAL | TRIVIAL | Utility coverage | active owners\n")
+    local names = {}
+    for name in pairs(categories) do table.insert(names, name) end
+    table.sort(names)
+    for _, name in ipairs(names) do
+        local b, owners = categories[name], {}
+        for owner, count in pairs(b.owners) do table.insert(owners, owner .. "=" .. tostring(count)) end
+        table.sort(owners)
+        writer:write(string.format("%s | %d | %d | %d | %d | %d | %.1f%% | %s\n", name, b.total, b.active, b.fallback, b.partial, b.trivial, b.total > 0 and (100 * b.active / b.total) or 0, #owners > 0 and table.concat(owners, "; ") or "-"))
+    end
+    writer:write("\nLARGEST FALLBACK / SCARCITY FAMILIES\nfamily (category | displayCategory | utilityKind) | fullTypes | readiness | examples | reasons\n")
+    local families = {}
+    for family, rows in pairs(fallbackFamilies) do table.insert(families, { family = family, rows = rows }) end
+    table.sort(families, function(a, b) return #a.rows == #b.rows and a.family < b.family or #a.rows > #b.rows end)
+    for _, entry in ipairs(families) do
+        local examples, reasons = {}, {}
+        for index, data in ipairs(entry.rows) do
+            if index <= 8 then table.insert(examples, tostring(data.fullType)) end
+            local reason = tostring(data.utilityAdjustmentReason or "no eligible Utility data")
+            reasons[reason] = true
+        end
+        local reasonList = {}
+        for reason in pairs(reasons) do table.insert(reasonList, reason) end
+        table.sort(reasonList)
+        writer:write(string.format("%s | %d | %s | %s | %s\n", entry.family, #entry.rows, coverageReadiness(entry.rows), table.concat(examples, ";"), table.concat(reasonList, " || ")))
+    end
+    writer:close()
+    ItemRarityUtils.info(string.format("System coverage audit written: %d published items, %d fallback families.", total, #families))
+    return true
+end
+
+-- Tool is intentionally split into structural subfamilies instead of being
+-- treated as one mechanical population.  This audit does not score anything.
+local function toolSubfamily(data, script, runtime, tags, display, itemType)
+    if data.utilityKind == "MELEE_WEAPON" and data.utility ~= nil then return "MELEE_ALREADY_COVERED" end
+    local signal = lower(display .. " " .. itemType .. " " .. tags)
+    if string.find(signal, "seed", 1, true) then return "SEED_OR_AGRICULTURE_INPUT" end
+    if string.find(signal, "vehicle", 1, true) or string.find(signal, "mechanic", 1, true) then return "MECHANICS" end
+    if string.find(signal, "fishing", 1, true) or string.find(signal, "fish", 1, true) then return "FISHING" end
+    if string.find(signal, "camp", 1, true) then return "CAMPING" end
+    if string.find(signal, "garden", 1, true) or string.find(signal, "farm", 1, true) then return "GARDENING" end
+    if string.find(signal, "paint", 1, true) or string.find(signal, "clean", 1, true) then return "PAINT_OR_CLEANING" end
+    return "GENERAL_CRAFTING_OR_TOOL"
+end
+
+local function toolReadiness(group, rows)
+    if group == "MELEE_ALREADY_COVERED" then return "already covered by WeaponUtility V2" end
+    if group == "SEED_OR_AGRICULTURE_INPUT" then return "no: value depends on growth/planting context" end
+    if group == "FISHING" then return "no: bait, lure and fishing-state logic not exposed as stable simple stats" end
+    if group == "CAMPING" then return "no: use depends on survival actions/recipes or world state" end
+    if group == "GARDENING" then return "no: value depends on farming actions and growth state" end
+    if group == "PAINT_OR_CLEANING" then return "no: mostly cosmetic/maintenance actions, no common absolute value" end
+    if group == "MECHANICS" then return "audit candidate: condition/uses exposed, but repair value needs vehicle-action semantics" end
+    return "no: general tools require recipe/crafting semantics to compare safely"
+end
+
+local function writeToolAudit(results)
+    if type(results) ~= "table" or not getFileWriter then return nil end
+    local manager = getScriptManager and getScriptManager() or nil
+    local groups, total = {}, 0
+    for _, data in pairs(results) do
+        if data.category == "TOOL" then
+            local script = manager and manager:FindItem(data.fullType) or nil
+            if script then
+                local runtime = runtimeFor(script)
+                local tags = lower(text(script, runtime, { "getTags" }, { "tags" }))
+                local display = text(script, runtime, { "getDisplayCategory" }, { "displayCategory" })
+                local itemType = text(script, runtime, { "getType", "getItemType" }, { "type", "itemType" })
+                local group = toolSubfamily(data, script, runtime, tags, display, itemType)
+                local row = {
+                    data = data, fullType = data.fullType, module = moduleOf(data.fullType), group = group,
+                    display = display, itemType = itemType, tags = tags,
+                    weight = num(script, runtime, { "getActualWeight", "getWeight" }, { "actualWeight", "weight" }),
+                    conditionMax = num(script, runtime, { "getConditionMax" }, { "conditionMax" }),
+                    useDelta = num(script, runtime, { "getUseDelta" }, { "useDelta" }),
+                    capacity = num(script, runtime, { "getCapacity" }, { "capacity" }),
+                    maxItemWeight = num(script, runtime, { "getMaxItemSize", "getMaxItemWeight" }, { "maxItemSize", "maxItemWeight" }),
+                    utilityKind = data.utilityKind, utility = data.utility,
+                }
+                row.profile = table.concat({ group, tostring(row.display), tostring(row.itemType), tostring(row.tags), tostring(row.weight), tostring(row.conditionMax), tostring(row.useDelta), tostring(row.capacity), tostring(row.maxItemWeight) }, ":")
+                groups[group] = groups[group] or {}
+                table.insert(groups[group], row)
+                total = total + 1
+            end
+        end
+    end
+    local writer = getFileWriter("ItemRarity_ToolAudit.txt", true, false)
+    if not writer then return nil end
+    writer:write("Item Rarity TOOL structural audit (READ ONLY)\n")
+    writer:write("Subfamilies use category, script display/type and tags; never item names or fullType rules. No Utility or tier is changed.\n")
+    writer:write(string.format("TOOL_FULLTYPES=%d\n\n", total))
+    writer:write("SUBFAMILY SUMMARY\nsubfamily | fullTypes | unique profiles | active coverage | reliable runtime fields | measurable without recipes | conclusion\n")
+    local names = {}
+    for name in pairs(groups) do table.insert(names, name) end
+    table.sort(names)
+    for _, name in ipairs(names) do
+        local rows, profiles, active = groups[name], {}, 0
+        for _, row in ipairs(rows) do profiles[row.profile] = true; if row.utilityKind and row.utility ~= nil then active = active + 1 end end
+        local direct = name == "MELEE_ALREADY_COVERED"
+        writer:write(string.format("%s | %d | %d | %d | weight;conditionMax;useDelta;capacity/maxItemWeight when declared | %s | %s\n", name, #rows, (function() local n=0 for _ in pairs(profiles) do n=n+1 end return n end)(), active, direct and "yes (already WeaponUtility)" or "no", toolReadiness(name, rows)))
+    end
+    for _, name in ipairs(names) do
+        local rows = groups[name]
+        table.sort(rows, function(a, b) return a.fullType < b.fullType end)
+        writer:write("\n" .. name .. "\n")
+        writer:write("fullType | module | displayCategory | itemType | tags | weight | conditionMax | useDelta | capacity | maxItemWeight | activeUtilityKind | activeUtility\n")
+        for _, row in ipairs(rows) do
+            writer:write(table.concat({ safe(row.fullType), safe(row.module), safe(row.display), safe(row.itemType), safe(row.tags), safe(row.weight), safe(row.conditionMax), safe(row.useDelta), safe(row.capacity), safe(row.maxItemWeight), safe(row.utilityKind), safe(row.utility) }, " | ") .. "\n")
+        end
+    end
+    writer:close()
+    ItemRarityUtils.info(string.format("TOOL audit written: %d fullTypes across %d structural subfamilies.", total, #names))
+    return true
+end
+
+-- Capability probe for a future RecipeValue/CraftingValue infrastructure.
+-- It deliberately asks only the public runtime bridge.  Falling back to a
+-- filesystem parser would make mod coverage load-order dependent, so it is
+-- explicitly not attempted here.
+local function probe(object, method)
+    local ok, fn = pcall(function() return object and object[method] end)
+    if not ok or type(fn) ~= "function" then return false, nil end
+    local called, value = pcall(function() return fn(object) end)
+    return called, value
+end
+
+local function collectionSize(collection)
+    if not collection then return nil end
+    local value = call(collection, "size") or call(collection, "length")
+    return tonumber(value)
+end
+
+local function collectionGet(collection, index)
+    if not collection then return nil end
+    return indexed(collection, index)
+end
+
+local function writeRecipeInfrastructureAudit()
+    if not getFileWriter then return nil end
+    local writer = getFileWriter("ItemRarity_RecipeInfrastructureAudit.txt", true, false)
+    if not writer then return nil end
+    local manager = getScriptManager and getScriptManager() or (ScriptManager and ScriptManager.instance) or nil
+    writer:write("Item Rarity RecipeValue / CraftingValue infrastructure capability audit (READ ONLY)\n")
+    writer:write("Public runtime bridge only; no script parser, tier, Utility, registry or scanner mutation.\n\n")
+    writer:write("SCRIPT MANAGER\n")
+    writer:write("available=" .. tostring(manager ~= nil) .. "\n")
+    local list, listMethod = nil, nil
+    for _, method in ipairs({ "getAllCraftRecipes", "getCraftRecipes", "getAllRecipes", "getRecipes" }) do
+        local ok, value = probe(manager, method)
+        writer:write(method .. " | callable=" .. tostring(ok) .. " | collectionSize=" .. safe(collectionSize(value)) .. "\n")
+        if not list and ok and collectionSize(value) and collectionSize(value) > 0 then list, listMethod = value, method end
+    end
+    writer:write("\nDIRECT LOOKUP\n")
+    for _, method in ipairs({ "getCraftRecipe", "getRecipe" }) do
+        local ok = pcall(function() return manager and manager[method] end)
+        writer:write(method .. " | memberAccessible=" .. tostring(ok) .. " | requires caller-known recipe id\n")
+    end
+    if not list then
+        writer:write("\nRESULT: public bridge does not enumerate CraftRecipes on this runtime. Outputs, inputs, quantities, tools, skills, stations, duration, alternatives and dependency graph cannot be built generically. A script parser would be required and is intentionally out of scope.\n")
+        writer:close()
+        ItemRarityUtils.info("Recipe infrastructure audit written: CraftRecipe enumeration unavailable through public runtime bridge.")
+        return true
+    end
+
+    local count = collectionSize(list) or 0
+    writer:write(string.format("\nENUMERATION\nmethod=%s | recipes=%d\n", listMethod, count))
+    local methodNames = { "getName", "getId", "getInputs", "getOutputs", "getRequiredSkills", "getRequiredTools", "getRequiredStations", "getCraftBench", "getTime", "getOnCreate", "getOnTest", "getCanBeDoneFromFloor" }
+    local availability, samples = {}, math.min(count, 10)
+    for index = 0, samples - 1 do
+        local recipe = collectionGet(list, index)
+        writer:write("\nRECIPE_SAMPLE_" .. tostring(index + 1) .. "\n")
+        for _, method in ipairs(methodNames) do
+            local ok, value = probe(recipe, method)
+            availability[method] = availability[method] or ok
+            local rendered = collectionSize(value) or value
+            writer:write(method .. " | callable=" .. tostring(ok) .. " | value=" .. safe(rendered) .. "\n")
+        end
+    end
+    writer:write("\nNESTED INPUT / OUTPUT / SKILL OBJECT PROBE\n")
+    local firstRecipe = collectionGet(list, 0)
+    local nested = {
+        { "INPUT", call(firstRecipe, "getInputs"), { "getItem", "getItems", "getItemType", "getCount", "getAmount", "getUse", "getUses", "isTool", "isKeep", "isDestroy", "getFlags" } },
+        { "OUTPUT", call(firstRecipe, "getOutputs"), { "getItem", "getItems", "getItemType", "getCount", "getAmount", "getQuantity", "getUses", "getFlags" } },
+        { "SKILL", call(firstRecipe, "getRequiredSkills"), { "getPerk", "getPerkType", "getLevel", "getSkill", "getRequiredLevel" } },
+    }
+    for _, probeData in ipairs(nested) do
+        local label, collection, methods = probeData[1], probeData[2], probeData[3]
+        local size = collectionSize(collection)
+        local object = size and size > 0 and collectionGet(collection, 0) or nil
+        writer:write(label .. " | collectionSize=" .. safe(size) .. " | firstObject=" .. safe(object) .. "\n")
+        for _, method in ipairs(methods) do
+            -- Some Java getters require an index/argument and Kahlua logs an
+            -- error even when pcall catches it.  Probe member visibility only
+            -- until signatures are known; never call an unknown overload.
+            local ok, member = pcall(function() return object and object[method] end)
+            writer:write("  " .. method .. " | memberAccessible=" .. tostring(ok and type(member) == "function") .. " | signature not invoked\n")
+        end
+    end
+    writer:write("\nCAPABILITY SUMMARY\nfield | public bridge seen\n")
+    for _, method in ipairs(methodNames) do writer:write(method .. " | " .. tostring(availability[method] == true) .. "\n") end
+    writer:write("\nINTERPRETATION\n")
+    writer:write("If outputs and inputs are enumerable, quantities still require inspecting every Input/Output object and alternatives/dependency graphs need a second pass. Skill/tools/stations/time are only safe when their respective getters are exposed. Runtime enumeration is mod-generic; a parser is not needed only if this bridge remains complete.\n")
+    writer:close()
+    ItemRarityUtils.info(string.format("Recipe infrastructure audit written: %d CraftRecipes enumerated via %s.", count, listMethod))
+    return true
+end
+
+-- Explosive and trap effects are often applied by callbacks/world objects.
+-- This audit reports only values directly exposed on the ScriptItem/runtime
+-- item, never guesses an effect from a display name or fullType.
+local function writeExplosiveTrapAudit(results)
+    if type(results) ~= "table" or not getFileWriter then return nil end
+    local manager = getScriptManager and getScriptManager() or nil
+    local groups = { THROWABLE_EXPLOSIVE = {}, PLACED_OR_TRIGGER_DEVICE = {}, INCENDIARY = {}, NOISE_MAKER = {}, TRAP = {}, SPECIAL_PARTIAL = {} }
+    local effectFields = {
+        explosionPower = { "getExplosionPower", "explosionPower" }, explosionRange = { "getExplosionRange", "explosionRange" },
+        firePower = { "getFirePower", "firePower" }, fireRange = { "getFireRange", "fireRange" },
+        smokeRange = { "getSmokeRange", "smokeRange" }, noiseRange = { "getNoiseRange", "noiseRange" },
+        timer = { "getTriggerExplosionTimer", "getTimer", "triggerExplosionTimer", "timer" },
+        sensorRange = { "getSensorRange", "sensorRange" }, remoteRange = { "getRemoteRange", "remoteRange" },
+    }
+    local total = 0
+    for _, data in pairs(results) do
+        local script = manager and manager:FindItem(data.fullType) or nil
+        if script then
+            local runtime = runtimeFor(script)
+            local display = text(script, runtime, { "getDisplayCategory" }, { "displayCategory" })
+            local tags = lower(text(script, runtime, { "getTags" }, { "tags" }))
+            local candidate = (data.category == "AMMO" and lower(display) == "explosives") or (data.category == "TOOL" and lower(display) == "trapping")
+            if candidate then
+                local metrics = {}
+                for key, names in pairs(effectFields) do
+                    metrics[key] = num(script, runtime, { names[1], names[2] }, { names[2] })
+                end
+                local remote = bool(script, runtime, { "isCanBeRemote", "getCanBeRemote" }, { "canBeRemote" })
+                local ranged = bool(script, runtime, { "isRanged" }, { "ranged" })
+                local group = "SPECIAL_PARTIAL"
+                if lower(display) == "trapping" or has(tags, "trap") then group = "TRAP"
+                elseif (metrics.noiseRange or 0) > 0 and (metrics.explosionPower or 0) <= 0 and (metrics.firePower or 0) <= 0 then group = "NOISE_MAKER"
+                elseif (metrics.firePower or 0) > 0 or (metrics.fireRange or 0) > 0 then group = "INCENDIARY"
+                elseif remote or (metrics.timer or 0) > 0 or (metrics.sensorRange or 0) > 0 then group = "PLACED_OR_TRIGGER_DEVICE"
+                elseif (metrics.explosionPower or 0) > 0 or (metrics.explosionRange or 0) > 0 then group = ranged and "THROWABLE_EXPLOSIVE" or "PLACED_OR_TRIGGER_DEVICE" end
+                local row = {
+                    fullType = data.fullType, module = moduleOf(data.fullType), group = group, display = display, tags = tags,
+                    weight = num(script, runtime, { "getActualWeight", "getWeight" }, { "actualWeight", "weight" }),
+                    conditionMax = num(script, runtime, { "getConditionMax" }, { "conditionMax" }),
+                    useDelta = num(script, runtime, { "getUseDelta" }, { "useDelta" }),
+                    ranged = ranged, remote = remote, metrics = metrics, finalTier = data.finalRarityTier,
+                    scarcityTier = data.baseScarcityTier or data.rarityTier,
+                    activeKind = data.utilityKind, activeNoiseTier = data.noiseMakerFinalTier,
+                    reason = data.utilityAdjustmentReason,
+                }
+                row.profile = table.concat({ group, tostring(row.ranged), tostring(row.remote), tostring(row.weight), tostring(row.conditionMax), tostring(row.useDelta), tostring(metrics.explosionPower), tostring(metrics.explosionRange), tostring(metrics.firePower), tostring(metrics.fireRange), tostring(metrics.noiseRange), tostring(metrics.timer), tostring(metrics.sensorRange), tostring(metrics.remoteRange) }, ":")
+                table.insert(groups[group], row)
+                total = total + 1
+            end
+        end
+    end
+    local writer = getFileWriter("ItemRarity_ExplosiveTrapAudit.txt", true, false)
+    if not writer then return nil end
+    writer:write("Item Rarity explosive / trap structural audit (READ ONLY)\n")
+    writer:write("Only directly exposed item/runtime attributes are reported. Missing effect values mean callback/world-object dependence and remain PARTIAL.\n")
+    writer:write(string.format("CANDIDATES=%d\n\n", total))
+    writer:write("GROUP SUMMARY\ngroup | fullTypes | unique profiles | directly measurable effect evidence | status\n")
+    for _, group in ipairs({ "THROWABLE_EXPLOSIVE", "PLACED_OR_TRIGGER_DEVICE", "INCENDIARY", "NOISE_MAKER", "TRAP", "SPECIAL_PARTIAL" }) do
+        local profiles, measurable = {}, 0
+        for _, row in ipairs(groups[group]) do
+            profiles[row.profile] = true
+            local m = row.metrics
+            if (m.explosionPower or 0) > 0 or (m.explosionRange or 0) > 0 or (m.firePower or 0) > 0 or (m.fireRange or 0) > 0 or (m.noiseRange or 0) > 0 then measurable = measurable + 1 end
+        end
+        local profileCount = 0; for _ in pairs(profiles) do profileCount = profileCount + 1 end
+        writer:write(string.format("%s | %d | %d | %d | %s\n", group, #groups[group], profileCount, measurable, measurable == #groups[group] and "potentially measurable; compare only within group" or "PARTIAL: essential effects absent or incomplete"))
+    end
+    for _, group in ipairs({ "THROWABLE_EXPLOSIVE", "PLACED_OR_TRIGGER_DEVICE", "INCENDIARY", "NOISE_MAKER", "TRAP", "SPECIAL_PARTIAL" }) do
+        table.sort(groups[group], function(a, b) return a.fullType < b.fullType end)
+        writer:write("\n" .. group .. "\n")
+        writer:write("fullType | module | displayCategory | ranged | remote | explosionPower | explosionRange | firePower | fireRange | smokeRange | noiseRange | timer | sensorRange | remoteRange | weight | conditionMax | useDelta | active tier | current reason | tags\n")
+        for _, row in ipairs(groups[group]) do
+            local m = row.metrics
+            writer:write(table.concat({ safe(row.fullType), safe(row.module), safe(row.display), safe(row.ranged), safe(row.remote), safe(m.explosionPower), safe(m.explosionRange), safe(m.firePower), safe(m.fireRange), safe(m.smokeRange), safe(m.noiseRange), safe(m.timer), safe(m.sensorRange), safe(m.remoteRange), safe(row.weight), safe(row.conditionMax), safe(row.useDelta), safe(row.finalTier), safe(row.reason), safe(row.tags) }, " | ") .. "\n")
+        end
+    end
+    local function tierForScore(score)
+        if score < 20 then return "COMMON" end
+        if score < 40 then return "UNCOMMON" end
+        if score < 60 then return "RARE" end
+        if score < 80 then return "EPIC" end
+        return "EXOTIC"
+    end
+    local function anchored(value, anchors)
+        value = tonumber(value) or 0
+        if value <= anchors[1][1] then return anchors[1][2] end
+        for index = 2, #anchors do
+            local left, right = anchors[index - 1], anchors[index]
+            if value <= right[1] then
+                return left[2] + (right[2] - left[2]) * (value - left[1]) / (right[1] - left[1])
+            end
+        end
+        return anchors[#anchors][2]
+    end
+    local powerAnchors = { { 0, 0 }, { 50, 40 }, { 70, 60 }, { 90, 80 }, { 110, 100 } }
+    local rangeAnchors = { { 0, 0 }, { 3, 40 }, { 5, 60 }, { 7, 80 }, { 9, 100 } }
+    local function fireTier(range)
+        range = tonumber(range) or 0
+        if range < 3 then return "COMMON" end
+        if range < 4 then return "UNCOMMON" end
+        if range < 5 then return "RARE" end
+        if range < 7 then return "EPIC" end
+        return "EXOTIC"
+    end
+    local function noiseTier(range)
+        range = tonumber(range) or 0
+        if range < 15 then return "COMMON" end
+        if range < 30 then return "UNCOMMON" end
+        if range < 50 then return "RARE" end
+        return "EPIC"
+    end
+    writer:write("\nV1 SIMULATION (READ ONLY)\n")
+    writer:write("Absolute-scale calibration only. Trigger/timer/sensor and smoke radius are recorded but excluded; no population percentile is used.\n")
+    writer:write("\nEXPLOSIVE\nfullType | ExplosionPower/PowerValue | ExplosionRange/RangeValue | 70/30 score | simulated tier | active tier | ScarcityTier | trigger/timer/sensor diagnostics\n")
+    for _, row in ipairs(groups.PLACED_OR_TRIGGER_DEVICE) do
+        local m, power = row.metrics, anchored(row.metrics.explosionPower, powerAnchors)
+        local range = anchored(row.metrics.explosionRange, rangeAnchors)
+        local score = .70 * power + .30 * range
+        writer:write(table.concat({ safe(row.fullType), safe(m.explosionPower) .. "/" .. safe(power), safe(m.explosionRange) .. "/" .. safe(range), safe(score), tierForScore(score), safe(row.finalTier), safe(row.scarcityTier), "timer=" .. safe(m.timer) .. ";sensor=" .. safe(m.sensorRange) .. ";remote=" .. safe(m.remoteRange) }, " | ") .. "\n")
+    end
+    writer:write("\nINCENDIARY\nfullType | FireRange | simulated tier | active tier | ScarcityTier | trigger/timer/sensor diagnostics\n")
+    for _, row in ipairs(groups.INCENDIARY) do
+        local m = row.metrics
+        writer:write(table.concat({ safe(row.fullType), safe(m.fireRange), fireTier(m.fireRange), safe(row.finalTier), safe(row.scarcityTier), "timer=" .. safe(m.timer) .. ";sensor=" .. safe(m.sensorRange) .. ";remote=" .. safe(m.remoteRange) }, " | ") .. "\n")
+    end
+    writer:write("\nNOISE_MAKER\nNoiseMakerUtility V1: <15 COMMON; 15-29 UNCOMMON; 30-49 RARE; >=50 EPIC (EPIC ceiling). Scarcity, timer, sensor, remote and SmokeRange are excluded.\n")
+    writer:write("fullType | NoiseRange | SmokeRange diagnostic | active kind | active tier | active NoiseMaker tier | proposed Utility tier | ScarcityTier | trigger/timer/sensor diagnostics\n")
+    for _, row in ipairs(groups.NOISE_MAKER) do
+        local m = row.metrics
+        writer:write(table.concat({ safe(row.fullType), safe(m.noiseRange), safe(m.smokeRange), safe(row.activeKind), safe(row.finalTier), safe(row.activeNoiseTier), noiseTier(m.noiseRange), safe(row.scarcityTier), "timer=" .. safe(m.timer) .. ";sensor=" .. safe(m.sensorRange) .. ";remote=" .. safe(m.remoteRange) }, " | ") .. "\n")
+    end
+    writer:close()
+    ItemRarityUtils.info(string.format("Explosive/trap audit written: %d candidates.", total))
+    return true
+end
+
+-- Focused Clothing diagnostic. It reads only fields already published by the
+-- active calculator, then selects comparable lower-body records from their
+-- structural subgroup/body slot. It never creates Clothing instances, edits
+-- results, or invokes the historical all-clothing MechanicalValue report.
+local function writeClothingTargetedAudit(results)
+    if type(results) ~= "table" or not getFileWriter then return end
+    local manager = getScriptManager and getScriptManager() or nil
+    local rows = {}
+    for _, data in pairs(results) do
+        if data.category == "CLOTHING" and data.utilityKind == "CLOTHING" then
+            local discovery = data.clothingDiscovery or {}
+            local body = lower(discovery.bodyLocation)
+            local subgroup = tostring(data.utilitySubgroup or "")
+            -- `LEGS` is calculator-derived from BodyLocation/coverage; the
+            -- underwear exception is also its declared BodyLocation, never a
+            -- display name or fullType rule.
+            if subgroup == "LEGS" or has(body, "underwear") then
+                local script = findScriptItem(manager, data.fullType)
+                local display = text(script, nil, { "getDisplayName" }, { "displayName" })
+                local metrics, components = data.utilityMetrics or {}, data.utilityComponents or {}
+                local direct = components.directSlot or {}
+                table.insert(rows, {
+                    data = data, display = display, body = discovery.bodyLocation or "", covered = discovery.coveredParts or "",
+                    slot = data.clothingEquipmentGraph and data.clothingEquipmentGraph.slotId or "",
+                    metrics = metrics, direct = direct,
+                })
+            end
+        end
+    end
+    table.sort(rows, function(a, b)
+        if a.slot == b.slot then return a.data.fullType < b.data.fullType end
+        return tostring(a.slot) < tostring(b.slot)
+    end)
+    local writer = getFileWriter("ItemRarity_ClothingTargetedAudit.txt", true, false)
+    if not writer then return end
+    writer:write("Item Rarity targeted lower-body Clothing audit (READ ONLY)\n")
+    writer:write("Selection uses active structural LEG subgroup or declared underwear BodyLocation. No clothing instance is created; FinalRarityTier, UI, registry and signature are unchanged. Dirty is an instance state, so the report identifies the stable fullType rather than guessing it from a localized item label.\n\n")
+    writer:write("fullType | displayName | BodyLocation | coveredParts | comparable slot | Scarcity | FinalTier | tier origin | MechanicalValue/Status | Bite/Scratch/Bullet | insulation/wind/water | weight | run/combat/discomfort/vision/hearing | conditionMax | ClothingScore | slot pct/rank/confidence/profiles | normalized direct components P/Cov/Dur/Mob/Wt/Disc/Sense/Weather | relative/absolute protection\n")
+    for _, row in ipairs(rows) do
+        local d, m, c = row.data, row.metrics, row.direct
+        writer:write(table.concat({
+            safe(d.fullType), safe(row.display), safe(row.body), safe(row.covered), safe(row.slot),
+            safe(d.baseScarcityTier), safe(d.finalRarityTier), safe(d.utilityAdjustmentReason),
+            safe(slash(d.clothingMechanicalValue, d.clothingMechanicalValueStatus)),
+            safe(slash(m.biteDefense, m.scratchDefense, m.bulletDefense)),
+            safe(slash(m.insulation, m.windResistance, m.waterResistance)), safe(m.weight),
+            safe(slash(m.runSpeedModifier, m.combatSpeedModifier, m.discomfortModifier, m.visionModifier, m.hearingModifier)),
+            safe(m.conditionMax), safe(d.utility),
+            safe(slash(d.slotQualityPercentile, d.slotQualityRank, d.slotRankingConfidence, d.utilityProfileCount)),
+            safe(slash(c.protection, c.coverage, c.durability, c.mobility, c.weight, c.discomfort, c.senses, c.weather)),
+            safe(slash(c.relativeProtection, c.absoluteProtection)),
+        }, " | ") .. "\n")
+    end
+    writer:close()
+    ItemRarityUtils.info(string.format("Targeted Clothing audit written: %d lower-body/underwear records.", #rows))
+end
+
+-- Outerwear comparison is selected solely from the declared BodyLocation.
+-- The report exposes the already-published DIRECT_SLOT components so a
+-- diagnostic can distinguish a Scarcity result from a score-driven result.
+local function writeOuterwearAudit(results)
+    if type(results) ~= "table" or not getFileWriter then return end
+    local manager = getScriptManager and getScriptManager() or nil
+    local rows = {}
+    for _, data in pairs(results) do
+        if data.category == "CLOTHING" and data.utilityKind == "CLOTHING" then
+            local discovery = data.clothingDiscovery or {}
+            local body = lower(discovery.bodyLocation)
+            if has(body, "jacket") then
+                local script = findScriptItem(manager, data.fullType)
+                table.insert(rows, {
+                    data = data, display = text(script, nil, { "getDisplayName" }, { "displayName" }),
+                    body = discovery.bodyLocation or "", covered = discovery.coveredParts or "",
+                })
+            end
+        end
+    end
+    table.sort(rows, function(a, b) return a.data.fullType < b.data.fullType end)
+    local writer = getFileWriter("ItemRarity_ClothingOuterwearAudit.txt", true, false)
+    if not writer then return end
+    writer:write("Item Rarity structural outerwear comparison (READ ONLY)\n")
+    writer:write("Selection: declared BodyLocation containing 'jacket'; no item name/fullType is used as a classification rule. Scores and components are those published by the active ClothingUtility V1 pipeline.\n\n")
+    writer:write("fullType | displayName | BodyLocation | coveredParts | Scarcity | FinalTier | tier origin | MechanicalValue/Status | Bite/Scratch/Bullet | insulation/wind/water | weight | run/combat/discomfort/vision/hearing | conditionMax | ClothingScore | slot pct/rank/confidence/profiles | normalized P/Cov/Dur/Mob/Wt/Disc/Sense/Weather | relative/absolute protection\n")
+    for _, row in ipairs(rows) do
+        local d, m, c = row.data, row.data.utilityMetrics or {}, (row.data.utilityComponents or {}).directSlot or {}
+        writer:write(table.concat({ safe(d.fullType), safe(row.display), safe(row.body), safe(row.covered), safe(d.baseScarcityTier), safe(d.finalRarityTier), safe(d.utilityAdjustmentReason), safe(slash(d.clothingMechanicalValue, d.clothingMechanicalValueStatus)), safe(slash(m.biteDefense, m.scratchDefense, m.bulletDefense)), safe(slash(m.insulation, m.windResistance, m.waterResistance)), safe(m.weight), safe(slash(m.runSpeedModifier, m.combatSpeedModifier, m.discomfortModifier, m.visionModifier, m.hearingModifier)), safe(m.conditionMax), safe(d.utility), safe(slash(d.slotQualityPercentile, d.slotQualityRank, d.slotRankingConfidence, d.utilityProfileCount)), safe(slash(c.protection, c.coverage, c.durability, c.mobility, c.weight, c.discomfort, c.senses, c.weather)), safe(slash(c.relativeProtection, c.absoluteProtection)) }, " | ") .. "\n")
+    end
+    writer:close()
+    ItemRarityUtils.info(string.format("Outerwear Clothing audit written: %d jacket-slot records.", #rows))
+end
+
+-- Container V2 deliberately defers non-wearable/special cases. This report
+-- surfaces only structurally small personal containers and their profiles so
+-- a future trivial policy can be evidenced before it is proposed. It does
+-- not manufacture a KNOWN/TRIVIAL state for a deferred group.
+local function writeSmallContainerAudit(results)
+    if type(results) ~= "table" or not getFileWriter then return end
+    local manager = getScriptManager and getScriptManager() or nil
+    local rows = {}
+    for _, data in pairs(results) do
+        if data.category == "CONTAINER" and data.utilityKind == "CONTAINER" then
+            local m = data.utilityMetrics or {}
+            local group, capacity = tostring(data.containerV2Group or data.utilitySubgroup or ""), tonumber(m.capacity)
+            if group == "KEY_CONTAINER" or ((group == "NON_WEARABLE_CONTAINER" or group == "CASE") and capacity ~= nil and capacity <= 5) then
+                local script = findScriptItem(manager, data.fullType)
+                local runtime = nil
+                if script then local ok, item = pcall(function() return script:InstanceItem(nil, false) end); runtime = ok and item or nil end
+                local body = text(script, runtime, { "getBodyLocation", "canBeEquipped" }, { "bodyLocation" })
+                local restrictions = text(script, runtime, { "getAcceptItemFunction" }, { "acceptItemFunction" })
+                local maxItemSize = num(script, runtime, { "getMaxItemSize" }, { "maxItemSize" })
+                local status = group == "KEY_CONTAINER" and "MECHANICALLY_TRIVIAL_POLICY" or "DEFERRED_UNASSESSED"
+                table.insert(rows, { data=data, display=text(script, nil, { "getDisplayName" }, { "displayName" }), group=group, body=body, restrictions=restrictions, maxItemSize=maxItemSize, status=status })
+            end
+        end
+    end
+    table.sort(rows, function(a, b) return a.data.fullType < b.data.fullType end)
+    local writer = getFileWriter("ItemRarity_SmallContainerAudit.txt", true, false)
+    if not writer then return end
+    writer:write("Item Rarity small personal container audit (READ ONLY)\n")
+    writer:write("Selection: KEY_CONTAINER or deferred CASE/NON_WEARABLE_CONTAINER with declared capacity <= 5. No display-name/fullType classifier exists here; all fields are structural/runtime. Deferred does not mean trivial.\n\n")
+    writer:write("fullType | displayName | Container subgroup | capacity | weightReduction | emptyWeight | RunSpeedModifier | attachments | equip/body slot | accept/restrictions | maxItemSize | mechanical status | Scarcity | FinalTier | rule/origin | profile | utility/confidence\n")
+    for _, row in ipairs(rows) do
+        local d, m = row.data, row.data.utilityMetrics or {}
+        writer:write(table.concat({ safe(d.fullType), safe(row.display), safe(row.group), safe(m.capacity), safe(m.weightReduction), safe(m.emptyWeight), safe(m.runSpeedModifier), safe(m.attachments), safe(row.body), safe(row.restrictions), safe(row.maxItemSize), safe(row.status), safe(d.baseScarcityTier), safe(d.finalRarityTier), safe(d.utilityAdjustmentReason), safe(d.utilityProfile), safe(slash(d.utility, d.utilityConfidence)) }, " | ") .. "\n")
+    end
+    writer:close()
+    ItemRarityUtils.info(string.format("Small-container audit written: %d structurally small records.", #rows))
+end
+
+local COMBINER_TIERS = { "COMMON", "UNCOMMON", "RARE", "EPIC", "EXOTIC" }
+local COMBINER_INDEX = { COMMON=1, UNCOMMON=2, RARE=3, EPIC=4, EXOTIC=5 }
+local function combinerTierAt(index)
+    return COMBINER_TIERS[math.max(1, math.min(#COMBINER_TIERS, index or 1))]
+end
+
+-- These candidate Utility bands preserve the active P2 good/excellent cuts
+-- and add only the outer C/U and E/X bounds needed to turn a continuous
+-- DIRECT_SLOT score into an anchor tier for this report. They are simulation
+-- inputs, not a modification of ClothingUtility's internal score.
+local function directSlotUtilityTier(score)
+    score = tonumber(score) or 0
+    if score < 40 then return "COMMON" end
+    if score < 53.64 then return "UNCOMMON" end
+    if score < 61.28 then return "RARE" end
+    if score < 70 then return "EPIC" end
+    return "EXOTIC"
+end
+
+local function bumpDistribution(distribution, tier)
+    distribution[tier] = (distribution[tier] or 0) + 1
+end
+
+local function formatDistribution(distribution)
+    local parts = {}
+    for _, tier in ipairs(COMBINER_TIERS) do table.insert(parts, tier .. "=" .. tostring(distribution[tier] or 0)) end
+    return table.concat(parts, " ")
+end
+
+-- A deliberately small, review-oriented sample for the continuous-score C1
+-- candidate. It consumes the already calculated score/components and never
+-- participates in the published tier pipeline.
+local function writeClothingC1SampleAudit(rows)
+    if type(rows) ~= "table" or not getFileWriter then return end
+    local candidates = {}
+    for _, row in ipairs(rows) do
+        local activeIndex = COMBINER_INDEX[row.data.finalRarityTier] or 1
+        local c1Index = COMBINER_INDEX[row.modelC1] or 1
+        local flags = {}
+        if activeIndex == 1 and c1Index >= 3 then table.insert(flags, "COMMON_TO_RARE_PLUS") end
+        if activeIndex == 2 and c1Index >= 3 then table.insert(flags, "UNCOMMON_TO_RARE_PLUS") end
+        if activeIndex >= 3 and c1Index == 1 then table.insert(flags, "RARE_EPIC_TO_COMMON") end
+        if activeIndex - c1Index >= 2 then table.insert(flags, "DROP_2PLUS") end
+        if c1Index - activeIndex >= 2 then table.insert(flags, "RISE_2PLUS") end
+        if #flags > 0 then
+            row.c1SampleFlags = table.concat(flags, ",")
+            table.insert(candidates, row)
+        end
+    end
+    table.sort(candidates, function(a, b)
+        local ad = math.abs((COMBINER_INDEX[a.modelC1] or 1) - (COMBINER_INDEX[a.data.finalRarityTier] or 1))
+        local bd = math.abs((COMBINER_INDEX[b.modelC1] or 1) - (COMBINER_INDEX[b.data.finalRarityTier] or 1))
+        if ad == bd then
+            -- Within an equal-size movement, review the most extreme adjusted
+            -- score first, because it is closest to a meaningful tier claim.
+            if a.adjustedC1 == b.adjustedC1 then return a.data.fullType < b.data.fullType end
+            return a.adjustedC1 > b.adjustedC1
+        end
+        return ad > bd
+    end)
+    local writer = getFileWriter("ItemRarity_ClothingC1SampleAudit.txt", true, false)
+    if not writer then return end
+    writer:write("Clothing DIRECT_SLOT C1 review sample (READ ONLY; MECHANICALLY_TRIVIAL excluded)\n")
+    writer:write("C1: ScarcityAdjustment=(ScarcityStrength-50)/10; AdjustedScore=clamp(ClothingScore+adjustment,0,100); FinalTier=tier(AdjustedScore).\n")
+    writer:write("Only the requested high-impact transitions are selected, maximum 30. Protection/weather/mobility are the existing normalized ClothingUtility components, not recomputed values.\n\n")
+    writer:write("category | fullType | displayName | bodyLocation/group | ClothingScore | ScarcityStrength | adjustment | AdjustedScore | active | C1 | protection | weather | mobility | probable reason\n")
+    local manager = getScriptManager and getScriptManager() or nil
+    for index, row in ipairs(candidates) do
+        if index > 30 then break end
+        local d, c = row.data, row.direct
+        local script = findScriptItem(manager, d.fullType)
+        local display = text(script, nil, { "getDisplayName" }, { "displayName" })
+        local slot = d.clothingEquipmentGraph and d.clothingEquipmentGraph.slotId or "-"
+        local direction = row.adjustmentC1 >= 0 and "positive" or "negative"
+        local reason = string.format("%s Scarcity adjustment %.3f shifts continuous score %.3f to %.3f across the C1 tier boundary", direction, row.adjustmentC1, d.utility or 0, row.adjustedC1)
+        writer:write(table.concat({ safe(row.c1SampleFlags), safe(d.fullType), safe(display), safe(slot), safe(d.utility), safe(row.scarcityStrength), safe(row.adjustmentC1), safe(row.adjustedC1), safe(d.finalRarityTier), safe(row.modelC1), safe(c.protection), safe(c.weather), safe(c.mobility), safe(reason) }, " | ") .. "\n")
+    end
+    writer:write("\nWORK BOOTS SANITY CHECK\n")
+    for _, row in ipairs(rows) do
+        if row.data.fullType == "Base.Shoes_WorkBoots" then
+            local d, c = row.data, row.direct
+            writer:write("fullType=" .. safe(d.fullType) .. "\n")
+            writer:write("score=" .. safe(d.utility) .. " scarcityStrength=" .. safe(row.scarcityStrength) .. " adjustment=" .. safe(row.adjustmentC1) .. " adjustedScore=" .. safe(row.adjustedC1) .. " active=" .. safe(d.finalRarityTier) .. " C1=" .. safe(row.modelC1) .. "\n")
+            writer:write("components protection=" .. safe(c.protection) .. " coverage=" .. safe(c.coverage) .. " durability=" .. safe(c.durability) .. " mobility=" .. safe(c.mobility) .. " weight=" .. safe(c.weight) .. " discomfort=" .. safe(c.discomfort) .. " senses=" .. safe(c.senses) .. " weather=" .. safe(c.weather) .. "\n")
+            writer:write("interpretation=the 60.090 score comes principally from protection 68.837, durability 95, weather 100, with neutral 50 handling costs; C1 does not make it RARE by scarcity, it remains RARE after its small negative scarcity adjustment.\n")
+            break
+        end
+    end
+    writer:close()
+    ItemRarityUtils.info(string.format("Clothing C1 review sample written: %d qualifying changes, capped at 30 rows.", #candidates))
+end
+
+-- Candidate successor to Clothing Policy 3: an item whose known mechanics
+-- are structurally trivial is always COMMON. This is report-only and does
+-- not touch the active C1 combiner or published tier.
+local function writeClothingTrivialPolicySimulation(results)
+    if type(results) ~= "table" or not getFileWriter then return end
+    local manager = getScriptManager and getScriptManager() or nil
+    local rows, uncommonToCommon = {}, 0
+    for _, data in pairs(results) do
+        if data.category == "CLOTHING" and data.clothingMechanicalValueStatus == "MECHANICALLY_TRIVIAL" then
+            if data.finalRarityTier == "UNCOMMON" then uncommonToCommon = uncommonToCommon + 1 end
+            table.insert(rows, data)
+        end
+    end
+    table.sort(rows, function(a, b) return a.fullType < b.fullType end)
+    local writer = getFileWriter("ItemRarity_ClothingTrivialPolicySimulation.txt", true, false)
+    if not writer then return end
+    writer:write("Clothing trivial-policy simulation (READ ONLY)\n")
+    writer:write("Predicate: clothingMechanicalValueStatus=MECHANICALLY_TRIVIAL. Proposed FinalTier=COMMON, with no Scarcity influence. Clothing DIRECT_SLOT C1 is not recomputed or changed.\n")
+    writer:write(string.format("TRIVIAL=%d | UNCOMMON_TO_COMMON=%d | PROPOSED_COMMON=%d\n\n", #rows, uncommonToCommon, #rows))
+    writer:write("fullType | displayName | ScarcityTier | current FinalTier | proposed FinalTier\n")
+    for _, data in ipairs(rows) do
+        local script = findScriptItem(manager, data.fullType)
+        local display = text(script, nil, { "getDisplayName" }, { "displayName" })
+        writer:write(table.concat({ safe(data.fullType), safe(display), safe(data.baseScarcityTier), safe(data.finalRarityTier), "COMMON" }, " | ") .. "\n")
+    end
+    writer:close()
+    ItemRarityUtils.info(string.format("Clothing trivial-policy simulation written: %d trivial items; %d UNCOMMON -> COMMON.", #rows, uncommonToCommon))
+end
+
+-- Simulates only the final Clothing DIRECT_SLOT combiner. Internal score,
+-- component weights, MechanicalValue, structural grouping and trivial policy
+-- are untouched. Trivial records are intentionally omitted so this report
+-- cannot confuse the separate Policy 3 question with scarcity anchoring.
+local function writeClothingCombinerSimulation(results)
+    if type(results) ~= "table" or not getFileWriter then return end
+    local rows, distributions = {}, { active={}, a={}, b={}, c1={}, c2={} }
+    for _, data in pairs(results) do
+        local direct = (data.utilityComponents or {}).directSlot
+        if data.category == "CLOTHING" and data.utilityKind == "CLOTHING" and direct and data.utility ~= nil
+            and data.clothingMechanicalValueStatus ~= "MECHANICALLY_TRIVIAL" then
+            local utilityTier = directSlotUtilityTier(data.utility)
+            local utilityIndex = COMBINER_INDEX[utilityTier]
+            local scarcityIndex = COMBINER_INDEX[data.baseScarcityTier] or 1
+            local activeIndex = COMBINER_INDEX[data.finalRarityTier] or 1
+            -- A: Utility anchor; Scarcity itself is clamped to one step around
+            -- the anchor. This is the literal ±1 interpretation.
+            local modelA = combinerTierAt(math.max(utilityIndex - 1, math.min(utilityIndex + 1, scarcityIndex)))
+            -- B: preserve the current V1 output only where it is inside the
+            -- same Utility floor/ceiling; otherwise snap it to that boundary.
+            local modelB = combinerTierAt(math.max(utilityIndex - 1, math.min(utilityIndex + 1, activeIndex)))
+            -- C uses the continuous ClothingScore as the anchor. Scarcity is
+            -- only a bounded numeric adjustment, never a tier movement.
+            local scarcityPercentile = tonumber(data.scarcityPercentile)
+                or tonumber(((data.tableAvailability or {}).routeWeightedPercentile)) or 50
+            local scarcityStrength = clamp(100 - scarcityPercentile, 0, 100)
+            local adjustmentC1 = (scarcityStrength - 50) / 10
+            local adjustmentC2 = .15 * (scarcityStrength - 50)
+            local adjustedC1 = clamp((tonumber(data.utility) or 0) + adjustmentC1, 0, 100)
+            local adjustedC2 = clamp((tonumber(data.utility) or 0) + adjustmentC2, 0, 100)
+            local modelC1 = directSlotUtilityTier(adjustedC1)
+            local modelC2 = directSlotUtilityTier(adjustedC2)
+            local row = {
+                data=data, utilityTier=utilityTier, modelA=modelA, modelB=modelB,
+                scarcityStrength=scarcityStrength, adjustmentC1=adjustmentC1,
+                adjustmentC2=adjustmentC2, adjustedC1=adjustedC1,
+                adjustedC2=adjustedC2, modelC1=modelC1, modelC2=modelC2,
+                direct=direct,
+            }
+            table.insert(rows, row)
+            bumpDistribution(distributions.active, data.finalRarityTier)
+            bumpDistribution(distributions.a, modelA)
+            bumpDistribution(distributions.b, modelB)
+            bumpDistribution(distributions.c1, modelC1)
+            bumpDistribution(distributions.c2, modelC2)
+        end
+    end
+    table.sort(rows, function(a, b) return a.data.fullType < b.data.fullType end)
+    local writer = getFileWriter("ItemRarity_ClothingCombinerSimulation.txt", true, false)
+    if not writer then return end
+    writer:write("Clothing DIRECT_SLOT final-combiner simulation (READ ONLY)\n")
+    writer:write("Excluded: MECHANICALLY_TRIVIAL, which remains a separate Policy 3 concern. No score/component/group/MechanicalValue field is recomputed.\n")
+    writer:write("Diagnostic UtilityTier bands: <40 COMMON; 40-53.63 UNCOMMON; 53.64-61.27 RARE; 61.28-69.99 EPIC; >=70 EXOTIC. Existing P2 good/excellent cuts are retained; outer bounds are simulation-only.\n")
+    writer:write("Model A: clamp ScarcityTier to UtilityTier +/-1. Model B: clamp current active V1 tier to UtilityTier +/-1.\n")
+    writer:write("Model C1: ScarcityStrength=100-ScarcityPercentile; adjustment=(strength-50)/10 (-5..+5); tier(ClothingScore+adjustment).\n")
+    writer:write("Model C2: ScarcityStrength=100-ScarcityPercentile; adjustment=.15*(strength-50) (-7.5..+7.5); tier(ClothingScore+adjustment).\n")
+    writer:write("ACTIVE " .. formatDistribution(distributions.active) .. "\n")
+    writer:write("MODEL_A " .. formatDistribution(distributions.a) .. "\n")
+    writer:write("MODEL_B " .. formatDistribution(distributions.b) .. "\n\n")
+    writer:write("MODEL_C1 " .. formatDistribution(distributions.c1) .. "\n")
+    writer:write("MODEL_C2 " .. formatDistribution(distributions.c2) .. "\n\n")
+    writer:write("ALL DIRECT_SLOT NONTRIVIAL\nfullType | displayName | slot | UtilityScore | ScarcityStrength | C1 adjustment | C1 adjusted score | C2 adjustment | C2 adjusted score | UtilityTier | Scarcity | active | ModelA | ModelB | ModelC1 | ModelC2 | score pct/rank/confidence/profiles | normalized P/Cov/Dur/Mob/Wt/Disc/Sense/Weather | tier origin\n")
+    local manager = getScriptManager and getScriptManager() or nil
+    for _, row in ipairs(rows) do
+        local d, c = row.data, row.direct
+        local script = findScriptItem(manager, d.fullType)
+        local display = text(script, nil, { "getDisplayName" }, { "displayName" })
+        local slot = d.clothingEquipmentGraph and d.clothingEquipmentGraph.slotId or ""
+        writer:write(table.concat({ safe(d.fullType), safe(display), safe(slot), safe(d.utility), safe(row.scarcityStrength), safe(row.adjustmentC1), safe(row.adjustedC1), safe(row.adjustmentC2), safe(row.adjustedC2), safe(row.utilityTier), safe(d.baseScarcityTier), safe(d.finalRarityTier), safe(row.modelA), safe(row.modelB), safe(row.modelC1), safe(row.modelC2), safe(slash(d.slotQualityPercentile, d.slotQualityRank, d.slotRankingConfidence, d.utilityProfileCount)), safe(slash(c.protection, c.coverage, c.durability, c.mobility, c.weight, c.discomfort, c.senses, c.weather)), safe(d.utilityAdjustmentReason) }, " | ") .. "\n")
+    end
+    writer:write("\nTOP CHANGES (active -> Model C1 or Model C2)\n")
+    local changed = {}
+    for _, row in ipairs(rows) do
+        if row.data.finalRarityTier ~= row.modelC1 or row.data.finalRarityTier ~= row.modelC2 then table.insert(changed, row) end
+    end
+    table.sort(changed, function(a, b)
+        local da = math.max(math.abs((COMBINER_INDEX[a.data.finalRarityTier] or 1) - (COMBINER_INDEX[a.modelC1] or 1)), math.abs((COMBINER_INDEX[a.data.finalRarityTier] or 1) - (COMBINER_INDEX[a.modelC2] or 1)))
+        local db = math.max(math.abs((COMBINER_INDEX[b.data.finalRarityTier] or 1) - (COMBINER_INDEX[b.modelC1] or 1)), math.abs((COMBINER_INDEX[b.data.finalRarityTier] or 1) - (COMBINER_INDEX[b.modelC2] or 1)))
+        if da == db then return a.data.fullType < b.data.fullType end
+        return da > db
+    end)
+    for index, row in ipairs(changed) do
+        if index > 80 then break end
+        writer:write(table.concat({ safe(row.data.fullType), safe(row.data.utility), safe(row.scarcityStrength), safe(row.adjustmentC1), safe(row.adjustedC1), safe(row.adjustmentC2), safe(row.adjustedC2), safe(row.utilityTier), safe(row.data.finalRarityTier), safe(row.modelC1), safe(row.modelC2) }, " | ") .. "\n")
+    end
+    writer:close()
+    writeClothingC1SampleAudit(rows)
+    ItemRarityUtils.info(string.format("Clothing combiner simulation written: %d nontrivial DIRECT_SLOT records; %d changed rows.", #rows, #changed))
+end
+
+-- Wallet simulation is intentionally much narrower than CASE. A candidate
+-- needs the directly exposed Wallet acceptance callback, capacity <=1, zero
+-- reduction, zero attachments, and no functional equip slot. The result is
+-- REPORT ONLY; specialized cases remain outside this predicate.
+local function writeWalletTrivialSimulation(results)
+    if type(results) ~= "table" or not getFileWriter then return end
+    local manager = getScriptManager and getScriptManager() or nil
+    local rows = {}
+    for _, data in pairs(results) do
+        if data.category == "CONTAINER" and data.utilityKind == "CONTAINER" then
+            local m = data.utilityMetrics or {}
+            if tonumber(m.capacity) and tonumber(m.capacity) <= 1 and tonumber(m.weightReduction) == 0 and tonumber(m.attachments) == 0 then
+                local script = findScriptItem(manager, data.fullType)
+                local runtime = nil
+                if script then local ok, item = pcall(function() return script:InstanceItem(nil, false) end); runtime = ok and item or nil end
+                local accept = text(script, runtime, { "getAcceptItemFunction" }, { "acceptItemFunction" })
+                local body = lower(text(script, runtime, { "getBodyLocation", "canBeEquipped" }, { "bodyLocation" }))
+                local noFunctionalSlot = body == "" or body == "-" or has(body, "none") or has(body, "null")
+                if has(accept, "wallet") and noFunctionalSlot then
+                    table.insert(rows, { data=data, accept=accept, body=body })
+                end
+            end
+        end
+    end
+    table.sort(rows, function(a, b) return a.data.fullType < b.data.fullType end)
+    local writer = getFileWriter("ItemRarity_WalletTrivialSimulation.txt", true, false)
+    if not writer then return end
+    writer:write("Wallet trivial-container simulation (READ ONLY)\nFinalTier=COMMON only for the structural predicate AcceptItemFunction.Wallet + capacity<=1 + WeightReduction=0 + attachments=0 + no functional equip slot. No general CASE policy is proposed.\n\n")
+    writer:write("fullType | displayName | capacity | weightReduction | emptyWeight | attachments | accept function | body/equip | active accept | active equip | active wallet predicate | current Scarcity | current FinalTier | proposed FinalTier\n")
+    for _, row in ipairs(rows) do
+        local d, m = row.data, row.data.utilityMetrics or {}
+        local script = findScriptItem(manager, d.fullType)
+        writer:write(table.concat({ safe(d.fullType), safe(text(script, nil, { "getDisplayName" }, { "displayName" })), safe(m.capacity), safe(m.weightReduction), safe(m.emptyWeight), safe(m.attachments), safe(row.accept), safe(row.body), safe(d.containerAcceptItemFunction), safe(d.containerEquipSlot), safe(d.containerWalletTrivial), safe(d.baseScarcityTier), safe(d.finalRarityTier), "COMMON" }, " | ") .. "\n")
+    end
+    writer:close()
+    ItemRarityUtils.info(string.format("Wallet trivial simulation written: %d structurally matching containers.", #rows))
+end
+
+-- Global registry review. This does not treat an uncommon design choice as a
+-- bug automatically: it separates rule candidates from bounded/partial
+-- architecture and from cases that are explainable by the current design.
+local function writeGlobalRarityAnomalyAudit(results)
+    if type(results) ~= "table" or not getFileWriter then return end
+    local tierIndex = { COMMON=1, UNCOMMON=2, RARE=3, EPIC=4, EXOTIC=5 }
+    local classRank = { ACCEPTABLE_BY_DESIGN=1, FUTURE_BRIDGE_OR_ARCHITECTURE=2, PROBABLE_RULE_ISSUE=3 }
+    local manager = getScriptManager and getScriptManager() or nil
+    local suspects, profiles = {}, {}
+    local function mechanicalStatus(data)
+        return data.clothingMechanicalValueStatus or data.accessoryMechanicalValueStatus
+            or data.foodValueStatus or data.medicalValueStatus or data.utilitySupport or "UNSPECIFIED"
+    end
+    local function add(data, classification, reason, severity)
+        local key = data.fullType
+        local record = suspects[key]
+        if not record then
+            record = { data=data, classification=classification, reasons={}, severity=severity or 0 }
+            suspects[key] = record
+        end
+        if classRank[classification] > classRank[record.classification] then record.classification = classification end
+        record.severity = math.max(record.severity, severity or 0)
+        table.insert(record.reasons, reason)
+    end
+    for _, data in pairs(results) do
+        local finalIndex = tierIndex[data.finalRarityTier] or 1
+        local status = mechanicalStatus(data)
+        local utility = tonumber(data.utility)
+        local reason = tostring(data.utilityAdjustmentReason or "")
+        local fallback = data.utilityEligible ~= true or has(lower(reason), "no eligible")
+            or has(lower(reason), "deferred") or has(lower(reason), "thresholds unavailable")
+        if status == "MECHANICALLY_TRIVIAL" and finalIndex > 1 then
+            add(data, "PROBABLE_RULE_ISSUE", "TRIVIAL above COMMON", 100 + finalIndex)
+        end
+        if (status == "MECHANICAL_VALUE_PARTIAL" or status == "UTILITY_PARTIAL") and finalIndex >= 4 then
+            add(data, "FUTURE_BRIDGE_OR_ARCHITECTURE", "PARTIAL in EPIC/EXOTIC; effect not quantified by current architecture", 70 + finalIndex)
+        end
+        if fallback and finalIndex >= 4 then
+            add(data, "FUTURE_BRIDGE_OR_ARCHITECTURE", "fallback/Scarcity in EPIC/EXOTIC", 65 + finalIndex)
+        end
+        if utility and utility <= 35 and finalIndex >= 4 and status ~= "MECHANICALLY_TRIVIAL" then
+            add(data, "PROBABLE_RULE_ISSUE", "low normalized Utility (<=35) in EPIC/EXOTIC", 60 + finalIndex)
+        end
+        if utility and utility >= 70 and finalIndex <= 2 and status ~= "MECHANICALLY_TRIVIAL" then
+            add(data, "ACCEPTABLE_BY_DESIGN", "high normalized Utility (>=70) held at COMMON/UNCOMMON", 45 + (3 - finalIndex))
+        end
+        local profile = tostring(data.utilityProfile or "")
+        local kind = tostring(data.utilityKind or "")
+        if profile ~= "" and profile ~= "nil" and kind ~= "" and kind ~= "nil" then
+            local profileKey = kind .. "|" .. profile
+            profiles[profileKey] = profiles[profileKey] or {}
+            table.insert(profiles[profileKey], data)
+        end
+    end
+    -- Identical profiles are the strongest safe signal for a Scarcity-driven
+    -- visual gap, because the mechanics used by the active Utility match.
+    for _, members in pairs(profiles) do
+        if #members >= 2 then
+            local low, high = members[1], members[1]
+            for _, data in ipairs(members) do
+                if (tierIndex[data.finalRarityTier] or 1) < (tierIndex[low.finalRarityTier] or 1) then low = data end
+                if (tierIndex[data.finalRarityTier] or 1) > (tierIndex[high.finalRarityTier] or 1) then high = data end
+            end
+            local gap = (tierIndex[high.finalRarityTier] or 1) - (tierIndex[low.finalRarityTier] or 1)
+            if gap >= 2 then
+                local note = string.format("identical active Utility profile has %d-tier gap with %s", gap, high.fullType)
+                add(low, "ACCEPTABLE_BY_DESIGN", note, 40 + gap)
+                add(high, "ACCEPTABLE_BY_DESIGN", string.format("identical active Utility profile has %d-tier gap with %s", gap, low.fullType), 40 + gap)
+            end
+        end
+    end
+    local rows = {}
+    for _, record in pairs(suspects) do table.insert(rows, record) end
+    table.sort(rows, function(a, b)
+        local ca, cb = classRank[a.classification], classRank[b.classification]
+        if ca ~= cb then return ca > cb end
+        if a.severity ~= b.severity then return a.severity > b.severity end
+        return a.data.fullType < b.data.fullType
+    end)
+    local byCategory = {}
+    for _, record in ipairs(rows) do
+        local category = tostring(record.data.category or record.data.utilityKind or "UNCLASSIFIED")
+        byCategory[category] = byCategory[category] or { total=0, bug=0, future=0, acceptable=0 }
+        local count = byCategory[category]
+        count.total = count.total + 1
+        if record.classification == "PROBABLE_RULE_ISSUE" then count.bug = count.bug + 1
+        elseif record.classification == "FUTURE_BRIDGE_OR_ARCHITECTURE" then count.future = count.future + 1
+        else count.acceptable = count.acceptable + 1 end
+    end
+    local categories = {}
+    for category in pairs(byCategory) do table.insert(categories, category) end
+    table.sort(categories)
+    local writer = getFileWriter("ItemRarity_GlobalRarityAnomalyAudit.txt", true, false)
+    if not writer then return end
+    writer:write("Global rarity anomaly audit (READ ONLY)\n")
+    writer:write("Heuristics flag review candidates only; no category, score, tier or signature is changed. Identical-profile gaps are marked ACCEPTABLE_BY_DESIGN until a category-specific policy says otherwise.\n")
+    writer:write(string.format("PUBLISHED=%d | DISTINCT_SUSPECTS=%d | TOP_LIMIT=50\n\n", (function() local n=0; for _ in pairs(results) do n=n+1 end; return n end)(), #rows))
+    writer:write("COUNTS BY CATEGORY\ncategory | suspects | probable rule issue | future bridge/architecture | acceptable by design\n")
+    for _, category in ipairs(categories) do
+        local c = byCategory[category]
+        writer:write(table.concat({ safe(category), safe(c.total), safe(c.bug), safe(c.future), safe(c.acceptable) }, " | ") .. "\n")
+    end
+    writer:write("\nTOP 50 REVIEW CANDIDATES\nclassification | fullType | displayName | category | FinalTier | ScarcityTier | Utility/fallback | status | reason\n")
+    for index, record in ipairs(rows) do
+        if index > 50 then break end
+        local data = record.data
+        local script = findScriptItem(manager, data.fullType)
+        local display = text(script, nil, { "getDisplayName" }, { "displayName" })
+        local owner = data.utilityKind or "fallback"
+        if data.utilityEligible ~= true then owner = "fallback/Scarcity" end
+        writer:write(table.concat({ safe(record.classification), safe(data.fullType), safe(display), safe(data.category or data.utilityKind), safe(data.finalRarityTier), safe(data.baseScarcityTier), safe(owner), safe(mechanicalStatus(data)), safe(table.concat(record.reasons, "; ")) }, " | ") .. "\n")
+    end
+    writer:close()
+    ItemRarityUtils.info(string.format("Global rarity anomaly audit written: %d distinct review candidates; top 50 emitted.", #rows))
+end
+
+-- Semantic family labels below are diagnostic presentation only. The candidate
+-- predicate itself is strictly Category=MISC plus the existing structural
+-- MECHANICALLY_TRIVIAL state; no name-based runtime rule is created.
+local function miscTrivialDiagnosticFamily(fullType)
+    local key = lower(tostring(fullType or ""))
+    if has(key, "bellybutton") or has(key, "earring") or has(key, "nosestud") then return "piercing" end
+    if has(key, "bracelet") or has(key, "necklace") then return "jewelry" end
+    if has(key, "glasses") then return "eyewear_cosmetic" end
+    if has(key, "tie_") or has(key, "bowtie") then return "tie" end
+    if has(key, "sheath") then return "sheath" end
+    return "other"
+end
+
+local function writeMiscTrivialPolicySimulation(results)
+    if type(results) ~= "table" or not getFileWriter then return end
+    local manager = getScriptManager and getScriptManager() or nil
+    local rows, families = {}, {}
+    for _, data in pairs(results) do
+        local status = data.clothingMechanicalValueStatus or data.accessoryMechanicalValueStatus
+        if data.category == "MISC" and status == "MECHANICALLY_TRIVIAL" and data.finalRarityTier ~= "COMMON" then
+            local family = miscTrivialDiagnosticFamily(data.fullType)
+            families[family] = (families[family] or 0) + 1
+            table.insert(rows, { data=data, family=family, status=status })
+        end
+    end
+    table.sort(rows, function(a, b) return a.data.fullType < b.data.fullType end)
+    local order = { "jewelry", "piercing", "eyewear_cosmetic", "tie", "sheath", "other" }
+    local writer = getFileWriter("ItemRarity_MiscTrivialPolicySimulation.txt", true, false)
+    if not writer then return end
+    writer:write("MISC trivial-policy simulation (READ ONLY)\n")
+    writer:write("Predicate: category=MISC AND existing MechanicalState=MECHANICALLY_TRIVIAL. Proposed FinalTier=COMMON, Scarcity excluded. Semantic family labels are report-only and do not participate in the predicate.\n")
+    writer:write("CANDIDATES_ABOVE_COMMON=" .. tostring(#rows) .. "\n")
+    writer:write("FAMILY COUNTS\n")
+    for _, family in ipairs(order) do writer:write(family .. "=" .. tostring(families[family] or 0) .. "\n") end
+    writer:write("\nfamily | fullType | displayName | ScarcityTier | current FinalTier | proposed FinalTier | structural trivial reason\n")
+    for _, row in ipairs(rows) do
+        local d = row.data
+        local script = findScriptItem(manager, d.fullType)
+        local display = text(script, nil, { "getDisplayName" }, { "displayName" })
+        local structural = d.accessoryMechanicalSpecialReason or d.clothingMechanicalSpecialReason or "known runtime attributes report no measured mechanical benefit"
+        writer:write(table.concat({ safe(row.family), safe(d.fullType), safe(display), safe(d.baseScarcityTier), safe(d.finalRarityTier), "COMMON", safe(structural) }, " | ") .. "\n")
+    end
+    writer:close()
+    ItemRarityUtils.info(string.format("MISC trivial-policy simulation written: %d structurally trivial MISC items above COMMON.", #rows))
+end
+
+-- Final V1 closure audit. Unlike the broad exploration report, this applies
+-- the approved category-specific semantics before classifying a candidate.
+-- In particular, absolute explosive/fire/noise bands and the firearm/fish/
+-- literature policies are never evaluated as a generic 0..100 Utility score.
+local function writeFinalUtilityClosureAudit(results)
+    if type(results) ~= "table" or not getFileWriter then return end
+    local tierIndex = { COMMON=1, UNCOMMON=2, RARE=3, EPIC=4, EXOTIC=5 }
+    local classRank = { ACEITAVEL_DESIGN=1, ARQUITETURA_FUTURA=2, REGRA_PROVAVEL=3 }
+    local manager = getScriptManager and getScriptManager() or nil
+    local suspects, profiles = {}, {}
+    local function stateOf(data)
+        return data.clothingMechanicalValueStatus or data.accessoryMechanicalValueStatus
+            or data.foodValueStatus or data.medicalValueStatus or data.utilitySupport or "UNSPECIFIED"
+    end
+    local function add(data, classification, reason, correction, severity)
+        local record = suspects[data.fullType]
+        if not record then
+            record = { data=data, classification=classification, reasons={}, correction=correction or "-", severity=severity or 0 }
+            suspects[data.fullType] = record
+        end
+        if classRank[classification] > classRank[record.classification] then
+            record.classification, record.correction = classification, correction or record.correction
+        end
+        record.severity = math.max(record.severity, severity or 0)
+        table.insert(record.reasons, reason)
+    end
+    local function clothingC1Tier(score)
+        if score < 40 then return "COMMON" end
+        if score < 53.64 then return "UNCOMMON" end
+        if score < 61.28 then return "RARE" end
+        if score < 70 then return "EPIC" end
+        return "EXOTIC"
+    end
+    for _, data in pairs(results) do
+        local finalIndex = tierIndex[data.finalRarityTier] or 1
+        local state = stateOf(data)
+        -- A trivial state is the one generic structural guarantee across the
+        -- completed wearable/MISC policies. Anything above COMMON is a real
+        -- rule candidate, independent of its original Scarcity.
+        if state == "MECHANICALLY_TRIVIAL" and finalIndex > 1 then
+            add(data, "REGRA_PROVAVEL", "MECHANICALLY_TRIVIAL published above COMMON", "route the existing structural trivial state to COMMON", 100 + finalIndex)
+        end
+        -- C1 must match its already-published adjusted continuous score for
+        -- every nontrivial DIRECT_SLOT record.
+        local direct = (data.utilityComponents or {}).directSlot
+        if data.category == "CLOTHING" and direct and state ~= "MECHANICALLY_TRIVIAL"
+            and tonumber(data.clothingAdjustedScore) ~= nil then
+            local expected = clothingC1Tier(tonumber(data.clothingAdjustedScore))
+            if data.finalRarityTier ~= expected then
+                add(data, "REGRA_PROVAVEL", "DIRECT_SLOT C1 final tier differs from published adjusted score", "use C1 tier(ClothingAdjustedScore) consistently", 95)
+            end
+        end
+        if data.category == "CONTAINER" and data.containerWalletTrivial == true and data.finalRarityTier ~= "COMMON" then
+            add(data, "REGRA_PROVAVEL", "structural Wallet predicate published above COMMON", "apply the existing Wallet trivial policy before fallback", 94)
+        end
+        -- These are explicitly deferred by V1 architecture. A high tier is
+        -- notable but not a rule bug: there is no quantified replacement yet.
+        local fallbackReason = lower(tostring(data.utilityAdjustmentReason or ""))
+        local fallback = data.utilityEligible ~= true or has(fallbackReason, "fallback")
+            or has(fallbackReason, "deferred") or has(fallbackReason, "no eligible")
+        if finalIndex >= 4 and (state == "MECHANICAL_VALUE_PARTIAL" or state == "UTILITY_PARTIAL" or fallback) then
+            add(data, "ARQUITETURA_FUTURA", "PARTIAL/fallback published in EPIC/EXOTIC under an intentionally unquantified role", "requires future bridge/runtime or category-specific Utility", 60 + finalIndex)
+        end
+        -- Mechanical profile gaps are reviewable, but Scarcity is deliberately
+        -- still meaningful for several completed categories. Keep them as
+        -- design observations, never generic bugs.
+        local profile, kind = tostring(data.utilityProfile or ""), tostring(data.utilityKind or "")
+        if profile ~= "" and profile ~= "nil" and kind ~= "" and kind ~= "nil" then
+            local key = kind .. "|" .. profile
+            profiles[key] = profiles[key] or {}
+            table.insert(profiles[key], data)
+        end
+    end
+    for _, members in pairs(profiles) do
+        if #members >= 2 then
+            local low, high = members[1], members[1]
+            for _, data in ipairs(members) do
+                if (tierIndex[data.finalRarityTier] or 1) < (tierIndex[low.finalRarityTier] or 1) then low = data end
+                if (tierIndex[data.finalRarityTier] or 1) > (tierIndex[high.finalRarityTier] or 1) then high = data end
+            end
+            local gap = (tierIndex[high.finalRarityTier] or 1) - (tierIndex[low.finalRarityTier] or 1)
+            if gap >= 2 then
+                add(low, "ACEITAVEL_DESIGN", string.format("identical active mechanical profile has %d-tier visual gap with %s", gap, high.fullType), "Scarcity remains an intentional differentiator for this completed policy", 25 + gap)
+                add(high, "ACEITAVEL_DESIGN", string.format("identical active mechanical profile has %d-tier visual gap with %s", gap, low.fullType), "Scarcity remains an intentional differentiator for this completed policy", 25 + gap)
+            end
+        end
+    end
+    local rows = {}
+    for _, record in pairs(suspects) do table.insert(rows, record) end
+    table.sort(rows, function(a, b)
+        local ca, cb = classRank[a.classification], classRank[b.classification]
+        if ca ~= cb then return ca > cb end
+        if a.severity ~= b.severity then return a.severity > b.severity end
+        return a.data.fullType < b.data.fullType
+    end)
+    local totals = { REGRA_PROVAVEL=0, ARQUITETURA_FUTURA=0, ACEITAVEL_DESIGN=0 }
+    local futureFamilies = {}
+    for _, record in ipairs(rows) do
+        totals[record.classification] = totals[record.classification] + 1
+        if record.classification == "ARQUITETURA_FUTURA" then
+            local category = tostring(record.data.category or record.data.utilityKind or "UNCLASSIFIED")
+            futureFamilies[category] = (futureFamilies[category] or 0) + 1
+        end
+    end
+    local futureOrder = {}
+    for category in pairs(futureFamilies) do table.insert(futureOrder, category) end
+    table.sort(futureOrder)
+    local writer = getFileWriter("ItemRarity_FinalUtilityClosureAudit.txt", true, false)
+    if not writer then return end
+    writer:write("Final Utility/Rarity V1 closure audit (READ ONLY)\n")
+    writer:write("Completed category semantics are applied before anomaly classification. No registry field or tier is changed.\n")
+    writer:write("TOTAL_ITEMS=" .. tostring((function() local n=0; for _ in pairs(results) do n=n+1 end; return n end)()) .. "\n")
+    writer:write("TOTAL_SUSPECTS=" .. tostring(#rows) .. "\n")
+    writer:write("REGRA_PROVAVEL=" .. tostring(totals.REGRA_PROVAVEL) .. "\n")
+    writer:write("ARQUITETURA_FUTURA=" .. tostring(totals.ARQUITETURA_FUTURA) .. "\n")
+    writer:write("ACEITAVEL_DESIGN=" .. tostring(totals.ACEITAVEL_DESIGN) .. "\n\n")
+    writer:write("ARQUITETURA_FUTURA BY CATEGORY\n")
+    for _, category in ipairs(futureOrder) do writer:write(category .. "=" .. tostring(futureFamilies[category]) .. "\n") end
+    writer:write("\nREGRA_PROVAVEL (only)\nfullType | displayName | category | FinalTier | ScarcityTier | Utility/fallback | mechanical state | exact reason | generic correction\n")
+    for _, record in ipairs(rows) do
+        if record.classification == "REGRA_PROVAVEL" then
+            local data = record.data
+            local script = findScriptItem(manager, data.fullType)
+            local display = text(script, nil, { "getDisplayName" }, { "displayName" })
+            local owner = data.utilityEligible == true and (data.utilityKind or "Utility") or "fallback/Scarcity"
+            writer:write(table.concat({ safe(data.fullType), safe(display), safe(data.category), safe(data.finalRarityTier), safe(data.baseScarcityTier), safe(owner), safe(stateOf(data)), safe(table.concat(record.reasons, "; ")), safe(record.correction) }, " | ") .. "\n")
+        end
+    end
+    writer:close()
+    ItemRarityUtils.info(string.format("Final Utility/Rarity closure audit written: total=%d rule=%d future=%d acceptable=%d.", #rows, totals.REGRA_PROVAVEL, totals.ARQUITETURA_FUTURA, totals.ACEITAVEL_DESIGN))
+end
+
 function ItemRarityFirearmAudit.write(results)
     if type(results) ~= "table" or not getFileWriter then return nil end
     local groups = { FIREARM = {}, AMMO = {}, MAGAZINE = {}, WEAPON_PART = {}, SPECIAL_PARTIAL = {} }
@@ -749,6 +1859,19 @@ function ItemRarityFirearmAudit.write(results)
     table.sort(familyNames)
     for _, family in ipairs(familyNames) do writer:write(family .. " | " .. tostring(families[family]) .. "\n") end
     writer:close()
+    writeSystemCoverageReport(results)
+    writeToolAudit(results)
+    writeRecipeInfrastructureAudit()
+    writeExplosiveTrapAudit(results)
+    writeClothingTargetedAudit(results)
+    writeOuterwearAudit(results)
+    writeSmallContainerAudit(results)
+    writeClothingCombinerSimulation(results)
+    writeClothingTrivialPolicySimulation(results)
+    writeWalletTrivialSimulation(results)
+    writeGlobalRarityAnomalyAudit(results)
+    writeMiscTrivialPolicySimulation(results)
+    writeFinalUtilityClosureAudit(results)
     ItemRarityUtils.info(string.format("FIREARM audit written: firearms=%d (%d profiles) | ammo=%d (%d profiles) | magazines=%d (%d profiles) | parts=%d (%d profiles).",
         #groups.FIREARM, countProfiles(groups.FIREARM), #groups.AMMO, countProfiles(groups.AMMO), #groups.MAGAZINE, countProfiles(groups.MAGAZINE), #groups.WEAPON_PART, countProfiles(groups.WEAPON_PART)))
     return true

@@ -2,7 +2,6 @@ if isServer() then return end
 
 require "ItemRarity/RarityAPI"
 require "ItemRarity/RarityUtils"
-require "ItemRarity/LightFireClientAudit"
 
 local lastRevision = nil
 
@@ -14,6 +13,9 @@ local function loadRegistry(force)
     if not force and lastRevision == revision then return false end
     ItemRarity.setRegistry(data.entries)
     lastRevision = revision
+    -- Presentation caches must key off the published revision, not Lua table
+    -- identity: ModData can update an existing entries table in place.
+    ItemRarity.clientRegistryRevision = revision
     ItemRarityUtils.info("Client registry ready: " .. ItemRarity.getRegistryCount() .. " items (revision " .. revision .. ").")
     return true
 end

@@ -18,7 +18,3 @@ function ItemRarityUtils.debug(message)
     log("DEBUG", message)
 end
 
-function ItemRarityUtils.formatNumber(value)
-    return string.format("%.3f", value or 0)
-end
-

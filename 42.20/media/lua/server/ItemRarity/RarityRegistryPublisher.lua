@@ -107,7 +107,6 @@ function ItemRarityRegistryPublisher.publish(results)
     end
 
     ItemRarity.setRegistry(entries)
-    ItemRarityRegistryPublisher.lastPublishedRevision = revision
     ItemRarityUtils.info(string.format("Registry ready | items=%d | mechanical profiles=%d | Utility eligible=%d | promoted items=%d | promoted profiles=%d | demoted items=%d.",
         count, countSet(summary.profiles), summary.eligible, summary.promoted, countSet(summary.promotedProfiles), summary.demoted))
     return entries, revision

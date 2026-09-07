@@ -5,7 +5,6 @@ require "ItemRarity/PoolRouteResolver"
 require "ItemRarity/TableAvailabilityCalculator"
 require "ItemRarity/UtilityCalculator"
 require "ItemRarity/RarityRegistryPublisher"
-require "ItemRarity/Diagnostics/RegistrySnapshot"
 
 -- Observes final Lua loot tables. It never writes to loot tables or items.
 ItemRarityScanner = ItemRarityScanner or {}
@@ -591,6 +590,10 @@ local function runFullScan(source, force)
     ItemRarityUtils.info("registry republished")
     if force then logMechanicalValueValidation(ItemRarityScanner.results) end
     if ItemRarityConfig.devReportsEnabled then
+        -- A/B/C availability strategies are diagnostics only. Rebuild them
+        -- explicitly here rather than spending their aggregation/sort cost in
+        -- every production RouteWeighted/D scan.
+        ItemRarityTableAvailabilityCalculator.calculateDiagnosticStrategies(ItemRarityScanner.results)
         require "ItemRarity/Diagnostics/RuntimeDiagnosticReport"
         ItemRarityUtilityCalculator.writeReports(ItemRarityScanner.results)
         ItemRarityDiagnosticReport.log(ItemRarityScanner.results, counters)
@@ -617,16 +620,7 @@ function ItemRarityScanner.scan(source)
 end
 
 function ItemRarityScanner.rescan(source)
-    local results = runFullScan(source or "manual", true)
-    -- Temporary forensic capture for baseline-regression investigation. The
-    -- writer is read-only and runs after the completed pipeline/signature.
-    -- Use the fingerprint in the filename so two different scans can be
-    -- compared item-by-item without asking the player to save snapshots.
-    if getFileWriter then
-        require "ItemRarity/Diagnostics/RegistrySnapshot"
-    end
-    if ItemRarityRegistrySnapshot and ItemRarityRegistrySnapshot.write then
-        ItemRarityRegistrySnapshot.write("AUTO_" .. tostring(ItemRarityScanner.lastScanSignatureFingerprint or "UNKNOWN"))
-    end
-    return results
+    -- Snapshot capture is an explicit diagnostic action (the bootstrap's
+    -- `snapshot` client command), never a side effect of a normal rescan.
+    return runFullScan(source or "manual", true)
 end

@@ -68,8 +68,6 @@ ItemRarityConfig.devReportsEnabled = false
 
 -- Detailed scanner reports remain available for development, but are disabled
 -- by default now that the normal mod behavior is visual lookup only.
-ItemRarityConfig.diagnosticsEnabled = false
-
 -- Experimental category utility.  This is deliberately independent from
 -- Strategy D: scarcity always establishes the base tier and these values can
 -- only request a one-tier refinement after the availability calculation.
@@ -77,7 +75,6 @@ ItemRarityConfig.utility = {
     enabled = true,
     -- The UI reads the server-published final tier only. It never calculates
     -- availability, Utility or percentiles during rendering.
-    publishFinalTierToUI = true,
     diagnosticsEnabled = true,
 
     promotionThreshold = 85,
@@ -174,17 +171,26 @@ ItemRarityConfig.utility = {
         maxTier = "EPIC",
     },
 
-    -- ClothingUtility is calculated for diagnostics only in this stage. Its
-    -- score intentionally does not participate in active FinalRarityTier or
-    -- UI publication until its simulation has been reviewed.
+    -- ClothingUtility V1/P2 retains its frozen internal scoring model. For
+    -- non-trivial DIRECT_SLOT clothing only, the final C1 combiner uses the
+    -- continuous score and a bounded +/-5 Scarcity adjustment; it does not
+    -- promote/demote directly from the Scarcity tier.
     clothing = {
-        utilityVersion = "V1_EXPERIMENTAL",
+        utilityVersion = "V1_P2_DIRECT_SLOT_C1",
         architecture = { protectionCoverage = 0.60, mobility = 0.15, weight = 0.10, durability = 0.10, weatherProtection = 0.05 },
         protection = { biteDefense = 0.50, scratchDefense = 0.35, bulletDefense = 0.15 },
         mobility = { runSpeedModifier = 0.70, combatSpeedModifier = 0.30 },
         weather = { insulation = 0.40, windResistance = 0.35, waterResistance = 0.25 },
         coverage = { minimumFactor = 0.70, maximumFactor = 1.00 },
         essential = { "biteDefense", "scratchDefense", "bulletDefense", "coverageEvidenceCount", "weight", "durability", "runSpeedModifier", "combatSpeedModifier", "insulation", "windResistance", "waterResistance" },
+        finalCombiner = {
+            common = 40.00,
+            good = 53.64,
+            excellent = 61.28,
+            exotic = 70.00,
+            scarcityCenter = 50.00,
+            scarcityDivisor = 10.00,
+        },
     },
 
     -- MedicalUtility V1 compares only treatments for the same medical
@@ -245,6 +251,34 @@ ItemRarityConfig.utility = {
         utilityVersion = "V1_LIGHT85_DURATION15_FIRE_ABSOLUTE_EPIC_CAP",
         light = { illumination = 0.85, duration = 0.15, maxTier = "EPIC" },
         fireUses = { uncommon = 20, rare = 40, epic = 60, maxTier = "EPIC" },
+    },
+
+    -- NoiseMakerUtility V1 is a separate tactical axis. It is deliberately
+    -- absolute (no population percentile or Scarcity refinement): NoiseRange
+    -- measures distraction reach, so even the strongest noise source stops
+    -- at EPIC rather than gaining EXOTIC from that one situational function.
+    noiseMaker = {
+        utilityVersion = "V1_ABSOLUTE_NOISE_RANGE_EPIC_CAP",
+        tiers = { uncommon = 15, rare = 30, epic = 50, maxTier = "EPIC" },
+    },
+
+    -- ExplosiveUtility V1 is an absolute blast-effect model.  It evaluates
+    -- only the two directly exposed, stable blast fields; trigger metadata
+    -- is diagnostic-only and Scarcity never refines this functional tier.
+    explosive = {
+        utilityVersion = "V1_ABSOLUTE_POWER70_RANGE30",
+        powerAnchors = { { 0, 0 }, { 50, 40 }, { 70, 60 }, { 90, 80 }, { 110, 100 } },
+        rangeAnchors = { { 0, 0 }, { 3, 40 }, { 5, 60 }, { 7, 80 }, { 9, 100 } },
+        weights = { power = 0.70, range = 0.30 },
+        tiers = { uncommon = 20, rare = 40, epic = 60, exotic = 80 },
+    },
+
+    -- IncendiaryUtility V1 intentionally measures only the directly exposed
+    -- fire reach. No unexposed intensity/duration, Scarcity or trigger
+    -- metadata is inferred into the resulting absolute tier.
+    incendiary = {
+        utilityVersion = "V1_ABSOLUTE_FIRE_RANGE",
+        tiers = { uncommon = 3, rare = 4, epic = 5, exotic = 7 },
     },
 
     -- Literature V1 is structural: SkillBook position alone owns its tier;

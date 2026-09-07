@@ -952,6 +952,13 @@ local function makeContainerCandidate(data, scriptItem)
     -- modifier as missing rather than silently interpreting it as a bonus.
     if runSpeedModifier ~= nil and runSpeedModifier <= 0 then runSpeedModifier = nil end
     local attachments = collectionSize(callMethod(runtimeItem, "getAttachmentsProvided"))
+    -- The script declaration is authoritative for a container acceptance
+    -- callback and equip slot. Runtime wrappers can stringify callback enums
+    -- differently, so they are only a fallback here.
+    local acceptItemFunction = readString(scriptItem, "getAcceptItemFunction", "acceptItemFunction")
+        or readString(runtimeItem, "getAcceptItemFunction", "acceptItemFunction") or ""
+    local equipSlot = readString(scriptItem, "getBodyLocation", "bodyLocation")
+        or readString(runtimeItem, "getBodyLocation", "bodyLocation") or ""
     local metrics = {
         capacity = capacity and capacity >= 0 and capacity or nil,
         weightReduction = weightReduction and weightReduction >= 0 and weightReduction or nil,
@@ -961,6 +968,18 @@ local function makeContainerCandidate(data, scriptItem)
     }
     local v2 = UTILITY.container.v2 and UTILITY.container.v2.groups or {}
     local groupConfig = v2[subgroup]
+    local normalizedAccept = string.lower(acceptItemFunction)
+    local normalizedSlot = string.lower(equipSlot)
+    local noFunctionalEquipSlot = normalizedSlot == "" or contains(normalizedSlot, "none")
+        or contains(normalizedSlot, "null") or normalizedSlot == "false" or normalizedSlot == "nil"
+    -- This is intentionally narrower than CASE: the acceptance callback is
+    -- the structural identity, while tiny capacity, no reduction, no
+    -- attachments and no functional slot establish mechanical triviality.
+    local walletTrivial = contains(normalizedAccept, "acceptitemfunction.wallet")
+        and (metrics.capacity or math.huge) <= 1
+        and (metrics.weightReduction or math.huge) == 0
+        and (metrics.attachments or 0) == 0
+        and noFunctionalEquipSlot
     return {
         data = data,
         kind = "CONTAINER",
@@ -974,6 +993,9 @@ local function makeContainerCandidate(data, scriptItem)
         directions = { capacity = false, weightReduction = false, emptyWeight = true, runSpeedModifier = false, attachments = false },
         containerV2Group = subgroup,
         containerV2Config = groupConfig,
+        containerAcceptItemFunction = acceptItemFunction,
+        containerEquipSlot = equipSlot,
+        containerWalletTrivial = walletTrivial,
     }
 end
 
@@ -1303,6 +1325,88 @@ local function makeLightFireCandidate(data, scriptItem)
     }
 end
 
+-- Noise makers are not firearms, explosives or ignition sources merely
+-- because they share the broad AMMO/Explosives script category.  V1 accepts
+-- only a directly declared NoiseRange and excludes any item with measured
+-- explosion or fire reach. Remote/timer/sensor fields are intentionally not
+-- read: the public bridge does not expose remote state consistently and they
+-- are not part of the approved V1 value model.
+local function makeNoiseMakerCandidate(data, scriptItem)
+    if data.category ~= "AMMO" then return nil end
+    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
+    if not ok then runtimeItem = nil end
+    local displayCategory = string.lower(tostring(data.displayCategory or readString(scriptItem, "getDisplayCategory", "displayCategory") or ""))
+    if displayCategory ~= "explosives" then return nil end
+    local metrics = {
+        noiseRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getNoiseRange", "noiseRange"),
+        explosionPower = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionPower", "explosionPower") or 0,
+        explosionRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionRange", "explosionRange") or 0,
+        fireRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getFireRange", "fireRange") or 0,
+    }
+    if metrics.noiseRange == nil or metrics.noiseRange <= 0
+        or metrics.explosionPower > 0 or metrics.explosionRange > 0 or metrics.fireRange > 0 then return nil end
+    return {
+        data = data, kind = "NOISE_MAKER", subgroup = "NOISE_MAKER", functionalGroup = "NOISE_MAKER",
+        parentGroup = "NOISE_MAKER", metrics = metrics,
+        profile = "NOISE_MAKER:" .. tostring(metrics.noiseRange),
+        utilityEligible = true, utilityConfidence = "HIGH", validAttributeCount = 1,
+        normalizationGroup = "NOISE_MAKER:ABSOLUTE_NOISE_RANGE",
+        utilityScoreVersion = UTILITY.noiseMaker.utilityVersion,
+    }
+end
+
+-- ExplosiveUtility V1 is deliberately narrower than the broad Explosives
+-- display category: only devices with a directly declared blast power *and*
+-- blast range participate.  Incendiaries, noise makers and capture traps
+-- therefore remain separate systems.  Timer/sensor/remote state is neither
+-- read nor inferred because it is not part of the approved value model.
+local function makeExplosiveCandidate(data, scriptItem)
+    if data.category ~= "AMMO" then return nil end
+    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
+    if not ok then runtimeItem = nil end
+    local displayCategory = string.lower(tostring(data.displayCategory or readString(scriptItem, "getDisplayCategory", "displayCategory") or ""))
+    if displayCategory ~= "explosives" then return nil end
+    local metrics = {
+        explosionPower = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionPower", "explosionPower"),
+        explosionRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionRange", "explosionRange"),
+    }
+    if metrics.explosionPower == nil or metrics.explosionPower <= 0
+        or metrics.explosionRange == nil or metrics.explosionRange <= 0 then return nil end
+    return {
+        data = data, kind = "EXPLOSIVE", subgroup = "EXPLOSIVE", functionalGroup = "EXPLOSIVE",
+        parentGroup = "EXPLOSIVE", metrics = metrics,
+        profile = "EXPLOSIVE:" .. profileKey(metrics, { "explosionPower", "explosionRange" }),
+        utilityEligible = true, utilityConfidence = "HIGH", validAttributeCount = 2,
+        normalizationGroup = "EXPLOSIVE:ABSOLUTE_POWER_RANGE",
+        utilityScoreVersion = UTILITY.explosive.utilityVersion,
+    }
+end
+
+-- Incendiaries are separate from blast devices and noise makers. V1 accepts
+-- only a direct FireRange declaration, excludes a measured explosion, and
+-- intentionally does not read timer/sensor/remote metadata or unexposed fire
+-- intensity/duration.
+local function makeIncendiaryCandidate(data, scriptItem)
+    if data.category ~= "AMMO" then return nil end
+    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
+    if not ok then runtimeItem = nil end
+    local displayCategory = string.lower(tostring(data.displayCategory or readString(scriptItem, "getDisplayCategory", "displayCategory") or ""))
+    if displayCategory ~= "explosives" then return nil end
+    local fireRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getFireRange", "fireRange")
+    local explosionPower = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionPower", "explosionPower") or 0
+    local explosionRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionRange", "explosionRange") or 0
+    if fireRange == nil or fireRange <= 0 or explosionPower > 0 or explosionRange > 0 then return nil end
+    local metrics = { fireRange = fireRange }
+    return {
+        data = data, kind = "INCENDIARY", subgroup = "INCENDIARY", functionalGroup = "INCENDIARY",
+        parentGroup = "INCENDIARY", metrics = metrics,
+        profile = "INCENDIARY:" .. tostring(metrics.fireRange),
+        utilityEligible = true, utilityConfidence = "HIGH", validAttributeCount = 1,
+        normalizationGroup = "INCENDIARY:ABSOLUTE_FIRE_RANGE",
+        utilityScoreVersion = UTILITY.incendiary.utilityVersion,
+    }
+end
+
 local function makeLiteratureCandidate(data, scriptItem)
     if data.category ~= "LITERATURE" then return nil end
     -- Preserve the established ScriptItem/runtime bridge for frozen
@@ -1440,6 +1544,12 @@ local function candidateFor(data)
     if fish then return fish end
     local food = makeFoodCandidate(data, scriptItem)
     if food then return food end
+    local incendiary = makeIncendiaryCandidate(data, scriptItem)
+    if incendiary then return incendiary end
+    local explosive = makeExplosiveCandidate(data, scriptItem)
+    if explosive then return explosive end
+    local noiseMaker = makeNoiseMakerCandidate(data, scriptItem)
+    if noiseMaker then return noiseMaker end
     local lightFire = makeLightFireCandidate(data, scriptItem)
     if lightFire then return lightFire end
     local literature = makeLiteratureCandidate(data, scriptItem)
@@ -2894,6 +3004,112 @@ local function scoreLightFireUtility(candidates)
     end
 end
 
+local function scoreNoiseMakerUtility(candidates)
+    local tiers = UTILITY.noiseMaker.tiers
+    local profiles = {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "NOISE_MAKER" and candidate.utilityEligible then profiles[candidate.profile] = true end
+    end
+    local profileCount = 0
+    for _ in pairs(profiles) do profileCount = profileCount + 1 end
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "NOISE_MAKER" and candidate.utilityEligible then
+            local noiseRange = candidate.metrics.noiseRange or 0
+            candidate.noiseMakerScore = noiseRange
+            if noiseRange >= tiers.epic then candidate.noiseMakerFinalTier = "EPIC"
+            elseif noiseRange >= tiers.rare then candidate.noiseMakerFinalTier = "RARE"
+            elseif noiseRange >= tiers.uncommon then candidate.noiseMakerFinalTier = "UNCOMMON"
+            else candidate.noiseMakerFinalTier = "COMMON" end
+            candidate.noiseMakerFinalTier = cappedTier(candidate.noiseMakerFinalTier, tiers.maxTier)
+            candidate.utility = noiseRange
+            candidate.profileCount = profileCount
+            candidate.utilityPercentile = nil
+        end
+    end
+end
+
+local function absoluteAnchorValue(value, anchors)
+    value = tonumber(value) or 0
+    if value <= anchors[1][1] then return anchors[1][2] end
+    for index = 2, #anchors do
+        local lower, upper = anchors[index - 1], anchors[index]
+        if value <= upper[1] then
+            local span = upper[1] - lower[1]
+            if span <= 0 then return upper[2] end
+            local fraction = (value - lower[1]) / span
+            return lower[2] + (upper[2] - lower[2]) * fraction
+        end
+    end
+    return anchors[#anchors][2]
+end
+
+local function explosiveFinalTier(score)
+    local tiers = UTILITY.explosive.tiers
+    if score >= tiers.exotic then return "EXOTIC" end
+    if score >= tiers.epic then return "EPIC" end
+    if score >= tiers.rare then return "RARE" end
+    if score >= tiers.uncommon then return "UNCOMMON" end
+    return "COMMON"
+end
+
+-- Absolute anchors are deliberately shared with the approved diagnostic
+-- simulation. No loaded-population normalization, percentile, Scarcity or
+-- trigger metadata can alter the result for a given blast profile.
+local function scoreExplosiveUtility(candidates)
+    local profiles = {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "EXPLOSIVE" and candidate.utilityEligible then profiles[candidate.profile] = true end
+    end
+    local profileCount = 0
+    for _ in pairs(profiles) do profileCount = profileCount + 1 end
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "EXPLOSIVE" and candidate.utilityEligible then
+            local metrics = candidate.metrics
+            local powerValue = absoluteAnchorValue(metrics.explosionPower, UTILITY.explosive.powerAnchors)
+            local rangeValue = absoluteAnchorValue(metrics.explosionRange, UTILITY.explosive.rangeAnchors)
+            local score = UTILITY.explosive.weights.power * powerValue + UTILITY.explosive.weights.range * rangeValue
+            candidate.explosivePowerValue = powerValue
+            candidate.explosiveRangeValue = rangeValue
+            candidate.explosiveScore = score
+            candidate.explosiveFinalTier = explosiveFinalTier(score)
+            candidate.utility = score
+            candidate.profileCount = profileCount
+            candidate.utilityPercentile = nil
+        end
+    end
+end
+
+local function incendiaryFinalTier(fireRange)
+    local tiers = UTILITY.incendiary.tiers
+    if fireRange >= tiers.exotic then return "EXOTIC" end
+    if fireRange >= tiers.epic then return "EPIC" end
+    if fireRange >= tiers.rare then return "RARE" end
+    if fireRange >= tiers.uncommon then return "UNCOMMON" end
+    return "COMMON"
+end
+
+-- An absolute band is appropriate here: FireRange is the sole directly
+-- measured effect and must keep the same result regardless of the loaded
+-- population. No percentile or Scarcity path exists for Incendiary V1.
+local function scoreIncendiaryUtility(candidates)
+    local profiles = {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "INCENDIARY" and candidate.utilityEligible then profiles[candidate.profile] = true end
+    end
+    local profileCount = 0
+    for _ in pairs(profiles) do profileCount = profileCount + 1 end
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "INCENDIARY" and candidate.utilityEligible then
+            local fireRange = candidate.metrics.fireRange or 0
+            candidate.incendiaryFireRange = fireRange
+            candidate.incendiaryFinalTier = incendiaryFinalTier(fireRange)
+            candidate.utility = fireRange
+            candidate.profileCount = profileCount
+            candidate.utilityPercentile = nil
+        end
+    end
+end
+
 local function utilitySupportStatus(candidate)
     if candidate.utilitySupport then return candidate.utilitySupport end
     if candidate.kind == "MEDICAL" and candidate.medicalValueStatus == "MECHANICAL_VALUE_PARTIAL" then return "UTILITY_PARTIAL" end
@@ -2930,6 +3146,9 @@ local function publishCandidateFields(candidates)
         data.utilityScoreVersion = candidate.utilityScoreVersion or "V1_LEGACY"
         data.containerV2Group = candidate.containerV2Group
         data.containerRankingConfidence = candidate.containerRankingConfidence
+        data.containerAcceptItemFunction = candidate.containerAcceptItemFunction
+        data.containerEquipSlot = candidate.containerEquipSlot
+        data.containerWalletTrivial = candidate.containerWalletTrivial == true
         data.utilitySupport = utilitySupportStatus(candidate)
         data.clothingDiscovery = candidate.clothingDiscovery
         data.clothingUtilityPercentile = candidate.clothingUtilityPercentile
@@ -2939,6 +3158,9 @@ local function publishCandidateFields(candidates)
         data.slotRankingConfidence = candidate.slotRankingConfidence
         data.clothingBalancedThresholds = candidate.clothingBalancedThresholds
         data.clothingEquipmentGraph = candidate.equipmentGraph
+        data.clothingScarcityStrength = candidate.clothingScarcityStrength
+        data.clothingScarcityAdjustment = candidate.clothingScarcityAdjustment
+        data.clothingAdjustedScore = candidate.clothingAdjustedScore
         data.clothingMechanicalValue = candidate.mechanicalValue
         data.clothingMechanicalValueStatus = candidate.mechanicalValueStatus
         data.clothingMechanicalBaseBenefit = candidate.mechanicalBaseBenefit
@@ -2981,6 +3203,14 @@ local function publishCandidateFields(candidates)
         data.fireUtility = candidate.kind == "LIGHTFIRE" and candidate.fireUtility or nil
         data.fireTier = candidate.kind == "LIGHTFIRE" and candidate.fireTier or nil
         data.lightFireSelectedFunction = candidate.kind == "LIGHTFIRE" and candidate.lightFireSelectedFunction or nil
+        data.noiseMakerNoiseRange = candidate.kind == "NOISE_MAKER" and candidate.metrics.noiseRange or nil
+        data.noiseMakerFinalTier = candidate.kind == "NOISE_MAKER" and candidate.noiseMakerFinalTier or nil
+        data.explosivePowerValue = candidate.kind == "EXPLOSIVE" and candidate.explosivePowerValue or nil
+        data.explosiveRangeValue = candidate.kind == "EXPLOSIVE" and candidate.explosiveRangeValue or nil
+        data.explosiveScore = candidate.kind == "EXPLOSIVE" and candidate.explosiveScore or nil
+        data.explosiveFinalTier = candidate.kind == "EXPLOSIVE" and candidate.explosiveFinalTier or nil
+        data.incendiaryFireRange = candidate.kind == "INCENDIARY" and candidate.incendiaryFireRange or nil
+        data.incendiaryFinalTier = candidate.kind == "INCENDIARY" and candidate.incendiaryFinalTier or nil
         data.firearmAbsoluteValue = candidate.kind == "FIREARM" and candidate.firearmAbsoluteValue or nil
         data.firearmRelativeFamilyScore = candidate.kind == "FIREARM" and candidate.firearmRelativeFamilyScore or nil
         data.firearmRankingConfidence = candidate.kind == "FIREARM" and candidate.firearmRankingConfidence or nil
@@ -3011,6 +3241,26 @@ local matrixTierFromAxes
 local function trivialWearableFinalTier(baseScarcityTier)
     if baseScarcityTier == "COMMON" or baseScarcityTier == "UNCOMMON" then return "COMMON" end
     return "UNCOMMON"
+end
+
+local function trivialClothingFinalTier()
+    return "COMMON"
+end
+
+-- C1 is deliberately a final-combiner helper only. It does not alter the
+-- frozen DIRECT_SLOT score, component weights, MechanicalValue, confidence,
+-- or comparable-group construction.
+local function clothingDirectSlotC1Tier(score, combiner)
+    combiner = combiner or {}
+    local common = tonumber(combiner.common) or 40.00
+    local good = tonumber(combiner.good) or 53.64
+    local excellent = tonumber(combiner.excellent) or 61.28
+    local exotic = tonumber(combiner.exotic) or 70.00
+    if score < common then return "COMMON" end
+    if score < good then return "UNCOMMON" end
+    if score < excellent then return "RARE" end
+    if score < exotic then return "EPIC" end
+    return "EXOTIC"
 end
 
 local function applyTierAdjustment(data, candidate)
@@ -3048,8 +3298,19 @@ local function applyTierAdjustment(data, candidate)
     data.magazineFinalScore = candidate.kind == "MAGAZINE" and candidate.magazineFinalScore or nil
     data.ammoCompatibleFirearms = candidate.kind == "AMMO" and candidate.ammoCompatibleFirearms or nil
     data.ammoInheritedFirearmTier = candidate.kind == "AMMO" and candidate.ammoInheritedFirearmTier or nil
+    data.noiseMakerNoiseRange = candidate.kind == "NOISE_MAKER" and candidate.metrics.noiseRange or nil
+    data.noiseMakerFinalTier = candidate.kind == "NOISE_MAKER" and candidate.noiseMakerFinalTier or nil
+    data.explosivePowerValue = candidate.kind == "EXPLOSIVE" and candidate.explosivePowerValue or nil
+    data.explosiveRangeValue = candidate.kind == "EXPLOSIVE" and candidate.explosiveRangeValue or nil
+    data.explosiveScore = candidate.kind == "EXPLOSIVE" and candidate.explosiveScore or nil
+    data.explosiveFinalTier = candidate.kind == "EXPLOSIVE" and candidate.explosiveFinalTier or nil
+    data.incendiaryFireRange = candidate.kind == "INCENDIARY" and candidate.incendiaryFireRange or nil
+    data.incendiaryFinalTier = candidate.kind == "INCENDIARY" and candidate.incendiaryFinalTier or nil
     data.containerV2Group = candidate.containerV2Group
     data.containerRankingConfidence = candidate.containerRankingConfidence
+    data.containerAcceptItemFunction = candidate.containerAcceptItemFunction
+    data.containerEquipSlot = candidate.containerEquipSlot
+    data.containerWalletTrivial = candidate.containerWalletTrivial == true
     data.utilitySupport = utilitySupportStatus(candidate)
     data.clothingDirectSlotFunction = candidate.directSlotFunctionalGroup
     data.slotQualityPercentile = candidate.slotQualityPercentile
@@ -3078,6 +3339,21 @@ local function applyTierAdjustment(data, candidate)
         return
     end
 
+    if candidate.kind == "CONTAINER" and candidate.containerWalletTrivial then
+        data.finalRarityTier = "COMMON"
+        data.utilityAdjustmentReason = "Container Wallet trivial policy: Wallet acceptance + capacity<=1 + zero reduction + zero attachments + no functional equip slot -> COMMON"
+        return
+    end
+
+    -- MISC has no blanket visual policy. Only records that the existing
+    -- runtime mechanical classifier has already proven trivial are capped;
+    -- PARTIAL and KNOWN MISC items remain entirely outside this branch.
+    if data.category == "MISC" and candidate.accessoryMechanicalValueStatus == "MECHANICALLY_TRIVIAL" then
+        data.finalRarityTier = "COMMON"
+        data.utilityAdjustmentReason = "MISC MechanicalValue trivial policy: structurally trivial benefit -> COMMON; Scarcity excluded"
+        return
+    end
+
     -- ContainerUtility V2 is deliberately scoped to five structural groups.
     -- Deferred cases (handheld/specialized/trivial) retain their pre-V2
     -- scarcity result exactly until their content restrictions can be read
@@ -3090,6 +3366,27 @@ local function applyTierAdjustment(data, candidate)
     if candidate.kind == "CONTAINER" and candidate.containerV2Group == "KEY_CONTAINER" then
         data.finalRarityTier = trivialWearableFinalTier(data.baseScarcityTier)
         data.utilityAdjustmentReason = "ContainerUtility V2 KEY_CONTAINER policy: scarcity COMMON/UNCOMMON->COMMON, RARE+->UNCOMMON"
+        return
+    end
+
+    -- NoiseMakerUtility V1 is tactical and absolute: NoiseRange alone never
+    -- receives Scarcity refinement or an EXOTIC outcome. Trigger metadata is
+    -- deliberately not inferred through the incomplete bridge.
+    if candidate.kind == "NOISE_MAKER" and candidate.utilityEligible and candidate.noiseMakerFinalTier then
+        data.finalRarityTier = candidate.noiseMakerFinalTier
+        data.utilityAdjustmentReason = "NoiseMakerUtility V1: absolute NoiseRange bands (<15 C, 15-29 U, 30-49 R, >=50 E); EPIC ceiling; Scarcity/trigger metadata excluded"
+        return
+    end
+
+    if candidate.kind == "EXPLOSIVE" and candidate.utilityEligible and candidate.explosiveFinalTier then
+        data.finalRarityTier = candidate.explosiveFinalTier
+        data.utilityAdjustmentReason = "ExplosiveUtility V1: absolute 70% ExplosionPower + 30% ExplosionRange anchors; Scarcity and trigger metadata excluded"
+        return
+    end
+
+    if candidate.kind == "INCENDIARY" and candidate.utilityEligible and candidate.incendiaryFinalTier then
+        data.finalRarityTier = candidate.incendiaryFinalTier
+        data.utilityAdjustmentReason = "IncendiaryUtility V1: absolute FireRange bands (<3 C, 3-3.99 U, 4-4.99 R, 5-6.99 E, >=7 X); Scarcity and trigger metadata excluded"
         return
     end
 
@@ -3126,6 +3423,32 @@ local function applyTierAdjustment(data, candidate)
         return
     end
 
+    -- Active Clothing DIRECT_SLOT C1.  Mechanical trivial clothing remains
+    -- outside this path and is still owned by Policy 3 below. Scarcity only
+    -- shifts the already-frozen continuous ClothingScore by +/-5 points.
+    local directSlot = candidate.utilityComponents and candidate.utilityComponents.directSlot
+    if candidate.kind == "CLOTHING" and directSlot and candidate.utilityEligible
+        and candidate.utility ~= nil and candidate.mechanicalValueStatus ~= "MECHANICALLY_TRIVIAL" then
+        local combiner = (UTILITY.clothing or {}).finalCombiner or {}
+        local scarcityPercentile = tonumber(data.scarcityPercentile)
+            or tonumber(((data.tableAvailability or {}).routeWeightedPercentile)) or 50
+        local scarcityStrength = clamp(100 - scarcityPercentile, 0, 100)
+        local scarcityCenter = tonumber(combiner.scarcityCenter) or 50
+        local scarcityDivisor = tonumber(combiner.scarcityDivisor) or 10
+        local adjustment = (scarcityStrength - scarcityCenter) / scarcityDivisor
+        local adjustedScore = clamp((tonumber(candidate.utility) or 0) + adjustment, 0, 100)
+        candidate.clothingScarcityStrength = scarcityStrength
+        candidate.clothingScarcityAdjustment = adjustment
+        candidate.clothingAdjustedScore = adjustedScore
+        data.clothingScarcityStrength = scarcityStrength
+        data.clothingScarcityAdjustment = adjustment
+        data.clothingAdjustedScore = adjustedScore
+        data.clothingMechanicalTierBeforeCap = clothingDirectSlotC1Tier(adjustedScore, combiner)
+        data.finalRarityTier = data.clothingMechanicalTierBeforeCap
+        data.utilityAdjustmentReason = "ClothingUtility V1 P2 DIRECT_SLOT C1: continuous ClothingScore + bounded Scarcity adjustment (+/-5); no direct Scarcity-tier cap/promotion"
+        return
+    end
+
     -- Scarcity is an internal potential, never a visual EPIC/EXOTIC grant by
     -- itself. Any unsupported, missing, or unreliable Utility may retain its
     -- base tier only up to RARE; this is category-agnostic and has no item
@@ -3148,8 +3471,8 @@ local function applyTierAdjustment(data, candidate)
         if candidate.kind == "CLOTHING" then
             data.clothingMechanicalTierBeforeCap = data.finalRarityTier
             if candidate.mechanicalValueStatus == "MECHANICALLY_TRIVIAL" then
-                data.finalRarityTier = trivialWearableFinalTier(data.baseScarcityTier)
-                data.utilityAdjustmentReason = "Clothing MechanicalValue Policy 3: trivial benefit follows scarcity COMMON/UNCOMMON->COMMON, RARE+->UNCOMMON"
+                data.finalRarityTier = trivialClothingFinalTier()
+                data.utilityAdjustmentReason = "Clothing MechanicalValue trivial policy: structurally trivial benefit -> COMMON; Scarcity excluded"
             end
         elseif candidate.kind == "ACCESSORY" then
             data.accessoryMechanicalTierBeforeCap = data.finalRarityTier
@@ -3191,8 +3514,8 @@ local function applyTierAdjustment(data, candidate)
         end
         data.clothingMechanicalTierBeforeCap = data.finalRarityTier
         if candidate.mechanicalValueStatus == "MECHANICALLY_TRIVIAL" then
-            data.finalRarityTier = trivialWearableFinalTier(data.baseScarcityTier)
-            data.utilityAdjustmentReason = "Clothing MechanicalValue Policy 3: trivial benefit follows scarcity COMMON/UNCOMMON->COMMON, RARE+->UNCOMMON"
+            data.finalRarityTier = trivialClothingFinalTier()
+            data.utilityAdjustmentReason = "Clothing MechanicalValue trivial policy: structurally trivial benefit -> COMMON; Scarcity excluded"
         end
         return
     end
@@ -3854,6 +4177,9 @@ function ItemRarityUtilityCalculator.calculate(results)
     scoreFishUtility(candidates)
     scoreFoodUtility(candidates)
     scoreLightFireUtility(candidates)
+    scoreNoiseMakerUtility(candidates)
+    scoreExplosiveUtility(candidates)
+    scoreIncendiaryUtility(candidates)
     assignClothingMechanicalValueStatus(candidates)
     assignAccessoryMechanicalValueStatus(candidates)
     publishCandidateFields(candidates)
