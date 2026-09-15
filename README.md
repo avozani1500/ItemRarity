@@ -8,7 +8,7 @@ Item Rarity adds five visual tiers to Project Zomboid items:
 - `EPIC`
 - `EXOTIC`
 
-Version `1.0.0-rc1` targets Project Zomboid Build `42.20.2`.
+Version `1.0.0` targets Project Zomboid Build `42.20.2`.
 
 ## How rarity is determined
 
@@ -27,6 +27,13 @@ runtime data retain the structural Scarcity fallback.
 The published `FinalRarityTier` is calculated once by the host and consumed by
 the client UI.  The UI never rescans loot tables or recalculates Scarcity or
 Utility while rendering.
+
+Clothing uses its own structural V2 policy: bodywear and accessories are
+classified from runtime/script anatomy rather than display category strings,
+and broad body coverage, movement, weather and senses are evaluated with
+absolute, centred components where the data is reliable. See
+[`docs/clothing-utility.md`](docs/clothing-utility.md) for the scoped rules and
+conservative exclusions.
 
 ## Difficulty and sandbox
 
@@ -78,12 +85,28 @@ specialized cases, capture traps, fluid/hydration containers, several Medical
 and Literature special cases, and Food items requiring preparation or recipe
 context.
 
+Tools and materials whose primary value comes from crafting, construction,
+farming, or world actions may therefore be underestimated. ToolUtility V1 was
+investigated before 1.0: B42 tags can identify some reusable tools, but the
+bridge cannot safely measure their action breadth, real opportunities for use,
+or recipe/tool alternatives. Combining that incomplete signal with
+WeaponUtility also risks double-counting items such as weapons that are tools.
+`ToolUtility` and generic `CraftingValue` are therefore deferred to 1.1, until
+the bridge can expose reliable `CraftRecipe ↔ Input/Tool` and world-action
+relationships.
+
+Some low-confidence Clothing/Accessory roles are also deliberately
+conservative: timepieces, belts, holsters, slings, sheaths and unusual
+protective accessories do not receive guessed Utility when the bridge cannot
+expose their actual gameplay behavior.
+
 This is intentional: an unmeasurable effect is not guessed or hardcoded as a
 value. Diagnostics remain available for development, but do not load, run, or
 write files during normal gameplay.
 
-## Release candidate status
+## Release status
 
-`1.0.0-rc1` is the first release candidate. It keeps the established structural
-rarity baseline and focuses on packaging, documentation, optional UI settings,
-and runtime/diagnostic separation.
+`1.0.0` is the stable release package for Project Zomboid Build `42.20.2`.
+It keeps the established structural rarity baseline, optional UI settings, and
+runtime/diagnostic separation. Deferred bridge limitations are known
+limitations, not missing per-item rules or bugs to be patched with hardcodes.

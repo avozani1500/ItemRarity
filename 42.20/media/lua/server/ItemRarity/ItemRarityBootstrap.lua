@@ -2,8 +2,11 @@ require "ItemRarity/RarityUtils"
 require "ItemRarity/RarityConfig"
 require "ItemRarity/RarityScanner"
 
-ItemRarityUtils.info("Loaded experimental loot scanner.")
+ItemRarityUtils.info("Item Rarity loot scanner loaded.")
 local postDistributionMergeSeen = false
+-- Local release default.  It may be temporarily armed only in a development
+-- copy when client debug commands cannot reach the singleplayer host.
+local devPerformanceProfileOnStartup = false
 
 local function scanWhenReady(source)
     if ItemRarityScanner.hasScanned then
@@ -20,7 +23,7 @@ local function scanWhenReady(source)
         return
     end
 
-    ItemRarityUtils.info("Starting experimental loot scan (" .. source .. ").")
+    ItemRarityUtils.info("Starting loot scan (" .. source .. ").")
     ItemRarityScanner.scan(source)
 end
 
@@ -33,6 +36,13 @@ if Events and Events.OnPostDistributionMerge then
         postDistributionMergeSeen = true
         ItemRarityScanner.setDistributionMergeReady("OnPostDistributionMerge")
         scanWhenReady("OnPostDistributionMerge")
+        if devPerformanceProfileOnStartup == true or ItemRarityConfig.devPerformanceProfileOnStartup == true then
+            require "ItemRarity/Diagnostics/RuntimePerformanceProfiler"
+            if ItemRarityRuntimePerformanceProfiler and ItemRarityRuntimePerformanceProfiler.runFiveScans then
+                ItemRarityUtils.info("[PERF] startup profiling armed; running aggregate five-rescan batch")
+                ItemRarityRuntimePerformanceProfiler.runFiveScans()
+            end
+        end
     end)
 else
     ItemRarityUtils.warn("OnPostDistributionMerge is unavailable; using the startup fallback.")
@@ -67,6 +77,16 @@ if Events and Events.OnClientCommand then
             if ItemRarityClothingMechanicalValueReport and ItemRarityClothingMechanicalValueReport.write then
                 ItemRarityClothingMechanicalValueReport.write(ItemRarityScanner.results)
             end
+        elseif module == "ItemRarity" and command == "clothingAbsoluteComponents" then
+            require "ItemRarity/Diagnostics/ClothingAbsoluteComponentsAudit"
+            if ItemRarityClothingAbsoluteComponentsAudit and ItemRarityClothingAbsoluteComponentsAudit.write then
+                ItemRarityClothingAbsoluteComponentsAudit.write(ItemRarityScanner.results)
+            end
+        elseif module == "ItemRarity" and command == "clothingClassifierFallbackSimulation" then
+            require "ItemRarity/Diagnostics/ClothingClassifierFallbackSimulation"
+            if ItemRarityClothingClassifierFallbackSimulation and ItemRarityClothingClassifierFallbackSimulation.write then
+                ItemRarityClothingClassifierFallbackSimulation.write(ItemRarityScanner.results)
+            end
         elseif module == "ItemRarity" and command == "foodRuntimeAudit" then
             require "ItemRarity/Diagnostics/ClothingMechanicalValueReport"
             if ItemRarityFoodRuntimeAudit and ItemRarityFoodRuntimeAudit.write then
@@ -91,6 +111,33 @@ if Events and Events.OnClientCommand then
             elseif not result then
                 ItemRarityUtils.warn("FIREARM audit did not produce a report")
             end
+        elseif module == "ItemRarity" and command == "toolUtilityAudit" then
+            -- Explicit dev-only feasibility report. It consumes current scan
+            -- results and never invokes a scan, registry publish or runtime
+            -- Utility path.
+            require "ItemRarity/Diagnostics/ToolUtilityAudit"
+            if ItemRarityToolUtilityAudit and ItemRarityToolUtilityAudit.write then
+                ItemRarityToolUtilityAudit.write(ItemRarityScanner.results)
+            else
+                ItemRarityUtils.warn("ToolUtility audit did not expose a writer")
+            end
+        elseif module == "ItemRarity" and command == "performanceProfile" then
+            -- Explicit dev-only action. The profiler is not required by
+            -- normal startup or rescan and writes one aggregate report only
+            -- after its fixed five-scan batch has completed.
+            require "ItemRarity/Diagnostics/RuntimePerformanceProfiler"
+            if ItemRarityRuntimePerformanceProfiler and ItemRarityRuntimePerformanceProfiler.runFiveScans then
+                ItemRarityRuntimePerformanceProfiler.runFiveScans()
+            else
+                ItemRarityUtils.warn("Performance profiler did not expose its runner")
+            end
+        elseif module == "ItemRarity" and command == "gameplayAnomalyAudit" then
+            require "ItemRarity/Diagnostics/GameplayAnomalyAudit"
+            if ItemRarityGameplayAnomalyAudit and ItemRarityGameplayAnomalyAudit.write then
+                ItemRarityGameplayAnomalyAudit.write(ItemRarityScanner.results)
+            else
+                ItemRarityUtils.warn("Gameplay anomaly audit did not expose a writer")
+            end
         elseif module == "ItemRarity" and command == "reloadRuntimePipeline" then
             -- Deliberately fixed, small server-side reload path for normal
             -- development.  It does not load any diagnostics and therefore
@@ -98,6 +145,8 @@ if Events and Events.OnClientCommand then
             if reloadLuaFile and ItemRarityScanner and not ItemRarityScanner.isScanning then
                 local files = {
                     "media/lua/shared/ItemRarity/RarityConfig.lua",
+                    "media/lua/shared/ItemRarity/ItemClassifier.lua",
+                    "media/lua/server/ItemRarity/LootAnalyzer.lua",
                     "media/lua/server/ItemRarity/TableAvailabilityCalculator.lua",
                     "media/lua/server/ItemRarity/UtilityCalculator.lua",
                     "media/lua/server/ItemRarity/RarityRegistryPublisher.lua",
@@ -116,6 +165,8 @@ if Events and Events.OnClientCommand then
             -- client command channel into an arbitrary file loader.
             local files = {
                 clothingMechanicalValue = "media/lua/server/ItemRarity/Diagnostics/ClothingMechanicalValueReport.lua",
+                clothingAbsoluteComponents = "media/lua/server/ItemRarity/Diagnostics/ClothingAbsoluteComponentsAudit.lua",
+                clothingClassifierFallback = "media/lua/server/ItemRarity/Diagnostics/ClothingClassifierFallbackSimulation.lua",
                 foodRuntimeAudit = "media/lua/server/ItemRarity/Diagnostics/ClothingMechanicalValueReport.lua",
                 clothingCostCalibration = "media/lua/server/ItemRarity/Diagnostics/ClothingCostCalibration.lua",
                 firearmAudit = "media/lua/server/ItemRarity/Diagnostics/FirearmAudit.lua",

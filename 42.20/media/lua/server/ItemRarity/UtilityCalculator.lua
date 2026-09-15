@@ -14,6 +14,29 @@ local TIER_STRENGTH = { "COMMON", "UNCOMMON", "RARE", "EPIC", "EXOTIC" }
 local TIER_INDEX = { COMMON = 1, UNCOMMON = 2, RARE = 3, EPIC = 4, EXOTIC = 5 }
 local CONFIDENCE_INDEX = { LOW = 1, MEDIUM = 2, HIGH = 3 }
 
+-- The explicit RuntimePerformanceProfiler installs itself only for a dev
+-- profile batch. Normal Utility calculation never loads it and follows the
+-- existing uninstrumented sequence below.
+local function activeProfiler()
+    local profiler = ItemRarityRuntimePerformanceProfiler
+    if profiler and profiler.isActive and profiler.isActive() then return profiler end
+    return nil
+end
+
+local function candidateCount(candidates, kind)
+    local total = 0
+    for _, candidate in ipairs(candidates or {}) do
+        if kind == nil or candidate.kind == kind then total = total + 1 end
+    end
+    return total
+end
+
+local function timedUtilityPass(profiler, label, candidates, kind, action)
+    local token = profiler.beginPhase(label, 1, candidateCount(candidates, kind))
+    action(candidates)
+    profiler.endPhase(token)
+end
+
 local function callMethod(object, name)
     if not object then return nil end
     local ok, method = pcall(function() return object[name] end)
@@ -202,6 +225,15 @@ local function readRuntimeOrScriptString(runtimeItem, scriptItem, getter, field)
     return value
 end
 
+-- The profiler observes every transient runtime construction, but never
+-- reuses or changes those objects. Discovery behavior remains identical.
+local function createDiscoveryRuntimeItem(scriptItem)
+    local profiler = activeProfiler()
+    if profiler and profiler.runtimeInstanceCreated then profiler.runtimeInstanceCreated() end
+    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
+    return ok and runtimeItem or nil
+end
+
 local function clothingSubgroup(bodyLocation)
     local location = string.lower(bodyLocation or "")
     if contains(location, "fullsuit") or contains(location, "longdress") or contains(location, "dress") or contains(location, "boilersuit") then return "FULL_BODY" end
@@ -298,6 +330,11 @@ end
 -- is not registered in the current runtime remains observable, but is marked
 -- unresolved so it cannot receive artificial HIGH confidence later.
 local function bodyLocationGraph(bodyLocation)
+    local cacheKey = string.lower(tostring(bodyLocation or ""))
+    if ItemRarityUtilityCalculator._scanBodyLocationGraphs then
+        local cached = ItemRarityUtilityCalculator._scanBodyLocationGraphs[cacheKey]
+        if cached then return cached end
+    end
     local graph = { bodyLocation = bodyLocation or "", resolved = false, exclusive = {}, exclusiveCount = 0 }
     -- BodyLocations.getGroup is static in B42.  Unlike instance bridge calls,
     -- it must not receive the Lua table as an implicit first argument.
@@ -317,7 +354,12 @@ local function bodyLocationGraph(bodyLocation)
         if idText == target then resolvedSlot = id end
         if idText == "base:cuirass" then cuirassSlot = id end
     end
-    if not resolvedSlot then return graph end
+    if not resolvedSlot then
+        if ItemRarityUtilityCalculator._scanBodyLocationGraphs then
+            ItemRarityUtilityCalculator._scanBodyLocationGraphs[cacheKey] = graph
+        end
+        return graph
+    end
     graph.resolved, graph.slot = true, resolvedSlot
     graph.slotId = tostring(resolvedSlot)
     graph.isCuirass = cuirassSlot ~= nil and tostring(resolvedSlot) == tostring(cuirassSlot)
@@ -332,6 +374,9 @@ local function bodyLocationGraph(bodyLocation)
     end
     table.sort(graph.exclusive)
     graph.exclusiveCount = #graph.exclusive
+    if ItemRarityUtilityCalculator._scanBodyLocationGraphs then
+        ItemRarityUtilityCalculator._scanBodyLocationGraphs[cacheKey] = graph
+    end
     return graph
 end
 
@@ -442,8 +487,7 @@ local function makeClothingDiscoveryCandidate(data, scriptItem)
     -- temporary Clothing runtime item confirms which getters actually cross
     -- the Lua bridge. This is diagnostics only: no clothing score or tier
     -- adjustment is created in this stage.
-    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-    if not ok then runtimeItem = nil end
+    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local bodyLocation = readRuntimeOrScriptString(runtimeItem, scriptItem, "getBodyLocation", "bodyLocation") or ""
     local coveredParts = readRuntimeOrScriptString(runtimeItem, scriptItem, "getBloodClothingType", "bloodClothingType")
         or readRuntimeOrScriptString(runtimeItem, scriptItem, "getBloodLocation", "bloodLocation")
@@ -492,8 +536,14 @@ local function makeClothingDiscoveryCandidate(data, scriptItem)
     local functionalGroup, functionalReason = clothingFunctionalGroup(equipmentGraph, regions, metrics)
     local priorFunctionalGroup = (functionalGroup == "TORSO_LAYER" or functionalGroup == "LOWER_BODY_LAYER"
         or functionalGroup == "CORE_ACCESSORY" or functionalGroup == "GENERAL_UNRESOLVED") and "GENERAL_CLOTHING" or functionalGroup
+    -- A representative may be shared only by items with every raw input that
+    -- contributes to a DIRECT_SLOT component.  In particular, omitting
+    -- discomfort or the two senses here made an otherwise similar variant
+    -- inherit a representative's cost/sensory score.  Keep the key complete
+    -- rather than adding category-specific propagation exceptions.
     local profile = profileKey(metrics, { "biteDefense", "scratchDefense", "bulletDefense", "insulation", "windResistance",
-        "waterResistance", "conditionMax", "conditionLowerChance", "weight", "runSpeedModifier", "combatSpeedModifier", "coverageEvidenceCount" })
+        "waterResistance", "conditionMax", "conditionLowerChance", "weight", "runSpeedModifier", "combatSpeedModifier",
+        "discomfortModifier", "visionModifier", "hearingModifier", "coverageEvidenceCount" })
         .. ":" .. subgroup .. ":" .. topology .. ":" .. tostring(coveredParts or "-")
     return {
         data = data,
@@ -527,15 +577,44 @@ end
 -- exists solely to derive the structural MechanicalValueStatus used by the
 -- approved trivial-benefit visual ceiling.  It has no score, percentile, or
 -- promotion path of its own.
+local function accessoryTrivialCosmeticPolicy(bodyLocation, tags)
+    local body = string.lower(tostring(bodyLocation or ""))
+    local normalizedTags = string.lower(tostring(tags or ""))
+    -- Wrist alone is ambiguous. Vanilla timepieces expose a structural
+    -- script tag, while ordinary bracelets do not. Timepieces remain PARTIAL
+    -- until the bridge exposes their gameplay effects safely.
+    local wrist = contains(body, "wrist")
+    local timepiece = wrist and (contains(normalizedTags, "digital") or contains(normalizedTags, "alarm")
+        or contains(normalizedTags, "timepiece") or contains(normalizedTags, "morewhennozombies"))
+    if timepiece then return false, true, "timepiece/watch structural tag" end
+
+    -- These locations/tags describe attachment or carrying roles whose
+    -- actual behavior is not exposed by the bridge. They intentionally keep
+    -- their existing fallback policy rather than being treated as cosmetic.
+    if contains(body, "belt") or contains(body, "holster") or contains(body, "sling") or contains(body, "sheath")
+        or contains(normalizedTags, "scrapasbelt") or contains(normalizedTags, "firearmloot")
+        or contains(normalizedTags, "firetinder") or contains(normalizedTags, "firefuel") or contains(normalizedTags, "startfire") then
+        return false, false, "attachment/carrying or special-use structural signal"
+    end
+
+    -- Only unambiguous cosmetic anatomy is eligible. This is structural:
+    -- it never reads an item name, module or fullType.
+    if contains(body, "eye") or contains(body, "ear") or contains(body, "neck") or contains(body, "finger") or contains(body, "bellybutton") or wrist then
+        return true, false, "cosmetic accessory anatomy without special signal"
+    end
+    return false, false, "unresolved accessory function"
+end
+
 local function makeAccessoryMechanicalCandidate(data, scriptItem)
-    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-    if not ok then runtimeItem = nil end
+    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local bodyLocation = readRuntimeOrScriptString(runtimeItem, scriptItem, "getBodyLocation", "bodyLocation") or ""
     local coveredParts = readRuntimeOrScriptString(runtimeItem, scriptItem, "getBloodClothingType", "bloodClothingType")
         or readRuntimeOrScriptString(runtimeItem, scriptItem, "getBloodLocation", "bloodLocation")
         or readRuntimeOrScriptString(runtimeItem, scriptItem, "getCoveredParts", "coveredParts") or ""
     local conditionMax = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getConditionMax", "conditionMax")
     local conditionLowerChance = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getConditionLowerChance", "conditionLowerChance")
+    local tags = readRuntimeOrScriptString(runtimeItem, scriptItem, "getTags", "tags") or ""
+    local cosmeticEligible, timepiece, policyReason = accessoryTrivialCosmeticPolicy(bodyLocation, tags)
     local metrics = {
         biteDefense = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getBiteDefense", "biteDefense"),
         scratchDefense = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getScratchDefense", "scratchDefense"),
@@ -570,7 +649,10 @@ local function makeAccessoryMechanicalCandidate(data, scriptItem)
         accessoryBodyLocation = bodyLocation,
         accessoryCoveredParts = coveredParts,
         accessoryMechanicalSpecialBehavior = special,
-        accessoryMechanicalSpecialReason = reason,
+        accessoryMechanicalSpecialReason = reason or (timepiece and policyReason or nil),
+        accessoryTrivialCosmeticEligible = cosmeticEligible,
+        accessoryTimepiecePartial = timepiece,
+        accessoryTrivialPolicyReason = policyReason,
     }
 end
 
@@ -579,8 +661,7 @@ end
 -- can remain material/household.  Functional effect fields, not names or
 -- modules, decide whether an item belongs to this Utility universe.
 local function makeMedicalCandidate(data, scriptItem)
-    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-    if not ok then runtimeItem = nil end
+    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local displayCategory = string.lower(tostring(data.displayCategory or readString(scriptItem, "getDisplayCategory", "displayCategory") or ""))
     local tags = string.lower(tostring(readString(scriptItem, "getTags", "tags") or ""))
     local itemType = string.lower(tostring(readString(scriptItem, "getItemType", "itemType") or ""))
@@ -679,8 +760,8 @@ local function makeFoodCandidate(data, scriptItem)
     -- reset mutable Food state so it represents the base fullType rather than
     -- the world's age, cooking or spoilage state.
     local function newCanonicalRuntimeFood()
-        local ok, item = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-        if not ok then return nil end
+        local item = createDiscoveryRuntimeItem(scriptItem)
+        if not item then return nil end
         callMethodWithArgs(item, "setAge", 0)
         callMethodWithArgs(item, "setCooked", false)
         callMethodWithArgs(item, "setBurnt", false)
@@ -941,8 +1022,7 @@ end
 local function makeContainerCandidate(data, scriptItem)
     -- The temporary object is never put into an inventory and is never
     -- transmitted. It exists only long enough to read the B42 runtime API.
-    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-    if not ok then runtimeItem = nil end
+    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local subgroup = containerSubgroup(scriptItem, runtimeItem)
     local capacity = readNumber(runtimeItem, "getCapacity", nil, nil)
     local weightReduction = readNumber(runtimeItem, "getWeightReduction", nil, nil)
@@ -1002,8 +1082,7 @@ end
 local function makeMeleeCandidate(data, scriptItem)
     local ranged = readBoolean(scriptItem, "isRanged", "ranged")
     local displayCategory = string.lower(data.displayCategory or "")
-    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-    if not ok then runtimeItem = nil end
+    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local minDamage = readNumber(scriptItem, "getMinDamage", "minDamage", nil)
     local maxDamage = readNumber(scriptItem, "getMaxDamage", "maxDamage", nil)
     local averageDamage = minDamage and maxDamage and (minDamage + maxDamage) / 2 or nil
@@ -1109,8 +1188,7 @@ local function firearmFamily(fireMode, ammoType, attachmentType, maxRange)
 end
 
 local function makeFirearmCandidate(data, scriptItem)
-    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-    if not ok then runtimeItem = nil end
+    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local ranged = readBoolean(runtimeItem, "isRanged", "ranged") or readBoolean(scriptItem, "isRanged", "ranged")
     local weaponScript = contains(string.lower(tostring(data.scriptType or "")), "weapon")
     local ammoType = firearmString(runtimeItem, scriptItem, { "getAmmoType" }, { "ammoType" })
@@ -1178,8 +1256,7 @@ end
 -- family and one or more compatible firearms, plus a positive MaxAmmo. This
 -- deliberately does not use category, display name or a magazine fullType.
 local function makeMagazineCandidate(data, scriptItem)
-    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-    if not ok then runtimeItem = nil end
+    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local ammoType = firearmString(runtimeItem, scriptItem, { "getAmmoType" }, { "ammoType" })
     local gunType = firearmString(runtimeItem, scriptItem, { "getGunType" }, { "gunType" })
     local maxAmmo = firearmNumber(runtimeItem, scriptItem, { "getMaxAmmo" }, { "maxAmmo" }) or 0
@@ -1209,8 +1286,7 @@ local function ammoFamilyKey(value)
 end
 
 local function makeAmmoCandidate(data, scriptItem)
-    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-    if not ok then runtimeItem = nil end
+    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local tags = string.lower(readString(scriptItem, "getTags", nil) or readString(runtimeItem, "getTags", nil) or "")
     local capacity = readNumber(runtimeItem, "getCapacity", nil, 0) or 0
     local openingRecipe = firearmString(runtimeItem, scriptItem, { "getDoubleClickRecipe" }, { "doubleClickRecipe" })
@@ -1278,8 +1354,7 @@ end
 -- refill has no measured function in its published state and stays outside
 -- LightFireUtility V1.
 local function makeLightFireCandidate(data, scriptItem)
-    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-    if not ok then runtimeItem = nil end
+    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local tags = string.lower(tostring(readString(scriptItem, "getTags", "tags") or ""))
     local metrics = {
         lightStrength = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getLightStrength", "lightStrength"),
@@ -1333,8 +1408,7 @@ end
 -- are not part of the approved V1 value model.
 local function makeNoiseMakerCandidate(data, scriptItem)
     if data.category ~= "AMMO" then return nil end
-    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-    if not ok then runtimeItem = nil end
+    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local displayCategory = string.lower(tostring(data.displayCategory or readString(scriptItem, "getDisplayCategory", "displayCategory") or ""))
     if displayCategory ~= "explosives" then return nil end
     local metrics = {
@@ -1362,8 +1436,7 @@ end
 -- read nor inferred because it is not part of the approved value model.
 local function makeExplosiveCandidate(data, scriptItem)
     if data.category ~= "AMMO" then return nil end
-    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-    if not ok then runtimeItem = nil end
+    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local displayCategory = string.lower(tostring(data.displayCategory or readString(scriptItem, "getDisplayCategory", "displayCategory") or ""))
     if displayCategory ~= "explosives" then return nil end
     local metrics = {
@@ -1388,8 +1461,7 @@ end
 -- intensity/duration.
 local function makeIncendiaryCandidate(data, scriptItem)
     if data.category ~= "AMMO" then return nil end
-    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-    if not ok then runtimeItem = nil end
+    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local displayCategory = string.lower(tostring(data.displayCategory or readString(scriptItem, "getDisplayCategory", "displayCategory") or ""))
     if displayCategory ~= "explosives" then return nil end
     local fireRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getFireRange", "fireRange")
@@ -1413,8 +1485,7 @@ local function makeLiteratureCandidate(data, scriptItem)
     -- SkillBook/Entertainment behavior. RecipeValue itself never consults
     -- this instance: `literatureUniqueRecipes` above reads static ScriptItem
     -- LearnedRecipes only and therefore never uses OnCreate-injected data.
-    local ok, runtimeItem = pcall(function() return scriptItem:InstanceItem(nil, false) end)
-    if not ok then runtimeItem = nil end
+    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     -- The B42 bridge serializes absent String/list properties as "nil",
     -- "null" or "[]" for some ScriptItem types. They are not declared map,
     -- recipe or callback mechanics and must not divert ordinary literature to
@@ -1532,50 +1603,68 @@ local function makeLiteratureCandidate(data, scriptItem)
     }
 end
 
+local function attemptCandidateBuilder(name, builder, data, scriptItem)
+    local profiler = activeProfiler()
+    if not profiler or not profiler.beginCandidateBuilder then return builder(data, scriptItem) end
+    local token = profiler.beginCandidateBuilder(name)
+    local candidate = builder(data, scriptItem)
+    profiler.endCandidateBuilder(token, candidate ~= nil)
+    return candidate
+end
+
 local function candidateFor(data)
-    local manager = getScriptManager and getScriptManager() or nil
-    local scriptItem = manager and manager:FindItem(data.fullType) or nil
-    if not scriptItem then
-        return { data = data, utilityEligible = false, ineligibleReason = "ScriptItem is unavailable" }
+    local profiler = activeProfiler()
+    if profiler and profiler.beginCandidate then profiler.beginCandidate() end
+    local function finish(candidate)
+        if profiler and profiler.endCandidate then profiler.endCandidate(candidate and candidate.kind or "UNSUPPORTED") end
+        return candidate
     end
-    local medical = makeMedicalCandidate(data, scriptItem)
-    if medical then return medical end
-    local fish = makeFishCandidate(data, scriptItem)
-    if fish then return fish end
-    local food = makeFoodCandidate(data, scriptItem)
-    if food then return food end
-    local incendiary = makeIncendiaryCandidate(data, scriptItem)
-    if incendiary then return incendiary end
-    local explosive = makeExplosiveCandidate(data, scriptItem)
-    if explosive then return explosive end
-    local noiseMaker = makeNoiseMakerCandidate(data, scriptItem)
-    if noiseMaker then return noiseMaker end
-    local lightFire = makeLightFireCandidate(data, scriptItem)
-    if lightFire then return lightFire end
-    local literature = makeLiteratureCandidate(data, scriptItem)
-    if literature then return literature end
+    local scriptItem = data._scriptItem
+    if not scriptItem then
+        local manager = getScriptManager and getScriptManager() or nil
+        scriptItem = manager and manager:FindItem(data.fullType) or nil
+    end
+    if not scriptItem then
+        return finish({ data = data, utilityEligible = false, ineligibleReason = "ScriptItem is unavailable" })
+    end
+    local medical = attemptCandidateBuilder("makeMedicalCandidate", makeMedicalCandidate, data, scriptItem)
+    if medical then return finish(medical) end
+    local fish = attemptCandidateBuilder("makeFishCandidate", makeFishCandidate, data, scriptItem)
+    if fish then return finish(fish) end
+    local food = attemptCandidateBuilder("makeFoodCandidate", makeFoodCandidate, data, scriptItem)
+    if food then return finish(food) end
+    local incendiary = attemptCandidateBuilder("makeIncendiaryCandidate", makeIncendiaryCandidate, data, scriptItem)
+    if incendiary then return finish(incendiary) end
+    local explosive = attemptCandidateBuilder("makeExplosiveCandidate", makeExplosiveCandidate, data, scriptItem)
+    if explosive then return finish(explosive) end
+    local noiseMaker = attemptCandidateBuilder("makeNoiseMakerCandidate", makeNoiseMakerCandidate, data, scriptItem)
+    if noiseMaker then return finish(noiseMaker) end
+    local lightFire = attemptCandidateBuilder("makeLightFireCandidate", makeLightFireCandidate, data, scriptItem)
+    if lightFire then return finish(lightFire) end
+    local literature = attemptCandidateBuilder("makeLiteratureCandidate", makeLiteratureCandidate, data, scriptItem)
+    if literature then return finish(literature) end
     -- Firearm eligibility is structural (ranged + an actual ammunition
     -- mechanism), not dependent on the scanner's broad display/category
     -- label.  Cap guns are the important vanilla case: they are part of the
     -- approved firearm reference population although they are not tagged as
     -- WEAPON/TOOL by the generic classifier.
-    local firearm = makeFirearmCandidate(data, scriptItem)
-    if firearm then return firearm end
+    local firearm = attemptCandidateBuilder("makeFirearmCandidate", makeFirearmCandidate, data, scriptItem)
+    if firearm then return finish(firearm) end
     -- A firearm can also declare GunType and MaxAmmo, so it must be resolved
     -- first.  Only the remaining compatible-ammo scripts are magazines.
-    local magazine = makeMagazineCandidate(data, scriptItem)
-    if magazine then return magazine end
-    local ammo = makeAmmoCandidate(data, scriptItem)
-    if ammo then return ammo end
-    if data.category == "CONTAINER" then return makeContainerCandidate(data, scriptItem) end
-    if data.category == "CLOTHING" then return makeClothingDiscoveryCandidate(data, scriptItem) end
+    local magazine = attemptCandidateBuilder("makeMagazineCandidate", makeMagazineCandidate, data, scriptItem)
+    if magazine then return finish(magazine) end
+    local ammo = attemptCandidateBuilder("makeAmmoCandidate", makeAmmoCandidate, data, scriptItem)
+    if ammo then return finish(ammo) end
+    if data.category == "CONTAINER" then return finish(attemptCandidateBuilder("makeContainerCandidate", makeContainerCandidate, data, scriptItem)) end
+    if data.category == "CLOTHING" then return finish(attemptCandidateBuilder("makeClothingDiscoveryCandidate", makeClothingDiscoveryCandidate, data, scriptItem)) end
     if data.category == "ACCESSORY" or string.lower(tostring(data.displayCategory or "")) == "accessory" then
-        return makeAccessoryMechanicalCandidate(data, scriptItem)
+        return finish(attemptCandidateBuilder("makeAccessoryMechanicalCandidate", makeAccessoryMechanicalCandidate, data, scriptItem))
     end
     if data.category == "WEAPON" or data.category == "TOOL" then
-        return makeMeleeCandidate(data, scriptItem)
+        return finish(attemptCandidateBuilder("makeMeleeCandidate", makeMeleeCandidate, data, scriptItem))
     end
-    return { data = data, utilityEligible = false, ineligibleReason = "category is not implemented for Utility" }
+    return finish({ data = data, utilityEligible = false, ineligibleReason = "category is not implemented for Utility" })
 end
 
 local function countProfiles(candidates)
@@ -2366,7 +2455,7 @@ local function assignAccessoryMechanicalValueStatus(candidates)
             candidate.accessoryMechanicalValue = candidate.accessoryMechanicalBaseBenefit
             local coreKnown = m.biteDefense ~= nil and m.scratchDefense ~= nil and m.bulletDefense ~= nil
                 and m.insulation ~= nil and m.windResistance ~= nil and m.waterResistance ~= nil
-            if candidate.accessoryMechanicalSpecialBehavior or not coreKnown then
+            if candidate.accessoryMechanicalSpecialBehavior or candidate.accessoryTimepiecePartial or not coreKnown then
                 candidate.accessoryMechanicalValueStatus = "MECHANICAL_VALUE_PARTIAL"
             -- Match the approved ACCESSORY audit: only a genuinely zero
             -- measured benefit is TRIVIAL. Tiny but real weather values stay
@@ -2482,6 +2571,223 @@ local function clothingDirectSlotV1Weights(role)
     return { protection=.36, coverage=.12, durability=.10, mobility=.15, weight=.09, discomfort=.10, senses=.05, weather=.03 }
 end
 
+-- LOWER_BODY V2 keeps the frozen V1 weights and every non-target component.
+-- Only coverage, mobility and weather become intrinsic scales so pants and
+-- shorts no longer receive incompatible values from separate slot samples.
+local LOWER_BODY_V2_ANATOMY = { GROIN=1.00, THIGH=.80, SHIN=.75 }
+local LOWER_BODY_V2_ANATOMY_MAXIMUM = 2.55
+
+local function lowerBodyCenteredComponents(candidate)
+    local metrics = candidate.metrics or {}
+    local regions = (candidate.clothingDiscovery or {}).coveredRegions or {}
+    local anatomicalTotal = 0
+    for _, region in ipairs(regions) do anatomicalTotal = anatomicalTotal + (LOWER_BODY_V2_ANATOMY[region] or 0) end
+    local coverageFraction = clamp(anatomicalTotal / LOWER_BODY_V2_ANATOMY_MAXIMUM, 0, 1)
+    local coverage = clamp(10 + 55 * coverageFraction, 0, 100)
+
+    local run = clamp(tonumber(metrics.runSpeedModifier) or 1, 0, 1.25)
+    local combat = clamp(tonumber(metrics.combatSpeedModifier) or 1, 0, 1.25)
+    local mobilityRaw = run * .70 + combat * .30
+    -- Fixed anchors: .75 -> 0, 1.00 -> 50, 1.25 -> 100. The loaded
+    -- population informed the anchors but never defines them at runtime.
+    local mobility = clamp(50 + 200 * (mobilityRaw - 1), 0, 100)
+
+    local physicalWeather = clamp(tonumber(metrics.insulation) or 0, 0, 1) * .40
+        + clamp(tonumber(metrics.windResistance) or 0, 0, 1) * .35
+        + clamp(tonumber(metrics.waterResistance) or 0, 0, 1) * .25
+    -- Fixed anchors: no weather protection -> 40, typical .20 -> 50,
+    -- maximal protection -> 90. This preserves the historical neutral band.
+    local weather = clamp(40 + 50 * physicalWeather, 0, 100)
+    return coverage, mobility, weather, coverageFraction, mobilityRaw, physicalWeather
+end
+
+-- Clothing V2 expands the already-approved LOWER_BODY intrinsic components
+-- only to the two anatomically unambiguous torso macro groups.  The macro is
+-- resolved from the item anatomy and functional role, never from item names
+-- or from slot populations.  Other DIRECT_SLOT groups retain V1 unchanged.
+local function clothingV2TorsoMacro(candidate, role)
+    local regions = regionSet((candidate.clothingDiscovery or {}).coveredRegions or {})
+    if role == "LOWER_BODY_LAYER" or role == "FOOTWEAR" or role == "HEADGEAR"
+        or role == "ARMOR_ACCESSORY" or role == "CORE_ACCESSORY" or role == "FULL_BODY_RESTRICTIVE" then
+        return nil
+    end
+    -- PRIMARY_ARMOR remains the torso-primary macro even when a particular
+    -- script also declares arm coverage; this mirrors the approved audit
+    -- taxonomy and avoids moving armor accessories into this rollout.
+    if role == "PRIMARY_ARMOR" then return "UPPER_BODY" end
+    if regions.TORSO_UPPER or regions.TORSO_LOWER then
+        return (regions.UPPER_ARM or regions.FOREARM) and "OUTERWEAR" or "UPPER_BODY"
+    end
+    return nil
+end
+
+local function clothingV2CenteredMobility(metrics)
+    local run = clamp(tonumber((metrics or {}).runSpeedModifier) or 1, 0, 1.25)
+    local combat = clamp(tonumber((metrics or {}).combatSpeedModifier) or 1, 0, 1.25)
+    local raw = run * .70 + combat * .30
+    return clamp(50 + 200 * (raw - 1), 0, 100), raw
+end
+
+local function clothingV2PhysicalWeather(metrics)
+    local source = metrics or {}
+    return clamp(tonumber(source.insulation) or 0, 0, 1) * .40
+        + clamp(tonumber(source.windResistance) or 0, 0, 1) * .35
+        + clamp(tonumber(source.waterResistance) or 0, 0, 1) * .25
+end
+
+local function clothingV2TorsoComponents(candidate, macro)
+    local regions = (candidate.clothingDiscovery or {}).coveredRegions or {}
+    local weights, maximum, base, span
+    if macro == "UPPER_BODY" then
+        weights, maximum, base, span = { TORSO_UPPER=1.20, TORSO_LOWER=1.10 }, 2.30, 42, 8
+    elseif macro == "OUTERWEAR" then
+        weights, maximum, base, span = { TORSO_UPPER=1.20, TORSO_LOWER=1.10, UPPER_ARM=.85, FOREARM=.80 }, 3.95, 40, 30
+    else
+        return nil
+    end
+    local anatomicalTotal = 0
+    for _, region in ipairs(regions) do anatomicalTotal = anatomicalTotal + (weights[region] or 0) end
+    local coverageFraction = clamp(anatomicalTotal / maximum, 0, 1)
+    local coverage = clamp(base + span * coverageFraction, 0, 100)
+    local mobility, mobilityRaw = clothingV2CenteredMobility(candidate.metrics)
+    local physicalWeather = clothingV2PhysicalWeather(candidate.metrics)
+    -- UPPER_BODY values all physical weather protection continuously.  In
+    -- OUTERWEAR the contribution starts only after material protection .50,
+    -- so ordinary jackets do not gain a rarity promotion merely by being a
+    -- jacket. Both transforms are absolute, fixed and population-independent.
+    local weather = macro == "UPPER_BODY"
+        and clamp(100 * physicalWeather, 0, 100)
+        or clamp(200 * (physicalWeather - .50), 0, 100)
+    return coverage, mobility, weather, coverageFraction, mobilityRaw, physicalWeather
+end
+
+-- FEET V2 uses the same intrinsic approach with deliberately narrower
+-- coverage and mobility ranges: low footwear remains distinguishable from a
+-- boot covering the shin, while a RunSpeedModifier bonus cannot alone make a
+-- sneaker RARE. These fixed anchors were validated against all active
+-- footwear profiles and do not read slot population percentiles.
+local FEET_V2_ANATOMY = { FOOT=.65, SHIN=.75 }
+local FEET_V2_ANATOMY_MAXIMUM = 1.40
+
+local function feetV2CenteredComponents(candidate)
+    local metrics = candidate.metrics or {}
+    local regions = (candidate.clothingDiscovery or {}).coveredRegions or {}
+    local anatomicalTotal = 0
+    for _, region in ipairs(regions) do anatomicalTotal = anatomicalTotal + (FEET_V2_ANATOMY[region] or 0) end
+    local coverageFraction = clamp(anatomicalTotal / FEET_V2_ANATOMY_MAXIMUM, 0, 1)
+    -- FOOT ~= 51.96; FOOT+SHIN = 60. A shin is useful additional coverage,
+    -- but this component alone cannot promote every boot.
+    local coverage = clamp(45 + 15 * coverageFraction, 0, 100)
+
+    local run = clamp(tonumber(metrics.runSpeedModifier) or 1, 0, 1.25)
+    local combat = clamp(tonumber(metrics.combatSpeedModifier) or 1, 0, 1.25)
+    local mobilityRaw = run * .70 + combat * .30
+    -- Fixed anchors: 1.00 -> 50; .90 -> ~43; 1.30 -> ~68.
+    local mobility = clamp(50 + 150 * (mobilityRaw - 1), 0, 100)
+
+    local physicalWeather = clothingV2PhysicalWeather(metrics)
+    -- Fixed absolute scale: none -> 20; maximum -> 100.
+    local weather = clamp(20 + 80 * physicalWeather, 0, 100)
+    return coverage, mobility, weather, coverageFraction, mobilityRaw, physicalWeather
+end
+
+-- HANDS V2 is intentionally anatomy-neutral: every eligible hand garment
+-- covers the same usable hand region in the loaded B42 data.  A fixed middle
+-- coverage value prevents a small slot population from manufacturing a
+-- ranking difference where no anatomical difference exists.  Mobility and
+-- weather use fixed intrinsic scales, matching the approved FEET calibration
+-- without consulting any hand-slot percentile.
+local function handsV2CenteredComponents(candidate)
+    local metrics = candidate.metrics or {}
+    local coverage = 50
+    local run = clamp(tonumber(metrics.runSpeedModifier) or 1, 0, 1.25)
+    local combat = clamp(tonumber(metrics.combatSpeedModifier) or 1, 0, 1.25)
+    local mobilityRaw = run * .70 + combat * .30
+    local mobility = clamp(50 + 150 * (mobilityRaw - 1), 0, 100)
+    local physicalWeather = clothingV2PhysicalWeather(metrics)
+    local weather = clamp(20 + 80 * physicalWeather, 0, 100)
+    return coverage, mobility, weather, mobilityRaw, physicalWeather
+end
+
+-- HEAD V2 uses only the two coverage regions actually exposed by the B42
+-- runtime. HEAD alone lands near the historical neutral component value;
+-- adding NECK earns a bounded, intrinsic credit.  All transforms below are
+-- fixed physical/anatomical scales, not rankings of the current head-slot
+-- population.
+local HEAD_V2_ANATOMY = { HEAD=1.30, NECK=1.25 }
+local HEAD_V2_ANATOMY_MAXIMUM = 2.55
+
+local function headV2AbsoluteSenses(metrics)
+    local source = metrics or {}
+    local raw = clamp(tonumber(source.visionModifier) or 1, 0, 1) * .50
+        + clamp(tonumber(source.hearingModifier) or 1, 0, 1) * .50
+    return clamp(50 + 100 * (raw - 1), 0, 100), raw
+end
+
+local function headV2CenteredComponents(candidate)
+    local metrics = candidate.metrics or {}
+    local regions = (candidate.clothingDiscovery or {}).coveredRegions or {}
+    local anatomicalTotal = 0
+    for _, region in ipairs(regions) do anatomicalTotal = anatomicalTotal + (HEAD_V2_ANATOMY[region] or 0) end
+    local coverageFraction = clamp(anatomicalTotal / HEAD_V2_ANATOMY_MAXIMUM, 0, 1)
+    -- HEAD ~= 50.20; HEAD + NECK = 60. Coverage alone cannot establish a
+    -- high tier, while neck protection remains materially visible.
+    local coverage = clamp(40 + 20 * coverageFraction, 0, 100)
+
+    local run = clamp(tonumber(metrics.runSpeedModifier) or 1, 0, 1.25)
+    local combat = clamp(tonumber(metrics.combatSpeedModifier) or 1, 0, 1.25)
+    local mobilityRaw = run * .70 + combat * .30
+    local mobility = clamp(50 + 150 * (mobilityRaw - 1), 0, 100)
+
+    local physicalWeather = clothingV2PhysicalWeather(metrics)
+    local weather = clamp(20 + 80 * physicalWeather, 0, 100)
+
+    -- Neutral vision/hearing remains 50. Penalties are intrinsic rather
+    -- than a potentially inverted percentile rank among helmet profiles.
+    local senses, sensesRaw = headV2AbsoluteSenses(metrics)
+    return coverage, mobility, weather, senses, coverageFraction, mobilityRaw, physicalWeather, sensesRaw
+end
+
+-- Remaining Clothing V2 rollout is deliberately narrow.  LIMB_LOWER and
+-- FULL_BODY have enough structural anatomy and stable raw data to replace
+-- their slot-local Coverage/Mobility/Weather axes.  Other direct-slot macros
+-- remain on their frozen V1 path until a concrete regression warrants a
+-- separate calibration.
+local CLOTHING_V2_REMAINING_ANATOMY = {
+    LIMB_LOWER = { weights={ THIGH=.80, SHIN=.75 }, maximum=1.55, base=35, span=40 },
+    FULL_BODY = { weights={ TORSO_UPPER=1.20, TORSO_LOWER=1.10, UPPER_ARM=.85, FOREARM=.80, GROIN=1.00, THIGH=.80, SHIN=.75 }, maximum=6.50, base=25, span=55 },
+}
+
+local function clothingV2RemainingMacro(candidate, role)
+    local regions = regionSet((candidate.clothingDiscovery or {}).coveredRegions or {})
+    if role == "FULL_BODY_RESTRICTIVE" then return "FULL_BODY" end
+    if role == "ARMOR_ACCESSORY" and (regions.THIGH or regions.SHIN) then return "LIMB_LOWER" end
+    return nil
+end
+
+local function clothingV2RemainingComponents(candidate, macro)
+    local anatomy = CLOTHING_V2_REMAINING_ANATOMY[macro]
+    if not anatomy then return nil end
+    local metrics = candidate.metrics or {}
+    local anatomicalTotal = 0
+    for _, region in ipairs((candidate.clothingDiscovery or {}).coveredRegions or {}) do
+        anatomicalTotal = anatomicalTotal + (anatomy.weights[region] or 0)
+    end
+    local coverageFraction = clamp(anatomicalTotal / anatomy.maximum, 0, 1)
+    local coverage = clamp(anatomy.base + anatomy.span * coverageFraction, 0, 100)
+
+    local run = clamp(tonumber(metrics.runSpeedModifier) or 1, 0, 1.25)
+    local combat = clamp(tonumber(metrics.combatSpeedModifier) or 1, 0, 1.25)
+    local mobilityRaw = run * .70 + combat * .30
+    local mobility = clamp(50 + 150 * (mobilityRaw - 1), 0, 100)
+
+    local physicalWeather = clothingV2PhysicalWeather(metrics)
+    local weather = clamp(20 + 80 * physicalWeather, 0, 100)
+    local senses, sensesRaw = nil, nil
+    if macro == "FULL_BODY" then senses, sensesRaw = headV2AbsoluteSenses(metrics) end
+    return coverage, mobility, weather, senses, coverageFraction, mobilityRaw, physicalWeather, sensesRaw
+end
+
 local function scoreClothingDirectSlotV1(candidates)
     local slots, entries = {}, {}
     local function ranker(records, field, inverted)
@@ -2530,11 +2836,72 @@ local function scoreClothingDirectSlotV1(candidates)
         end
         slot.profileCount = profileCount
         slot.rankingConfidence = profileCount >= 20 and "HIGH" or (profileCount >= 8 and "MEDIUM" or "LOW")
-        local weights = clothingDirectSlotV1Weights(slot.role)
+            local weights = clothingDirectSlotV1Weights(slot.role)
         for _, record in pairs(representatives) do
             local components = {}
             for field, getter in pairs(ranks) do components[field] = getter(record) or 50 end
             local metrics, parts = record.candidate.metrics, record.candidate.utilityComponents
+            if record.role == "LOWER_BODY_LAYER" then
+                local coverage, mobility, weather, coverageFraction, mobilityRaw, physicalWeather = lowerBodyCenteredComponents(record.candidate)
+                components.coverage = coverage
+                components.mobility = mobility
+                components.weather = weather
+                components.lowerBodyV2CoverageFraction = coverageFraction
+                components.lowerBodyV2MobilityRaw = mobilityRaw
+                components.lowerBodyV2PhysicalWeather = physicalWeather
+            elseif record.role == "FOOTWEAR" then
+                local coverage, mobility, weather, coverageFraction, mobilityRaw, physicalWeather = feetV2CenteredComponents(record.candidate)
+                components.coverage = coverage
+                components.mobility = mobility
+                components.weather = weather
+                components.feetV2CoverageFraction = coverageFraction
+                components.feetV2MobilityRaw = mobilityRaw
+                components.feetV2PhysicalWeather = physicalWeather
+            elseif record.role == "HEADGEAR" then
+                local coverage, mobility, weather, senses, coverageFraction, mobilityRaw, physicalWeather, sensesRaw = headV2CenteredComponents(record.candidate)
+                components.coverage = coverage
+                components.mobility = mobility
+                components.weather = weather
+                components.senses = senses
+                components.headV2CoverageFraction = coverageFraction
+                components.headV2MobilityRaw = mobilityRaw
+                components.headV2PhysicalWeather = physicalWeather
+                components.headV2SensesRaw = sensesRaw
+            else
+                local macro = clothingV2RemainingMacro(record.candidate, record.role)
+                if macro then
+                    local coverage, mobility, weather, senses, coverageFraction, mobilityRaw, physicalWeather, sensesRaw = clothingV2RemainingComponents(record.candidate, macro)
+                    components.coverage = coverage
+                    components.mobility = mobility
+                    components.weather = weather
+                    if senses ~= nil then components.senses = senses end
+                    components.clothingV2Macro = macro
+                    components.clothingV2CoverageFraction = coverageFraction
+                    components.clothingV2MobilityRaw = mobilityRaw
+                    components.clothingV2PhysicalWeather = physicalWeather
+                    if sensesRaw ~= nil then components.clothingV2SensesRaw = sensesRaw end
+                elseif record.candidate.subgroup == "HANDS" then
+                    local coverage, mobility, weather, mobilityRaw, physicalWeather = handsV2CenteredComponents(record.candidate)
+                    components.coverage = coverage
+                    components.mobility = mobility
+                    components.weather = weather
+                    components.handsV2Coverage = coverage
+                    components.handsV2MobilityRaw = mobilityRaw
+                    components.handsV2PhysicalWeather = physicalWeather
+                else
+                    local torsoMacro = clothingV2TorsoMacro(record.candidate, record.role)
+                    if torsoMacro then
+                        local coverage, mobility, weather, coverageFraction, mobilityRaw, physicalWeather = clothingV2TorsoComponents(record.candidate, torsoMacro)
+                        components.coverage = coverage
+                        components.mobility = mobility
+                        components.weather = weather
+                        components.clothingV2Macro = torsoMacro
+                        components.clothingV2CoverageFraction = coverageFraction
+                        components.clothingV2MobilityRaw = mobilityRaw
+                        components.clothingV2PhysicalWeather = physicalWeather
+                    end
+                end
+            end
             local absolute = ((clamp(metrics.biteDefense or 0, 0, 100) * .50) + (clamp(metrics.scratchDefense or 0, 0, 100) * .35)
                 + (clamp(metrics.bulletDefense or 0, 0, 100) * .15)) * clamp(parts.coverageFactor or 1, 0, 1)
             components.relativeProtection = components.protection
@@ -2555,8 +2922,24 @@ local function scoreClothingDirectSlotV1(candidates)
             for _, record in ipairs(slot.records) do
                 if record.candidate.profile == representative.candidate.profile then
                     local candidate = record.candidate
-                    candidate.utilityEligible = representative.quality ~= nil
-                    candidate.utility = representative.quality
+                    local assignedComponents, assignedQuality = representative.components, representative.quality
+                    -- Profiles intentionally remain deduplicated for the
+                    -- existing rank-derived axes.  HEAD V2 Senses, however,
+                    -- is an intrinsic per-item transform. A neutral-vision
+                    -- helmet must not inherit a sensory penalty merely
+                    -- because its otherwise equivalent profile happened to
+                    -- select a different representative during deduplication.
+                    if representative.role == "HEADGEAR" then
+                        assignedComponents = {}
+                        for key, value in pairs(representative.components) do assignedComponents[key] = value end
+                        local senses, sensesRaw = headV2AbsoluteSenses(candidate.metrics)
+                        assignedComponents.senses = senses
+                        assignedComponents.headV2SensesRaw = sensesRaw
+                        assignedQuality = representative.quality
+                            + (senses - (tonumber(representative.components.senses) or 50)) * weights.senses
+                    end
+                    candidate.utilityEligible = assignedQuality ~= nil
+                    candidate.utility = assignedQuality
                     candidate.utilityConfidence = representative.utilityConfidence
                     candidate.profileCount = slot.profileCount
                     candidate.validAttributeCount = representative.valid
@@ -2566,11 +2949,17 @@ local function scoreClothingDirectSlotV1(candidates)
                     candidate.slotQualityRank = rank
                     candidate.slotRankingConfidence = slot.rankingConfidence
                     candidate.utilityScoreVersion = "CLOTHING_V1_P2_DIRECT_SLOT"
+                    if representative.role == "LOWER_BODY_LAYER" then candidate.utilityScoreVersion = "CLOTHING_V2_LOWER_BODY_CENTERED" end
+                    if representative.role == "FOOTWEAR" then candidate.utilityScoreVersion = "CLOTHING_V2_FEET_CENTERED" end
+                    if representative.role == "HEADGEAR" then candidate.utilityScoreVersion = "CLOTHING_V2_HEAD_CENTERED" end
+                    if representative.candidate.subgroup == "HANDS" then candidate.utilityScoreVersion = "CLOTHING_V2_HANDS_CENTERED" end
+                    if assignedComponents.clothingV2Macro == "LIMB_LOWER" then candidate.utilityScoreVersion = "CLOTHING_V2_LIMB_LOWER_CENTERED" end
+                    if assignedComponents.clothingV2Macro == "FULL_BODY" then candidate.utilityScoreVersion = "CLOTHING_V2_FULL_BODY_CENTERED" end
                     candidate.utilityComponents = candidate.utilityComponents or {}
                     candidate.utilityComponents.relativeProtection = representative.components.relativeProtection
                     candidate.utilityComponents.absoluteProtection = representative.components.absoluteProtection
                     candidate.utilityComponents.protectionComponent = representative.components.protection
-                    candidate.utilityComponents.directSlot = representative.components
+                    candidate.utilityComponents.directSlot = assignedComponents
                     if candidate.utilityConfidence == "LOW" then candidate.ineligibleReason = "ClothingUtility V1 incomplete intrinsic runtime attributes; visual ceiling RARE"
                     else candidate.ineligibleReason = nil end
                 end
@@ -3173,6 +3562,9 @@ local function publishCandidateFields(candidates)
         data.accessoryMechanicalDurabilityFactor = candidate.accessoryMechanicalDurabilityFactor
         data.accessoryMechanicalFunctionalCost = candidate.accessoryMechanicalFunctionalCost
         data.accessoryMechanicalSpecialReason = candidate.accessoryMechanicalSpecialReason
+        data.accessoryTrivialCosmeticEligible = candidate.accessoryTrivialCosmeticEligible == true
+        data.accessoryTimepiecePartial = candidate.accessoryTimepiecePartial == true
+        data.accessoryTrivialPolicyReason = candidate.accessoryTrivialPolicyReason
         data.medicalValueStatus = candidate.medicalValueStatus
         data.medicalDominantEffect = candidate.medicalDominantEffect
         data.medicalUses = candidate.medicalUses
@@ -3260,6 +3652,32 @@ local function clothingDirectSlotC1Tier(score, combiner)
     if score < good then return "UNCOMMON" end
     if score < excellent then return "RARE" end
     if score < exotic then return "EPIC" end
+    return "EXOTIC"
+end
+
+-- LOWER_BODY uses the same published ClothingScore and the same C1 scarcity
+-- adjustment as every other DIRECT_SLOT role.  Its tier cuts are intentionally
+-- role-specific, however: the validated lower-body population has a practical
+-- top around the leather-pants profile, which otherwise remains UNCOMMON even
+-- after its real protection advantage has reached the score.  This helper
+-- changes only the final score-to-tier mapping for that structural role.
+local function clothingLowerBodyC1Tier(score)
+    if score < 40.00 then return "COMMON" end
+    if score < 50.00 then return "UNCOMMON" end
+    if score < 60.00 then return "RARE" end
+    if score < 75.00 then return "EPIC" end
+    return "EXOTIC"
+end
+
+-- HEAD V2's fixed absolute components top out below the generic Clothing
+-- tail in the currently loaded B42 profiles. These structural bands were
+-- explicitly calibrated for HEAD: they recognise strong protection without
+-- manufacturing EPIC/EXOTIC when no head profile reaches those scores.
+local function clothingHeadC1Tier(score)
+    if score < 40.00 then return "COMMON" end
+    if score < 50.00 then return "UNCOMMON" end
+    if score < 60.00 then return "RARE" end
+    if score < 75.00 then return "EPIC" end
     return "EXOTIC"
 end
 
@@ -3443,9 +3861,21 @@ local function applyTierAdjustment(data, candidate)
         data.clothingScarcityStrength = scarcityStrength
         data.clothingScarcityAdjustment = adjustment
         data.clothingAdjustedScore = adjustedScore
-        data.clothingMechanicalTierBeforeCap = clothingDirectSlotC1Tier(adjustedScore, combiner)
+        if candidate.directSlotFunctionalGroup == "LOWER_BODY_LAYER" then
+            data.clothingMechanicalTierBeforeCap = clothingLowerBodyC1Tier(adjustedScore)
+        elseif candidate.directSlotFunctionalGroup == "HEADGEAR" then
+            data.clothingMechanicalTierBeforeCap = clothingHeadC1Tier(adjustedScore)
+        else
+            data.clothingMechanicalTierBeforeCap = clothingDirectSlotC1Tier(adjustedScore, combiner)
+        end
         data.finalRarityTier = data.clothingMechanicalTierBeforeCap
-        data.utilityAdjustmentReason = "ClothingUtility V1 P2 DIRECT_SLOT C1: continuous ClothingScore + bounded Scarcity adjustment (+/-5); no direct Scarcity-tier cap/promotion"
+        if candidate.directSlotFunctionalGroup == "LOWER_BODY_LAYER" then
+            data.utilityAdjustmentReason = "ClothingUtility V1 P2 DIRECT_SLOT C1: continuous ClothingScore + bounded Scarcity adjustment (+/-5); LOWER_BODY structural tier bands (40/50/60/75)"
+        elseif candidate.directSlotFunctionalGroup == "HEADGEAR" then
+            data.utilityAdjustmentReason = "ClothingUtility V2 HEAD: absolute HEAD/NECK coverage, M150 mobility, W20 weather and absolute senses; C1 Scarcity adjustment (+/-5); HEAD structural tier bands (40/50/60/75)"
+        else
+            data.utilityAdjustmentReason = "ClothingUtility V1 P2 DIRECT_SLOT C1: continuous ClothingScore + bounded Scarcity adjustment (+/-5); no direct Scarcity-tier cap/promotion"
+        end
         return
     end
 
@@ -3477,8 +3907,13 @@ local function applyTierAdjustment(data, candidate)
         elseif candidate.kind == "ACCESSORY" then
             data.accessoryMechanicalTierBeforeCap = data.finalRarityTier
             if candidate.accessoryMechanicalValueStatus == "MECHANICALLY_TRIVIAL" then
-                data.finalRarityTier = trivialWearableFinalTier(data.baseScarcityTier)
-                data.utilityAdjustmentReason = "Accessory MechanicalValue Policy 3: trivial benefit follows scarcity COMMON/UNCOMMON->COMMON, RARE+->UNCOMMON"
+                if candidate.accessoryTrivialCosmeticEligible then
+                    data.finalRarityTier = "COMMON"
+                    data.utilityAdjustmentReason = "Accessory trivial cosmetic policy: structurally cosmetic, no special function signal -> COMMON; Scarcity excluded"
+                else
+                    data.finalRarityTier = trivialWearableFinalTier(data.baseScarcityTier)
+                    data.utilityAdjustmentReason = "Accessory MechanicalValue Policy 3: structurally ambiguous/functional trivial accessory retains COMMON/UNCOMMON->COMMON, RARE+->UNCOMMON"
+                end
             end
         end
         return
@@ -4149,9 +4584,28 @@ function ItemRarityUtilityCalculator.writeCalibrationReport(results)
 end
 
 function ItemRarityUtilityCalculator.calculate(results)
-    if not UTILITY.enabled then return results end
+    if not UTILITY.enabled then
+        -- The ScriptItem bridge reference is purely scan-local even when a
+        -- developer disables Utility dispatch entirely.
+        for _, data in pairs(results or {}) do data._scriptItem = nil end
+        return results
+    end
+    -- These caches live only for one complete scan. They reuse immutable
+    -- ScriptItem/body-topology data and cannot carry state across rescans.
+    ItemRarityUtilityCalculator._scanBodyLocationGraphs = {}
     local candidates = {}
-    for _, data in pairs(results) do table.insert(candidates, candidateFor(data)) end
+    local profiler = activeProfiler()
+    for _, data in pairs(results) do
+        if profiler then
+            local started = profiler.nowNs()
+            local candidate = candidateFor(data)
+            local finished = profiler.nowNs()
+            profiler.record((candidate.kind or "UNSUPPORTED") .. " CandidateDiscovery", finished - started, 1, 1)
+            table.insert(candidates, candidate)
+        else
+            table.insert(candidates, candidateFor(data))
+        end
+    end
     -- Every score pass deduplicates profiles by keeping the first candidate it
     -- sees.  `pairs(results)` has no defined order, so establish one stable
     -- fullType order before any grouping, reference selection or percentile
@@ -4164,27 +4618,60 @@ function ItemRarityUtilityCalculator.calculate(results)
     -- vanilla-only references. Melee and Clothing use their own frozen
     -- calculators below; historical generic-container snapshots stay
     -- diagnostics-only.
-    scoreContainerV2(candidates)
+    if profiler then
+        timedUtilityPass(profiler, "ContainerUtility", candidates, "CONTAINER", scoreContainerV2)
+    else
+        scoreContainerV2(candidates)
+    end
     -- Every eligible melee HandWeapon (including TOOL combat items) is then
     -- recalculated as V2 Model C10.
-    scoreMeleeV2(candidates)
-    scoreFirearmUtility(candidates)
-    scoreMagazineUtility(candidates)
-    scoreAmmoInheritance(candidates)
-    scoreClothingUtility(candidates)
-    scoreClothingDirectSlotV1(candidates)
-    scoreMedicalUtility(candidates)
-    scoreFishUtility(candidates)
-    scoreFoodUtility(candidates)
-    scoreLightFireUtility(candidates)
-    scoreNoiseMakerUtility(candidates)
-    scoreExplosiveUtility(candidates)
-    scoreIncendiaryUtility(candidates)
-    assignClothingMechanicalValueStatus(candidates)
-    assignAccessoryMechanicalValueStatus(candidates)
-    publishCandidateFields(candidates)
-    buildSubfamilyMetrics(results)
-    for _, candidate in ipairs(candidates) do applyTierAdjustment(candidate.data, candidate) end
+    if profiler then
+        timedUtilityPass(profiler, "WeaponUtility", candidates, "MELEE_WEAPON", scoreMeleeV2)
+        timedUtilityPass(profiler, "FirearmUtility", candidates, "FIREARM", scoreFirearmUtility)
+        timedUtilityPass(profiler, "MagazineUtility", candidates, "MAGAZINE", scoreMagazineUtility)
+        timedUtilityPass(profiler, "AmmoInheritance", candidates, "AMMO", scoreAmmoInheritance)
+        timedUtilityPass(profiler, "ClothingUtility", candidates, "CLOTHING", scoreClothingUtility)
+        timedUtilityPass(profiler, "ClothingDirectSlot/C1", candidates, "CLOTHING", scoreClothingDirectSlotV1)
+        timedUtilityPass(profiler, "MedicalUtility", candidates, "MEDICAL", scoreMedicalUtility)
+        timedUtilityPass(profiler, "FishUtility", candidates, "FISH", scoreFishUtility)
+        timedUtilityPass(profiler, "FoodUtility", candidates, "FOOD", scoreFoodUtility)
+        timedUtilityPass(profiler, "LightFireUtility", candidates, "LIGHTFIRE", scoreLightFireUtility)
+        timedUtilityPass(profiler, "NoiseMakerUtility", candidates, "NOISE_MAKER", scoreNoiseMakerUtility)
+        timedUtilityPass(profiler, "ExplosiveUtility", candidates, "EXPLOSIVE", scoreExplosiveUtility)
+        timedUtilityPass(profiler, "IncendiaryUtility", candidates, "INCENDIARY", scoreIncendiaryUtility)
+        timedUtilityPass(profiler, "ClothingMechanicalPolicies", candidates, "CLOTHING", assignClothingMechanicalValueStatus)
+        timedUtilityPass(profiler, "AccessoryPolicies", candidates, "ACCESSORY", assignAccessoryMechanicalValueStatus)
+        timedUtilityPass(profiler, "PublishCandidateFields", candidates, nil, publishCandidateFields)
+        local subfamily = profiler.beginPhase("SubfamilyMetrics", 1, #candidates)
+        buildSubfamilyMetrics(results)
+        profiler.endPhase(subfamily)
+        local finalTier = profiler.beginPhase("FinalRarityTier/C1", 1, #candidates)
+        for _, candidate in ipairs(candidates) do applyTierAdjustment(candidate.data, candidate) end
+        profiler.endPhase(finalTier)
+    else
+        scoreMeleeV2(candidates)
+        scoreFirearmUtility(candidates)
+        scoreMagazineUtility(candidates)
+        scoreAmmoInheritance(candidates)
+        scoreClothingUtility(candidates)
+        scoreClothingDirectSlotV1(candidates)
+        scoreMedicalUtility(candidates)
+        scoreFishUtility(candidates)
+        scoreFoodUtility(candidates)
+        scoreLightFireUtility(candidates)
+        scoreNoiseMakerUtility(candidates)
+        scoreExplosiveUtility(candidates)
+        scoreIncendiaryUtility(candidates)
+        assignClothingMechanicalValueStatus(candidates)
+        assignAccessoryMechanicalValueStatus(candidates)
+        publishCandidateFields(candidates)
+        buildSubfamilyMetrics(results)
+        for _, candidate in ipairs(candidates) do applyTierAdjustment(candidate.data, candidate) end
+    end
+    -- ScriptItem is a transient Java bridge reference reused from functional
+    -- classification. Do not retain it in scanner results or registry state.
+    for _, data in pairs(results) do data._scriptItem = nil end
+    ItemRarityUtilityCalculator._scanBodyLocationGraphs = nil
     return results
 end
 

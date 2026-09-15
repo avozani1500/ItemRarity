@@ -21,6 +21,19 @@ ItemRarityScanner.summary = ItemRarityScanner.summary or {}
 ItemRarityScanner.isScanning = ItemRarityScanner.isScanning == true
 ItemRarityScanner.distributionMergeReady = ItemRarityScanner.distributionMergeReady == true
 
+-- RuntimePerformanceProfiler is deliberately not required here. It is loaded
+-- only by its explicit dev command; these no-op guards keep normal scans free
+-- of profiling work.
+local function perfBegin(name, calls, items)
+    local profiler = ItemRarityRuntimePerformanceProfiler
+    return profiler and profiler.beginPhase and profiler.beginPhase(name, calls, items) or nil
+end
+
+local function perfEnd(token)
+    local profiler = ItemRarityRuntimePerformanceProfiler
+    if profiler and profiler.endPhase then profiler.endPhase(token) end
+end
+
 local function resolveFullType(itemName)
     if type(itemName) ~= "string" or itemName == "" then return nil end
     local manager = getScriptManager and getScriptManager() or nil
@@ -120,6 +133,7 @@ end
 
 local function addPoolOccurrences(rawOccurrences, counters, pool, metadata, distribution)
     if type(distribution.items) ~= "table" then return end
+    local profile = perfBegin("NominalOccurrenceProcessing", 1, math.floor(#distribution.items / 2))
     for index = 1, #distribution.items, 2 do
         local itemName, weight = distribution.items[index], distribution.items[index + 1]
         local fullType = type(weight) == "number" and resolveFullType(itemName) or nil
@@ -150,6 +164,7 @@ local function addPoolOccurrences(rawOccurrences, counters, pool, metadata, dist
             counters.entries = counters.entries + 1
         end
     end
+    perfEnd(profile)
 end
 
 local function scanProcedural(rawOccurrences, pools, routes, counters)
@@ -457,7 +472,7 @@ local function logMechanicalValueValidation(results)
     end
 end
 
-local function runFullScan(source, force)
+local function runFullScan(source, force, performanceProfile)
     if ItemRarityScanner.isScanning then
         ItemRarityUtils.warn("Scan request ignored: a scan is already running.")
         return ItemRarityScanner.results
@@ -494,16 +509,22 @@ local function runFullScan(source, force)
     end
 
     ItemRarityScanner.isScanning = true
+    local fullScanProfile = perfBegin("OnPostDistributionMerge TOTAL", 1, 0)
     local scanStarted = nowMs()
     local rawOccurrences, pools, routes = {}, {}, {}
     local counters = { entries = 0, malformedEntries = 0, proceduralDistributions = 0, staticDistributions = 0 }
+    local routeProfile = perfBegin("RouteCollection", 1, 0)
     collectProceduralRoutes(SuburbsDistributions, "SuburbsDistributions", routes)
     collectProceduralRoutes(VehicleDistributions, "VehicleDistributions", routes)
+    perfEnd(routeProfile)
     local routesCollectedAt = getTimestampMs and getTimestampMs() or scanStarted
+    local distributionProfile = perfBegin("DistributionScan", 1, 0)
     scanProcedural(rawOccurrences, pools, routes, counters)
     scanStatic(SuburbsDistributions, "SuburbsDistributions", rawOccurrences, pools, counters)
     scanStatic(VehicleDistributions, "VehicleDistributions", rawOccurrences, pools, counters)
+    perfEnd(distributionProfile)
     local tablesScannedAt = getTimestampMs and getTimestampMs() or routesCollectedAt
+    local exposureProfile = perfBegin("PoolExposureAndRoutes", 1, #rawOccurrences)
     local registry = ItemRarityPoolExposure.buildRegistry(pools)
     local routeResolution = ItemRarityPoolRouteResolver.analyze(pools)
     for _, occurrence in ipairs(rawOccurrences) do
@@ -511,15 +532,22 @@ local function runFullScan(source, force)
         occurrence.poolExposure = pool and pool.exposure and pool.exposure.poolExposure or 0
         occurrence.poolExposureData = pool and pool.exposure or nil
     end
+    perfEnd(exposureProfile)
     local exposureBuiltAt = getTimestampMs and getTimestampMs() or tablesScannedAt
 
     ItemRarityScanner.rawOccurrences = rawOccurrences
     ItemRarityScanner.pools = pools
     ItemRarityScanner.proceduralRoutes = routes
     ItemRarityScanner.poolRegistry = registry
+    local classificationProfile = perfBegin("Classification", 1, #rawOccurrences)
     ItemRarityScanner.results = ItemRarityLootAnalyzer.analyze(rawOccurrences)
+    perfEnd(classificationProfile)
+    local availabilityProfile = perfBegin("RouteWeighted", 1, 0)
     ItemRarityTableAvailabilityCalculator.calculate(ItemRarityScanner.results)
+    perfEnd(availabilityProfile)
+    local utilityProfile = perfBegin("UtilityDispatch", 1, 0)
     ItemRarityUtilityCalculator.calculate(ItemRarityScanner.results)
+    perfEnd(utilityProfile)
     local availabilityCalculatedAt = getTimestampMs and getTimestampMs() or exposureBuiltAt
     ItemRarityScanner.summary = counters
     ItemRarityScanner.hasScanned = true
@@ -586,9 +614,11 @@ local function runFullScan(source, force)
         counters.performance.routeCollectionMs, counters.performance.tableScanMs, counters.performance.exposureAnalysisMs,
         counters.performance.availabilityCalculationMs, counters.performance.totalMs))
     if counters.malformedEntries > 0 then ItemRarityUtils.warn("Skipped " .. counters.malformedEntries .. " malformed item/weight pairs.") end
+    local registryProfile = perfBegin("RegistryPublish", 1, counters.itemTypes)
     ItemRarityRegistryPublisher.publish(ItemRarityScanner.results)
+    perfEnd(registryProfile)
     ItemRarityUtils.info("registry republished")
-    if force then logMechanicalValueValidation(ItemRarityScanner.results) end
+    if force and not performanceProfile then logMechanicalValueValidation(ItemRarityScanner.results) end
     if ItemRarityConfig.devReportsEnabled then
         -- A/B/C availability strategies are diagnostics only. Rebuild them
         -- explicitly here rather than spending their aggregation/sort cost in
@@ -608,7 +638,11 @@ local function runFullScan(source, force)
             .. " | signature=" .. counters.resultSignature)
         if not sameAsPrevious then logSignatureDifferences(previousSignatureRows, signatureRows) end
         ItemRarityUtils.info(string.format("manual rescan completed in %d ms", nowMs() - manualStarted))
+        perfEnd(fullScanProfile)
+        local profiler = ItemRarityRuntimePerformanceProfiler
+        if performanceProfile and profiler and profiler.endRun then profiler.endRun(counters.resultSignature, sameAsPrevious) end
     end
+    if not force then perfEnd(fullScanProfile) end
     return ItemRarityScanner.results
 end
 
@@ -623,4 +657,10 @@ function ItemRarityScanner.rescan(source)
     -- Snapshot capture is an explicit diagnostic action (the bootstrap's
     -- `snapshot` client command), never a side effect of a normal rescan.
     return runFullScan(source or "manual", true)
+end
+
+-- Explicit profiler path: same scan and registry pipeline, but it suppresses
+-- the bounded sanity-item log dump so five runs remain aggregate-only.
+function ItemRarityScanner.rescanForPerformance(source)
+    return runFullScan(source or "performance profile", true, true)
 end

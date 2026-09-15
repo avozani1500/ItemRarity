@@ -18,6 +18,12 @@ function ItemRarityLootAnalyzer.analyze(rawOccurrences)
             local category, metadata = ItemRarityItemClassifier.getFunctionalCategory(occurrence.fullType)
             data = {
                 fullType = occurrence.fullType,
+                -- `getFunctionalCategory()` already resolved this ScriptItem
+                -- while collecting structural metadata. Reuse it for this
+                -- scan's Utility discovery instead of doing a second Java
+                -- ScriptManager lookup; UtilityCalculator clears it before
+                -- publication.
+                _scriptItem = metadata._scriptItem,
                 module = metadata.module,
                 category = category,
                 displayCategory = metadata.displayCategory,

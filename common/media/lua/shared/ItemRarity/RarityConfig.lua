@@ -1,10 +1,10 @@
--- Experimental analysis settings. This mod never changes game loot.
+-- Runtime rarity settings. This mod never changes game loot.
 ItemRarityConfig = ItemRarityConfig or {}
 
--- "A" = relative-table baseline, "B" = nominal item chance plus declared rolls,
--- "C" = equal-pool-exposure aggregation of B.  The selected value is only
--- reported; all three values are calculated for comparison.
-ItemRarityConfig.tableAvailabilityStrategy = "A"
+-- Strategy D is the active structural RouteWeighted model. A/B/C are retained
+-- only as explicit development comparisons and are never calculated in a
+-- normal scan.
+ItemRarityConfig.tableAvailabilityStrategy = "D"
 
 -- Strategy D is a normalized table-route approximation.  These are not game
 -- multipliers and never affect loot generation.
@@ -16,7 +16,7 @@ ItemRarityConfig.poolExposure = {
 
 -- Tier boundaries are percentile ranges inside an item's functional category.
 -- Lower Strategy D percentile means lower modeled availability and therefore a
--- rarer tier. `maxExclusive` prevents overlaps at the experimental boundaries.
+-- rarer tier. `maxExclusive` prevents overlaps at the configured boundaries.
 ItemRarityConfig.tierOrder = { "EXOTIC", "EPIC", "RARE", "UNCOMMON", "COMMON" }
 ItemRarityConfig.tiers = {
     EXOTIC = { min = 0, max = 5, maxExclusive = true },
@@ -66,9 +66,14 @@ ItemRarityConfig.registryModDataKey = "ItemRarity.Registry.v1"
 -- active when this is false.
 ItemRarityConfig.devReportsEnabled = false
 
+-- Disabled by default. This is a one-shot development escape hatch for local
+-- profiling when a Build 42 client debug console cannot route custom commands
+-- to its singleplayer host. It is never enabled in a release configuration.
+ItemRarityConfig.devPerformanceProfileOnStartup = false
+
 -- Detailed scanner reports remain available for development, but are disabled
 -- by default now that the normal mod behavior is visual lookup only.
--- Experimental category utility.  This is deliberately independent from
+-- Category Utility. This is deliberately independent from
 -- Strategy D: scarcity always establishes the base tier and these values can
 -- only request a one-tier refinement after the availability calculation.
 ItemRarityConfig.utility = {

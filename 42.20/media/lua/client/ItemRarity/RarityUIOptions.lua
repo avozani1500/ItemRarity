@@ -32,14 +32,14 @@ end
 
 local fallback = {
     modName = "Raridade de Itens",
-    presentation = "Apresenta" .. pt({195, 167, 195, 163}) .. "o",
-    description = "Prefer" .. pt({195, 170}) .. "ncias visuais locais; n" .. pt({195, 163}) .. "o alteram loot nem tiers.",
+    presentation = "Visuais",
+    description = "Prefer" .. pt({195, 170}) .. "ncias visuais locais; n" .. pt({195, 163}) .. "o alteram loot, raridade ou tiers.",
     inventoryNames = "Colorir nomes dos itens no invent" .. pt({195, 161}) .. "rio",
     inventoryNamesTip = "Colore os nomes usando o tier de raridade.",
     tooltipBorder = "Mostrar borda de raridade nos tooltips",
     tooltipBorderTip = "Desenha uma borda colorida pela raridade.",
-    tooltipLabel = "Mostrar label de Raridade nos tooltips",
-    tooltipLabelTip = "Mostra o rodap" .. pt({195, 169}) .. " de raridade no tooltip.",
+    tooltipLabel = "Mostrar raridade nos tooltips",
+    tooltipLabelTip = "Mostra a linha de raridade no rodap" .. pt({195, 169}) .. " do tooltip.",
     hotbar = "Mostrar raridade na hotbar",
     hotbarTip = "Desenha bordas e marcadores de raridade nos slots ocupados.",
     commonVanilla = "Manter nomes COMMON na cor vanilla",

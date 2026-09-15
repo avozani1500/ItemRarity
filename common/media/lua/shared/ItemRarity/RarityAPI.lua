@@ -54,6 +54,47 @@ function ItemRarity.rescan()
     return nil, message
 end
 
+-- Explicit five-run, aggregate-only dev profiler. The host owns the scanner;
+-- a client console uses the same forwarding convention as ItemRarity.rescan.
+-- This never runs during ordinary loading or a normal manual rescan.
+function ItemRarity.profilePerformance()
+    if ItemRarityScanner and type(ItemRarityScanner.rescanForPerformance) == "function" then
+        require "ItemRarity/Diagnostics/RuntimePerformanceProfiler"
+        if ItemRarityRuntimePerformanceProfiler and ItemRarityRuntimePerformanceProfiler.runFiveScans then
+            return ItemRarityRuntimePerformanceProfiler.runFiveScans()
+        end
+    end
+    -- B42 client→server commands take module/command/args. Unlike the older
+    -- shared dev helpers, this new profiler must also work from a client-only
+    -- debug console, where prepending an IsoPlayer prevents dispatch.
+    if sendClientCommand then
+        sendClientCommand("ItemRarity", "performanceProfile", {})
+        local message = "ItemRarity.profilePerformance() requested from the client; waiting for the host profile."
+        if ItemRarityUtils and ItemRarityUtils.info then ItemRarityUtils.info(message) else print(message) end
+        return true, message
+    end
+    local message = "ItemRarity.profilePerformance() is unavailable: this Lua context cannot reach the host scanner."
+    if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+    return nil, message
+end
+
+-- Explicit host-side forensic report for gameplay observations.  It consumes
+-- the current scan only and never rescans, republishes, or changes a tier.
+function ItemRarity.writeGameplayAnomalyAudit()
+    if ItemRarityGameplayAnomalyAudit and type(ItemRarityGameplayAnomalyAudit.write) == "function" and ItemRarityScanner then
+        return ItemRarityGameplayAnomalyAudit.write(ItemRarityScanner.results)
+    end
+    if sendClientCommand then
+        sendClientCommand("ItemRarity", "gameplayAnomalyAudit", {})
+        local message = "ItemRarity gameplay anomaly audit requested from the client; waiting for the host report."
+        if ItemRarityUtils and ItemRarityUtils.info then ItemRarityUtils.info(message) else print(message) end
+        return true, message
+    end
+    local message = "ItemRarity gameplay anomaly audit is unavailable: this Lua context cannot reach the host scanner."
+    if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+    return nil, message
+end
+
 -- Forensic helper: asks the host to serialize the current registry without
 -- recalculating it. It mirrors rescan's client→server routing because a
 -- client debug console only owns the compact UI registry.
@@ -110,6 +151,43 @@ function ItemRarity.writeClothingMechanicalValueAudit()
     return nil, message
 end
 
+-- Read-only comparison of active per-slot Clothing components against a
+-- lower-body absolute-component simulation. It never rescans or republishes.
+function ItemRarity.writeClothingAbsoluteComponentsAudit()
+    if ItemRarityClothingAbsoluteComponentsAudit and type(ItemRarityClothingAbsoluteComponentsAudit.write) == "function" and ItemRarityScanner then
+        return ItemRarityClothingAbsoluteComponentsAudit.write(ItemRarityScanner.results)
+    end
+    local player = getSpecificPlayer and getSpecificPlayer(0) or (getPlayer and getPlayer() or nil)
+    if sendClientCommand and player then
+        sendClientCommand(player, "ItemRarity", "clothingAbsoluteComponents", {})
+        local message = "ItemRarity Clothing absolute-components audit requested from the client; waiting for the host report."
+        if ItemRarityUtils and ItemRarityUtils.info then ItemRarityUtils.info(message) else print(message) end
+        return true, message
+    end
+    local message = "ItemRarity Clothing absolute-components audit is unavailable: this Lua context cannot reach the host registry."
+    if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+    return nil, message
+end
+
+-- Explicit simulation of a structural `base:clothing` classifier fallback.
+-- The server clones current rows and writes a report; it never publishes the
+-- simulated tiers or changes the active classifier.
+function ItemRarity.writeClothingClassifierFallbackSimulation()
+    if ItemRarityClothingClassifierFallbackSimulation and type(ItemRarityClothingClassifierFallbackSimulation.write) == "function" and ItemRarityScanner then
+        return ItemRarityClothingClassifierFallbackSimulation.write(ItemRarityScanner.results)
+    end
+    local player = getSpecificPlayer and getSpecificPlayer(0) or (getPlayer and getPlayer() or nil)
+    if sendClientCommand and player then
+        sendClientCommand(player, "ItemRarity", "clothingClassifierFallbackSimulation", {})
+        local message = "ItemRarity Clothing classifier fallback simulation requested from the client; waiting for the host report."
+        if ItemRarityUtils and ItemRarityUtils.info then ItemRarityUtils.info(message) else print(message) end
+        return true, message
+    end
+    local message = "ItemRarity Clothing classifier fallback simulation is unavailable: this Lua context cannot reach the host registry."
+    if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+    return nil, message
+end
+
 -- Read-only Food runtime audit.  It runs server-side and is deliberately
 -- separate from FoodUtility, which has not been implemented yet.
 function ItemRarity.writeFoodRuntimeAudit()
@@ -146,11 +224,30 @@ function ItemRarity.writeFoodStaticSourceAudit()
     return nil, message
 end
 
+-- Explicit host-side feasibility audit for a future ToolUtility. It only
+-- reads the current scan/ScriptItem bridge; it cannot rescan or mutate the
+-- registry. The client console forwards it to the host just like the other
+-- forensic writers.
+function ItemRarity.writeToolUtilityAudit()
+    if ItemRarityToolUtilityAudit and type(ItemRarityToolUtilityAudit.write) == "function" and ItemRarityScanner then
+        return ItemRarityToolUtilityAudit.write(ItemRarityScanner.results)
+    end
+    if sendClientCommand then
+        sendClientCommand("ItemRarity", "toolUtilityAudit", {})
+        local message = "ItemRarity ToolUtility feasibility audit requested from the client; waiting for the host report."
+        if ItemRarityUtils and ItemRarityUtils.info then ItemRarityUtils.info(message) else print(message) end
+        return true, message
+    end
+    local message = "ItemRarity ToolUtility feasibility audit is unavailable: this Lua context cannot reach the host scanner."
+    if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+    return nil, message
+end
+
 -- Reloads an explicitly permitted server-side diagnostic writer.  Normal
 -- ItemRarity runtime files remain intentionally outside this API; changing
 -- active pipeline code still requires the normal controlled validation flow.
 function ItemRarity.reloadDiagnostic(key)
-    local allowed = { clothingMechanicalValue=true, clothingCostCalibration=true, foodRuntimeAudit=true, foodStaticSourceAudit=true }
+    local allowed = { clothingMechanicalValue=true, clothingAbsoluteComponents=true, clothingClassifierFallback=true, clothingCostCalibration=true, foodRuntimeAudit=true, foodStaticSourceAudit=true }
     if not allowed[key] then
         local message = "ItemRarity.reloadDiagnostic() rejected an unknown diagnostic key."
         if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
