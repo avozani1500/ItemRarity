@@ -1,8 +1,8 @@
-name=Item Rarity
-id=ItemRarity
-description=Structural item rarity tiers for Project Zomboid Build 42.20.2.
+name=Item Rarity DEV
+id=ItemRarity_DEV
+description=Development build of Item Rarity.
 author=Natan
-modversion=1.0.0
-versionMin=42.20.2
+modversion=1.0.0-dev
+versionMin=42.20.0
 poster=poster.png
 icon=poster.png

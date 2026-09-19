@@ -548,8 +548,15 @@ local function runFullScan(source, force, performanceProfile)
     local utilityProfile = perfBegin("UtilityDispatch", 1, 0)
     ItemRarityUtilityCalculator.calculate(ItemRarityScanner.results)
     perfEnd(utilityProfile)
+    -- Keep independently valid, no-loot gameplay items outside Strategy D.
+    -- The augmentation is deliberately downstream from the complete normal
+    -- scan so no synthetic row can change loot-backed Scarcity or Utility.
+    local utilityOnlyProfile = perfBegin("UtilityOnlyAugmentation", 1, 0)
+    local utilityOnly = ItemRarityUtilityCalculator.augmentUtilityOnly(ItemRarityScanner.results)
+    perfEnd(utilityOnlyProfile)
     local availabilityCalculatedAt = getTimestampMs and getTimestampMs() or exposureBuiltAt
     ItemRarityScanner.summary = counters
+    counters.utilityOnly = utilityOnly
     ItemRarityScanner.hasScanned = true
 
     local vanilla, modded = 0, 0
@@ -613,6 +620,20 @@ local function runFullScan(source, force, performanceProfile)
     ItemRarityUtils.info(string.format("Performance: route collection=%dms | table scan=%dms | exposure=%dms | availability=%dms | total=%dms.",
         counters.performance.routeCollectionMs, counters.performance.tableScanMs, counters.performance.exposureAnalysisMs,
         counters.performance.availabilityCalculationMs, counters.performance.totalMs))
+    local lootBackedRows, utilityOnlyRows, utilityOnlyOtherKinds = 0, 0, 0
+    for _, data in pairs(ItemRarityScanner.results) do
+        if data.source == "UTILITY_ONLY" then
+            utilityOnlyRows = utilityOnlyRows + 1
+            if data.utilityKind ~= "FIREARM" and data.utilityKind ~= "FISH" then utilityOnlyOtherKinds = utilityOnlyOtherKinds + 1 end
+        else
+            lootBackedRows = lootBackedRows + 1
+        end
+    end
+    ItemRarityUtils.info(string.format(
+        "Utility-only coverage | LOOT_BACKED=%d | UTILITY_ONLY=%d | FIREARM=%d | FISH=%d | Scarcity-present=%d | RouteWeighted=%d | other-Utility=%d.",
+        lootBackedRows, utilityOnlyRows, utilityOnly.firearm or 0, utilityOnly.fish or 0,
+        utilityOnly.withScarcity or 0, utilityOnly.routeWeighted or 0, utilityOnlyOtherKinds
+    ))
     if counters.malformedEntries > 0 then ItemRarityUtils.warn("Skipped " .. counters.malformedEntries .. " malformed item/weight pairs.") end
     local registryProfile = perfBegin("RegistryPublish", 1, counters.itemTypes)
     ItemRarityRegistryPublisher.publish(ItemRarityScanner.results)

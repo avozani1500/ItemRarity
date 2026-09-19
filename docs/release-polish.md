@@ -65,13 +65,15 @@ should be changed.
 - `42.20/` and `common/` runtime media;
 - `42.20/mod.info` and `42.20/poster.png`;
 - required `Translate/EN` and `Translate/PTBR` JSON resources;
-- optional release-facing `README.md`, `CHANGELOG.md`, and selected `docs/`.
+- release-facing `README.md` and `CHANGELOG.md`.
 
 **Do not package**
 
 - `.git/`, `.codex/`, editor/IDE folders and local backups;
 - `Zomboid/Lua/ItemRarity_*.txt` or `ItemRarity_*.tsv` reports;
 - generated snapshots, profiler output, dumps and temporary files;
+- the `ItemRarity/Diagnostics/` source folder and diagnostic/reload command
+  handlers; they remain available in the development repository only;
 - development source outside the B42 package roots, unless a separate
   development-source archive is intentionally published.
 

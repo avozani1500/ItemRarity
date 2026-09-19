@@ -243,6 +243,59 @@ function ItemRarity.writeToolUtilityAudit()
     return nil, message
 end
 
+-- Explicit, read-only FirearmUtility audit for the current SHOTGUN family.
+-- The client forwards the request to the host; no scan or registry mutation
+-- can occur through this diagnostic path.
+function ItemRarity.writeShotgunUtilityAudit()
+    if ItemRarityShotgunUtilityAudit and type(ItemRarityShotgunUtilityAudit.write) == "function" and ItemRarityScanner then
+        return ItemRarityShotgunUtilityAudit.write(ItemRarityScanner.results)
+    end
+    if sendClientCommand then
+        sendClientCommand("ItemRarity", "shotgunUtilityAudit", {})
+        local message = "ItemRarity SHOTGUN Utility audit requested from the client; waiting for the host report."
+        if ItemRarityUtils and ItemRarityUtils.info then ItemRarityUtils.info(message) else print(message) end
+        return true, message
+    end
+    local message = "ItemRarity SHOTGUN Utility audit is unavailable: this Lua context cannot reach the host scanner."
+    if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+    return nil, message
+end
+
+-- Explicit coverage audit for firearms that exist in ScriptManager but may be
+-- absent from final loot distributions. It is diagnostic-only: no scan,
+-- candidate, Utility, registry or tier state is changed.
+function ItemRarity.writeFirearmCoverageAudit()
+    if ItemRarityFirearmCoverageAudit and type(ItemRarityFirearmCoverageAudit.write) == "function" and ItemRarityScanner then
+        return ItemRarityFirearmCoverageAudit.write(ItemRarityScanner.results)
+    end
+    if sendClientCommand then
+        sendClientCommand("ItemRarity", "firearmCoverageAudit", {})
+        local message = "ItemRarity firearm coverage audit requested from the client; waiting for the host report."
+        if ItemRarityUtils and ItemRarityUtils.info then ItemRarityUtils.info(message) else print(message) end
+        return true, message
+    end
+    local message = "ItemRarity firearm coverage audit is unavailable: this Lua context cannot reach the host scanner."
+    if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+    return nil, message
+end
+
+-- Explicit global coverage simulation. It only calculates a temporary
+-- ScriptManager shadow universe, never scans loot tables or republishes data.
+function ItemRarity.writeScriptItemCoverageAudit()
+    if ItemRarityScriptItemCoverageAudit and type(ItemRarityScriptItemCoverageAudit.write) == "function" and ItemRarityScanner then
+        return ItemRarityScriptItemCoverageAudit.write(ItemRarityScanner.results)
+    end
+    if sendClientCommand then
+        sendClientCommand("ItemRarity", "scriptItemCoverageAudit", {})
+        local message = "ItemRarity global ScriptItem coverage audit requested from the client; waiting for the host report."
+        if ItemRarityUtils and ItemRarityUtils.info then ItemRarityUtils.info(message) else print(message) end
+        return true, message
+    end
+    local message = "ItemRarity global ScriptItem coverage audit is unavailable: this Lua context cannot reach the host scanner."
+    if ItemRarityUtils and ItemRarityUtils.warn then ItemRarityUtils.warn(message) else print(message) end
+    return nil, message
+end
+
 -- Reloads an explicitly permitted server-side diagnostic writer.  Normal
 -- ItemRarity runtime files remain intentionally outside this API; changing
 -- active pipeline code still requires the normal controlled validation flow.

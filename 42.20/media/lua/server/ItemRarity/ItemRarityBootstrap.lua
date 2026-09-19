@@ -121,6 +121,33 @@ if Events and Events.OnClientCommand then
             else
                 ItemRarityUtils.warn("ToolUtility audit did not expose a writer")
             end
+        elseif module == "ItemRarity" and command == "shotgunUtilityAudit" then
+            -- Explicit forensic report for already-published FirearmUtility
+            -- values. It has no scan, calculator or registry side effect.
+            require "ItemRarity/Diagnostics/ShotgunUtilityAudit"
+            if ItemRarityShotgunUtilityAudit and ItemRarityShotgunUtilityAudit.write then
+                ItemRarityShotgunUtilityAudit.write(ItemRarityScanner.results)
+            else
+                ItemRarityUtils.warn("SHOTGUN audit did not expose a writer")
+            end
+        elseif module == "ItemRarity" and command == "firearmCoverageAudit" then
+            -- Explicit forensic coverage report. It compares ScriptManager
+            -- firearms against existing results only; no pipeline stage is run.
+            require "ItemRarity/Diagnostics/FirearmCoverageAudit"
+            if ItemRarityFirearmCoverageAudit and ItemRarityFirearmCoverageAudit.write then
+                ItemRarityFirearmCoverageAudit.write(ItemRarityScanner.results)
+            else
+                ItemRarityUtils.warn("Firearm coverage audit did not expose a writer")
+            end
+        elseif module == "ItemRarity" and command == "scriptItemCoverageAudit" then
+            -- Expensive, explicit development-only shadow calculation. It has
+            -- no scanner, RouteWeighted, registry or tier publication path.
+            require "ItemRarity/Diagnostics/ScriptItemCoverageAudit"
+            if ItemRarityScriptItemCoverageAudit and ItemRarityScriptItemCoverageAudit.write then
+                ItemRarityScriptItemCoverageAudit.write(ItemRarityScanner.results)
+            else
+                ItemRarityUtils.warn("Global ScriptItem coverage audit did not expose a writer")
+            end
         elseif module == "ItemRarity" and command == "performanceProfile" then
             -- Explicit dev-only action. The profiler is not required by
             -- normal startup or rescan and writes one aggregate report only

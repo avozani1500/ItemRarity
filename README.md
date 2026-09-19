@@ -50,6 +50,15 @@ Scarcity uses the final loaded universe.  Several Utilities use a stable
 vanilla reference population so unusually strong modded items are evaluated
 against that reference rather than redefining it.
 
+Some valid gameplay items are created by transformation, world actions, or a
+mod override rather than appearing directly in a final loot distribution. They
+do not receive invented Scarcity. When a category has a complete, reliable
+Utility model, Item Rarity can publish a `UTILITY_ONLY` entry instead. Version
+1.0 applies this conservative path only to **Firearms** and **Fish**: their
+tiers come from their existing category Utility, with `Scarcity = UNKNOWN` and
+no RouteWeighted calculation. Other categories remain on their established
+fallback until their data is equally safe.
+
 ## UI options
 
 Open **Options > Mods > Item Rarity** to change client-only presentation:

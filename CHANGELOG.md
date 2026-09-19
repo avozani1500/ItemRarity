@@ -4,6 +4,27 @@
 
 First stable release for Project Zomboid Build 42.20.2.
 
+### Final Utility-only coverage
+
+- Added a conservative post-scan `UTILITY_ONLY` publication path for valid
+  gameplay items that have no direct final-loot row.
+- The path never invents Scarcity and skips RouteWeighted entirely.
+- Initial safe coverage is intentionally limited to fully calculable
+  **Firearms** and **Fish**; other Utilities remain loot-backed or on their
+  existing conservative fallback.
+- Stabilized transient firearm discovery within a loaded session so mod
+  `OnCreate` behavior cannot make repeated rescans change a published firearm
+  profile.
+
+### Final validation reference
+
+- Validated loaded-universe baseline:
+  `354281:1115296468:592415885`.
+- Published registry in that validation: `3660` entries — `3646` loot-backed
+  plus `14` safe `UTILITY_ONLY` entries (`12` Firearms, `2` Fish).
+- Consecutive manual rescans returned `MATCH`. The baseline is a validation
+  reference for that loaded mod set, not a universal count for every setup.
+
 ### ClothingUtility V2 closure
 
 - Corrected structural Clothing/Accessory classification so bodywear no longer

@@ -8,6 +8,16 @@ require "ItemRarity/RarityUtils"
 -- scarcity tier; `finalRarityTier` is the UI-facing result of the hybrid model.
 ItemRarityUtilityCalculator = ItemRarityUtilityCalculator or {}
 
+-- A ScriptItem declaration is immutable for a loaded mod set.  Keep only the
+-- raw, complete Firearm V1 discovery result for the life of this Lua runtime:
+-- a few weapon mods implement Item.OnCreate as a random spawner selector, and
+-- rebuilding their transient InventoryItem on every rescan can make the same
+-- ScriptItem report a different combat profile.  This is deliberately not a
+-- scored-result cache: normalization, scarcity, final tiers and registry
+-- publication are still recomputed on every scan from the current results.
+ItemRarityUtilityCalculator.runtimeFirearmCandidateCache =
+    ItemRarityUtilityCalculator.runtimeFirearmCandidateCache or {}
+
 local UTILITY = ItemRarityConfig.utility
 local NORMALIZATION = UTILITY.normalization
 local TIER_STRENGTH = { "COMMON", "UNCOMMON", "RARE", "EPIC", "EXOTIC" }
@@ -1187,8 +1197,15 @@ local function firearmFamily(fireMode, ammoType, attachmentType, maxRange)
     return "LONG_GUN"
 end
 
-local function makeFirearmCandidate(data, scriptItem)
-    local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
+local function makeFirearmCandidate(data, scriptItem, allowRuntimeInstance)
+    -- Utility-only discovery must not run ScriptItem.OnCreate.  Some mods use
+    -- that callback as a random loot-spawner selector, so constructing a
+    -- transient InventoryItem during a rescan can mutate the mod's own
+    -- selection state.  The complete Firearm V1 attribute set is also
+    -- available from ScriptItem, therefore the isolated no-loot path passes
+    -- false and reads only static declarations.  The normal scan keeps its
+    -- established runtime-assisted discovery behaviour.
+    local runtimeItem = allowRuntimeInstance == false and nil or createDiscoveryRuntimeItem(scriptItem)
     local ranged = readBoolean(runtimeItem, "isRanged", "ranged") or readBoolean(scriptItem, "isRanged", "ranged")
     local weaponScript = contains(string.lower(tostring(data.scriptType or "")), "weapon")
     local ammoType = firearmString(runtimeItem, scriptItem, { "getAmmoType" }, { "ammoType" })
@@ -1250,6 +1267,38 @@ local function makeFirearmCandidate(data, scriptItem)
         config = UTILITY.firearm,
         utilityScoreVersion = UTILITY.firearm.utilityVersion,
     }
+end
+
+local function firearmCandidateTemplate(candidate)
+    if not candidate or candidate.kind ~= "FIREARM" or not candidate.utilityEligible then return nil end
+    local template = {}
+    for key, value in pairs(candidate) do
+        if key ~= "data" and key ~= "metrics" then template[key] = value end
+    end
+    template.metrics = {}
+    for key, value in pairs(candidate.metrics or {}) do template.metrics[key] = value end
+    return template
+end
+
+local function cacheFirearmCandidate(candidate)
+    local fullType = candidate and candidate.data and candidate.data.fullType
+    local template = firearmCandidateTemplate(candidate)
+    if fullType and template then
+        ItemRarityUtilityCalculator.runtimeFirearmCandidateCache[fullType] = template
+    end
+end
+
+local function cachedFirearmCandidate(data)
+    local template = data and ItemRarityUtilityCalculator.runtimeFirearmCandidateCache[data.fullType]
+    if not template then return nil end
+    local candidate = {}
+    for key, value in pairs(template) do
+        if key ~= "metrics" then candidate[key] = value end
+    end
+    candidate.data = data
+    candidate.metrics = {}
+    for key, value in pairs(template.metrics or {}) do candidate.metrics[key] = value end
+    return candidate
 end
 
 -- Magazine eligibility is structural: the script must declare both its ammo
@@ -1627,6 +1676,35 @@ local function candidateFor(data)
     if not scriptItem then
         return finish({ data = data, utilityEligible = false, ineligibleReason = "ScriptItem is unavailable" })
     end
+    -- Reuse only a complete raw firearm profile.  The returned candidate is a
+    -- fresh Lua table, so every pass is still free to attach its own score,
+    -- normalization and final-tier fields without contaminating a later scan.
+    local cachedFirearm = cachedFirearmCandidate(data)
+    if cachedFirearm then return finish(cachedFirearm) end
+    -- Firearm V1's complete contract is declared by ScriptItem.  Resolve that
+    -- contract before generic builders instantiate a weapon only to reject it
+    -- as Medical/LightFire/Literature/etc.  Besides redundant work, an
+    -- InstanceItem call is allowed to execute a mod's OnCreate callback; some
+    -- generic weapon spawners use that callback to choose a random replacement.
+    --
+    -- An explicitly declared light/fire signal retains the established earlier
+    -- LightFire precedence.  All other proven firearms are therefore read
+    -- from static metadata only, keeping a scan observational and repeatable.
+    local firearmTags = string.lower(tostring(readString(scriptItem, "getTags", "tags") or ""))
+    local hasDeclaredLightFire = (readNumber(scriptItem, "getLightStrength", "lightStrength", 0) or 0) > 0
+        or (readNumber(scriptItem, "getLightDistance", "lightDistance", 0) or 0) > 0
+        or contains(firearmTags, "base:startfire")
+    local firearmScriptType = string.lower(tostring(data.scriptType or readString(scriptItem, "getType", "type") or ""))
+    local firearmItemType = string.lower(tostring(readString(scriptItem, "getItemType", "itemType") or ""))
+    local canPossiblyBeFirearm = readBoolean(scriptItem, "isRanged", "ranged")
+        or contains(firearmScriptType, "weapon") or contains(firearmItemType, "weapon")
+    if canPossiblyBeFirearm and not hasDeclaredLightFire then
+        local staticFirearm = makeFirearmCandidate(data, scriptItem, false)
+        if staticFirearm and staticFirearm.utilityEligible then
+            cacheFirearmCandidate(staticFirearm)
+            return finish(staticFirearm)
+        end
+    end
     local medical = attemptCandidateBuilder("makeMedicalCandidate", makeMedicalCandidate, data, scriptItem)
     if medical then return finish(medical) end
     local fish = attemptCandidateBuilder("makeFishCandidate", makeFishCandidate, data, scriptItem)
@@ -1649,7 +1727,10 @@ local function candidateFor(data)
     -- approved firearm reference population although they are not tagged as
     -- WEAPON/TOOL by the generic classifier.
     local firearm = attemptCandidateBuilder("makeFirearmCandidate", makeFirearmCandidate, data, scriptItem)
-    if firearm then return finish(firearm) end
+    if firearm then
+        cacheFirearmCandidate(firearm)
+        return finish(firearm)
+    end
     -- A firearm can also declare GunType and MaxAmmo, so it must be resolved
     -- first.  Only the remaining compatible-ammo scripts are magazines.
     local magazine = attemptCandidateBuilder("makeMagazineCandidate", makeMagazineCandidate, data, scriptItem)
@@ -4673,6 +4754,211 @@ function ItemRarityUtilityCalculator.calculate(results)
     for _, data in pairs(results) do data._scriptItem = nil end
     ItemRarityUtilityCalculator._scanBodyLocationGraphs = nil
     return results
+end
+
+-- This is intentionally limited to the two complete models approved for
+-- independent gameplay items.  It uses a temporary, structural-only
+-- reference population and never passes a synthetic row through the active
+-- TableAvailability/RouteWeighted pipeline.
+function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
+    -- Keep the helpers local to this isolated augmentation function. Kahlua
+    -- enforces a 200-local limit per compiled chunk, while UtilityCalculator
+    -- intentionally already contains the mature runtime formulas.
+    local function fullTypeFor(scriptItem)
+        local fullType = callMethod(scriptItem, "getFullName") or callMethod(scriptItem, "getFullType")
+        if fullType and tostring(fullType) ~= "" then return tostring(fullType) end
+        local module = callMethod(scriptItem, "getModuleName") or callMethod(scriptItem, "getModule")
+        local name = callMethod(scriptItem, "getName")
+        return module and name and tostring(module) .. "." .. tostring(name) or nil
+    end
+    local function allScriptItems()
+        local manager = getScriptManager and getScriptManager() or nil
+        if not manager then return {} end
+        local collection = callMethod(manager, "getAllItems")
+            or callMethod(manager, "getAllScriptItems")
+            or callMethod(manager, "getItems")
+        if not collection then return {} end
+        local scripts, seen = {}, {}
+        local function append(scriptItem)
+            local fullType = fullTypeFor(scriptItem)
+            if fullType and not seen[fullType] then seen[fullType] = true; table.insert(scripts, scriptItem) end
+        end
+        if type(collection) == "table" then
+            for _, scriptItem in pairs(collection) do append(scriptItem) end
+        else
+            local size = tonumber(callMethod(collection, "size") or callMethod(collection, "getSize")) or 0
+            for index = 0, size - 1 do append(callMethodWithArgs(collection, "get", index)) end
+        end
+        return scripts
+    end
+    local function potentialFirearm(scriptItem)
+        local scriptType = string.lower(tostring(readString(scriptItem, "getType", "type") or ""))
+        local itemType = string.lower(tostring(readString(scriptItem, "getItemType", "itemType") or ""))
+        local ranged = readBoolean(scriptItem, "isRanged", "ranged")
+        -- This is intentionally only an inexpensive admission gate.  The
+        -- static Firearm candidate below remains the strict authority for an
+        -- ammo mechanism and complete combat attributes.  Unlike the prior
+        -- CandidateDiscovery call, this path never constructs an item and
+        -- therefore cannot execute mod OnCreate callbacks.
+        return ranged or contains(scriptType, "weapon") or contains(itemType, "weapon")
+    end
+    local function fishFullTypes()
+        local fish = {}
+        for _, configuration in ipairs(fishingConfigurations() or {}) do
+            if configuration.isHaveDifferentSizes ~= false and configuration.itemType then fish[tostring(configuration.itemType)] = true end
+        end
+        return fish
+    end
+    local function scratchData(fullType, scriptItem)
+        return {
+            fullType = fullType, module = ItemRarityItemClassifier.getModule(fullType),
+            scriptType = readString(scriptItem, "getType", "type"),
+            displayCategory = readString(scriptItem, "getDisplayCategory", "displayCategory"),
+            category = "UNKNOWN", _scriptItem = scriptItem,
+        }
+    end
+    local function lootBackedFirearmReference(data)
+        -- The normal pass has already built and published these immutable
+        -- firearm metrics. Reuse them in the temporary reference population
+        -- instead of creating a second runtime InventoryItem for the same
+        -- loot-backed script during this augmentation.
+        return {
+            data = { fullType = data.fullType },
+            kind = "FIREARM",
+            subgroup = data.utilitySubgroup,
+            functionalGroup = data.utilityFunctionalGroup,
+            metrics = data.utilityMetrics,
+            profile = data.utilityProfile,
+            utilityEligible = true,
+        }
+    end
+    local function directTier(candidate)
+        if candidate.kind == "FIREARM" then
+            local combined = tonumber(candidate.firearmCombinedScore)
+            if combined == nil then return nil end
+            -- FirearmUtility normally blends a small Scarcity refinement. This
+            -- route has UNKNOWN scarcity, so CombinedFirearmScore owns its tier.
+            candidate.utility, candidate.firearmScarcityStrength = combined, nil
+            candidate.firearmFinalScore, candidate.firearmFinalTier = combined, firearmFinalTier(combined)
+            return candidate.firearmFinalTier
+        end
+        return candidate.kind == "FISH" and candidate.fishFinalTier or nil
+    end
+    local function makeSynthetic(candidate, tier)
+        local fullType = candidate.data.fullType
+        local category, metadata = ItemRarityItemClassifier.getFunctionalCategory(fullType)
+        local data = candidate.data
+        data.module, data.category = metadata.module or data.module, category
+        data.displayCategory = metadata.displayCategory or data.displayCategory
+        data.scriptType, data._scriptItem = metadata.scriptType or data.scriptType, nil
+        data.occurrences, data.proceduralOccurrences, data.staticOccurrences = 0, 0, 0
+        data.occurrencesData, data.distributions, data.distributionSet = {}, {}, {}
+        data.lootClassification, data.source, data.utilityOnly = "UTILITY_ONLY", "UTILITY_ONLY", true
+        data.scarcityState, data.hasLootRoute, data.routeWeighted = "UNKNOWN", false, "SKIPPED"
+        data.tableAvailability = { routeWeighted = "SKIPPED" }
+        -- No base tier, percentile or scarcity strength is fabricated here.
+        data.rarityTier, data.baseScarcityTier, data.scarcityPercentile = nil, nil, nil
+        data.finalRarityTier = tier
+        return data
+    end
+    local statistics = {
+        scannedScripts = 0,
+        referenceCandidates = 0,
+        referenceLootBacked = 0,
+        total = 0,
+        firearm = 0,
+        fish = 0,
+        withScarcity = 0,
+        routeWeighted = 0,
+        otherUtility = 0,
+        entries = {},
+    }
+    if not UTILITY.enabled or type(results) ~= "table" then return statistics end
+
+    local fishTypes = fishFullTypes()
+    local candidates = {}
+    for _, data in pairs(results) do
+        if data.utilityKind == "FIREARM" and data.utilityEligible
+            and data.utilityMetrics and data.utilityProfile and data.utilitySubgroup then
+            table.insert(candidates, lootBackedFirearmReference(data))
+            statistics.referenceLootBacked = statistics.referenceLootBacked + 1
+        end
+    end
+    for _, scriptItem in ipairs(allScriptItems()) do
+        statistics.scannedScripts = statistics.scannedScripts + 1
+        local fullType = fullTypeFor(scriptItem)
+        -- Existing loot-backed firearms are already represented above. The
+        -- no-loot path intentionally reads only structural declarations: a
+        -- generic candidateFor call would instantiate every incompatible
+        -- builder and can execute third-party OnCreate callbacks.
+        if fullType and not results[fullType] and (fishTypes[fullType] or potentialFirearm(scriptItem)) then
+            local data = scratchData(fullType, scriptItem)
+            local candidate = fishTypes[fullType]
+                and makeFishCandidate(data, scriptItem)
+                or makeFirearmCandidate(data, scriptItem, false)
+            -- This remains restricted to the two explicitly approved complete
+            -- models. A static weapon-shaped script still needs the full
+            -- ranged/ammo/attribute proof from makeFirearmCandidate.
+            if candidate and candidate.utilityEligible
+                and (candidate.kind == "FIREARM" or candidate.kind == "FISH") then
+                table.insert(candidates, candidate)
+            end
+        end
+    end
+    table.sort(candidates, function(a, b) return a.data.fullType < b.data.fullType end)
+    statistics.referenceCandidates = #candidates
+
+    -- Preserve this diagnostic-only cache from the normal scan.  Rebuilding
+    -- the temporary firearm reference set must never change the public
+    -- calculator state or the already-scored loot-backed entries.
+    local savedBounds = ItemRarityUtilityCalculator.lastFirearmNormalizationBounds
+    scoreFirearmUtility(candidates)
+    scoreFishUtility(candidates)
+    ItemRarityUtilityCalculator.lastFirearmNormalizationBounds = savedBounds
+
+    for _, candidate in ipairs(candidates) do
+        local fullType = candidate.data.fullType
+        if results[fullType] then
+            -- Reference only. The active loot-backed row was scored solely by
+            -- the normal pipeline before this augmentation began.
+        else
+            local tier = directTier(candidate)
+            if tier then
+                local data = makeSynthetic(candidate, tier)
+                publishCandidateFields({ candidate })
+                -- publishCandidateFields intentionally only transports the
+                -- Utility fields. Restore the no-Scarcity invariants after it
+                -- has copied the candidate's computed attributes.
+                data.source = "UTILITY_ONLY"
+                data.utilityOnly = true
+                data.scarcityState = "UNKNOWN"
+                data.hasLootRoute = false
+                data.routeWeighted = "SKIPPED"
+                data.tableAvailability = { routeWeighted = "SKIPPED" }
+                data.rarityTier = nil
+                data.baseScarcityTier = nil
+                data.scarcityPercentile = nil
+                data.finalRarityTier = tier
+                data.utilityAdjustmentReason = candidate.kind == "FIREARM"
+                    and "UTILITY_ONLY Firearm: CombinedFirearmScore direct tier; Scarcity UNKNOWN and RouteWeighted skipped"
+                    or "UTILITY_ONLY Fish: FishUtility V1 direct tier; Scarcity UNKNOWN and RouteWeighted skipped"
+                results[fullType] = data
+                statistics.total = statistics.total + 1
+                if candidate.kind == "FIREARM" then statistics.firearm = statistics.firearm + 1
+                elseif candidate.kind == "FISH" then statistics.fish = statistics.fish + 1
+                else statistics.otherUtility = statistics.otherUtility + 1 end
+                if data.scarcityPercentile ~= nil or data.baseScarcityTier ~= nil or data.rarityTier ~= nil then
+                    statistics.withScarcity = statistics.withScarcity + 1
+                end
+                if data.tableAvailability and data.tableAvailability.routeWeighted ~= "SKIPPED" then
+                    statistics.routeWeighted = statistics.routeWeighted + 1
+                end
+                table.insert(statistics.entries, fullType)
+            end
+        end
+    end
+    table.sort(statistics.entries)
+    return statistics
 end
 
 local function sortedKeys(map)

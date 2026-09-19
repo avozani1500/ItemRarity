@@ -25,6 +25,10 @@ local function copyEntry(data)
         utilityParentPercentile = data.utilityParentPercentile,
         utilitySampleClass = data.utilitySampleClass,
         utilityAdjustmentReason = data.utilityAdjustmentReason,
+        source = data.source or "LOOT",
+        scarcityState = data.scarcityState or "KNOWN",
+        hasLootRoute = data.hasLootRoute ~= false,
+        routeWeighted = data.routeWeighted or score.routeWeighted,
         clothingMechanicalValue = data.clothingMechanicalValue,
         clothingMechanicalValueStatus = data.clothingMechanicalValueStatus,
         clothingMechanicalBaseBenefit = data.clothingMechanicalBaseBenefit,
@@ -81,7 +85,10 @@ function ItemRarityRegistryPublisher.publish(results)
         count = count + 1
         if data.utilityEligible then summary.eligible = summary.eligible + 1 end
         if data.utilityEligible and data.utilityProfile then summary.profiles[(data.utilityKind or "UNKNOWN") .. ":" .. data.utilityProfile] = true end
-        if data.finalRarityTier ~= data.rarityTier then
+        -- Utility-only entries deliberately have no base Scarcity tier. They
+        -- are not promotions/demotions of loot rows and must not be counted as
+        -- though a synthetic COMMON tier existed.
+        if data.rarityTier ~= nil and data.finalRarityTier ~= data.rarityTier then
             local finalIndex = ({ COMMON = 1, UNCOMMON = 2, RARE = 3, EPIC = 4, EXOTIC = 5 })[data.finalRarityTier] or 0
             local baseIndex = ({ COMMON = 1, UNCOMMON = 2, RARE = 3, EPIC = 4, EXOTIC = 5 })[data.rarityTier] or 0
             if finalIndex > baseIndex then
