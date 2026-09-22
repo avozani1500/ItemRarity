@@ -624,14 +624,14 @@ local function runFullScan(source, force, performanceProfile)
     for _, data in pairs(ItemRarityScanner.results) do
         if data.source == "UTILITY_ONLY" then
             utilityOnlyRows = utilityOnlyRows + 1
-            if data.utilityKind ~= "FIREARM" and data.utilityKind ~= "FISH" then utilityOnlyOtherKinds = utilityOnlyOtherKinds + 1 end
+            if data.utilityKind ~= "FIREARM" and data.utilityKind ~= "FISH" and data.utilityKind ~= "AMMO" then utilityOnlyOtherKinds = utilityOnlyOtherKinds + 1 end
         else
             lootBackedRows = lootBackedRows + 1
         end
     end
     ItemRarityUtils.info(string.format(
-        "Utility-only coverage | LOOT_BACKED=%d | UTILITY_ONLY=%d | FIREARM=%d | FISH=%d | Scarcity-present=%d | RouteWeighted=%d | other-Utility=%d.",
-        lootBackedRows, utilityOnlyRows, utilityOnly.firearm or 0, utilityOnly.fish or 0,
+        "Utility-only coverage | LOOT_BACKED=%d | UTILITY_ONLY=%d | FIREARM=%d | FISH=%d | AMMO=%d | Scarcity-present=%d | RouteWeighted=%d | other-Utility=%d.",
+        lootBackedRows, utilityOnlyRows, utilityOnly.firearm or 0, utilityOnly.fish or 0, utilityOnly.ammo or 0,
         utilityOnly.withScarcity or 0, utilityOnly.routeWeighted or 0, utilityOnlyOtherKinds
     ))
     if counters.malformedEntries > 0 then ItemRarityUtils.warn("Skipped " .. counters.malformedEntries .. " malformed item/weight pairs.") end

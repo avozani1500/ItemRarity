@@ -2,13 +2,16 @@ if isServer() then return end
 
 require "ItemRarity/RarityAPI"
 require "ItemRarity/RarityConfig"
+require "ItemRarity/RarityUIOptions"
 
 -- Presentation-only helpers. UI callers resolve fullType through the
 -- published registry and never infer, calculate, or alter a rarity tier.
 ItemRarityPresentation = ItemRarityPresentation or {}
 
 function ItemRarityPresentation.getRarityVisual(tier)
-    return tier and ItemRarity.getVisual(tier) or nil
+    local baseVisual = tier and ItemRarity.getVisual(tier) or nil
+    if not baseVisual then return nil end
+    return ItemRarityUIOptions.getVisual(tier, baseVisual)
 end
 
 function ItemRarityPresentation.getItemRarity(item)
@@ -22,6 +25,10 @@ function ItemRarityPresentation.getRarityColor(tier)
     return visual and visual.color or nil
 end
 
+function ItemRarityPresentation.getBorderAlpha(tier, defaultAlpha)
+    return ItemRarityUIOptions.getBorderAlpha(defaultAlpha)
+end
+
 function ItemRarityPresentation.drawRarityBorder(panel, tier, x, y, width, height)
     if not panel or tier == "COMMON" then return end
     local color = ItemRarityPresentation.getRarityColor(tier)
@@ -31,7 +38,8 @@ function ItemRarityPresentation.drawRarityBorder(panel, tier, x, y, width, heigh
     if effect and effect.glowAlpha then
         panel:drawRectBorder(x + 1, y + 1, width - 2, height - 2, effect.glowAlpha, color.r, color.g, color.b)
     end
-    panel:drawRectBorder(x, y, width, height, effect and effect.borderAlpha or 0.70, color.r, color.g, color.b)
+    panel:drawRectBorder(x, y, width, height,
+        ItemRarityPresentation.getBorderAlpha(tier, effect and effect.borderAlpha or 0.70), color.r, color.g, color.b)
 end
 
 function ItemRarityPresentation.drawRarityLabel(panel, tier, x, y, font)

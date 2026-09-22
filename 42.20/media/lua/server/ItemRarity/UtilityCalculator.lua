@@ -1324,29 +1324,37 @@ local function makeMagazineCandidate(data, scriptItem)
     }
 end
 
--- Direct ammunition has no independent combat value.  B42 exposes it as a
--- non-container `base:ammo` script item; its family is resolved generically
--- against the ammunition family declared by firearm scripts.  Opening boxes,
--- ammo straps and ammo bags are excluded because they either transform via a
--- recipe or expose container capacity.
-local function ammoFamilyKey(value)
-    local key = string.lower(tostring(value or "")):gsub("[^%w]", "")
-    return key:gsub("base", ""):gsub("bullets", ""):gsub("ammo", "")
+-- AmmoType is the declared compatibility key shared by direct ammunition and
+-- firearms. Keep its spelling intact: punctuation is part of a mod's key, so
+-- this intentionally performs only bridge-sentinel and surrounding-space
+-- normalization rather than deriving an identity from a fullType.
+local function canonicalAmmoType(value)
+    local key = tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    local sentinel = string.lower(key)
+    if sentinel == "" or sentinel == "nil" or sentinel == "null" or sentinel == "[]" then return "" end
+    return key
 end
 
 local function makeAmmoCandidate(data, scriptItem)
+    -- Direct ammo has no container, opening transform, GunType or weapon-part
+    -- declaration. Magazine-like WeaponParts remain outside this route even
+    -- when a mod gives them an AmmoType.
     local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local tags = string.lower(readString(scriptItem, "getTags", nil) or readString(runtimeItem, "getTags", nil) or "")
     local capacity = readNumber(runtimeItem, "getCapacity", nil, 0) or 0
     local openingRecipe = firearmString(runtimeItem, scriptItem, { "getDoubleClickRecipe" }, { "doubleClickRecipe" })
+    local gunType = firearmString(runtimeItem, scriptItem, { "getGunType" }, { "gunType" })
+    local partType = firearmString(runtimeItem, scriptItem, { "getPartType" }, { "partType" })
+    local weaponPartType = firearmString(runtimeItem, scriptItem, { "getWeaponPartType" }, { "weaponPartType" })
     if string.lower(tostring(openingRecipe)) == "null" or string.lower(tostring(openingRecipe)) == "nil" then openingRecipe = "" end
     local weaponScript = contains(string.lower(tostring(data.scriptType or "")), "weapon")
-    if weaponScript or not contains(tags, "base:ammo") or capacity > 0 or openingRecipe ~= "" then return nil end
-    local familyKey = ammoFamilyKey(data.fullType)
-    if familyKey == "" then return nil end
+    if weaponScript or not contains(tags, "base:ammo") or capacity > 0 or openingRecipe ~= ""
+        or gunType ~= "" or partType ~= "" or weaponPartType ~= "" then return nil end
+    local ammoType = canonicalAmmoType(firearmString(runtimeItem, scriptItem, { "getAmmoType" }, { "ammoType" }))
+    if ammoType == "" then return nil end
     return {
         data = data, kind = "AMMO", subgroup = "DIRECT_AMMO", functionalGroup = "DIRECT_AMMO",
-        metrics = { familyKey = familyKey }, profile = "AMMO:DIRECT:" .. familyKey,
+        metrics = { ammoType = ammoType }, profile = "AMMO:DIRECT:" .. ammoType,
         utilityEligible = true, utilityConfidence = "HIGH", validAttributeCount = 2,
         essentialsPresent = true, utilityScoreVersion = "V1_HIGHEST_COMPATIBLE_FIREARM_TIER",
     }
@@ -1877,7 +1885,7 @@ end
 -- Active ContainerUtility V2.  Unlike the retired generic wearable-container
 -- pass, every safe structural group is scored against only its vanilla
 -- mechanical profiles.  Mods are members, never reference points.
-local function scoreContainerV2(candidates)
+local function scoreContainerV2(candidates, auditObserver)
     local groups = {}
     for _, candidate in ipairs(candidates) do
         if candidate.kind == "CONTAINER" and candidate.utilityEligible and candidate.containerV2Group then
@@ -1935,6 +1943,11 @@ local function scoreContainerV2(candidates)
                     if rank and value ~= nil then
                         local percentile = percentileRank(rank.values, clamp(value, rank.low, rank.high), candidate.directions[metricName])
                         candidate.metricPercentiles[metricName] = percentile
+                        -- The observer is development-only and supplied only
+                        -- by the explicit Container V2 audit. It records the
+                        -- exact operands before the active multiplication;
+                        -- normal scans pass nil and retain the original path.
+                        if auditObserver then auditObserver(candidate, metricName, value, rank, percentile, weight) end
                         numerator, denominator, valid = numerator + percentile * weight, denominator + weight, valid + 1
                     end
                 end
@@ -2309,21 +2322,22 @@ local function scoreMagazineUtility(candidates)
 end
 
 -- AmmoUtility intentionally has no score: direct ammunition inherits the
--- strongest already-finalized firearm tier in its declared ammo family.
+-- strongest already-finalized firearm tier with the identical declared
+-- AmmoType. Never substitute a fullType-derived family for this link.
 local function scoreAmmoInheritance(candidates)
-    local firearmsByFamily = {}
+    local firearmsByAmmoType = {}
     for _, candidate in ipairs(candidates) do
         if candidate.kind == "FIREARM" and candidate.utilityEligible and candidate.firearmFinalTier then
-            local key = ammoFamilyKey(candidate.firearmAmmoType)
+            local key = canonicalAmmoType(candidate.firearmAmmoType)
             if key ~= "" then
-                firearmsByFamily[key] = firearmsByFamily[key] or {}
-                table.insert(firearmsByFamily[key], { fullType = candidate.data.fullType, tier = candidate.firearmFinalTier })
+                firearmsByAmmoType[key] = firearmsByAmmoType[key] or {}
+                table.insert(firearmsByAmmoType[key], { fullType = candidate.data.fullType, tier = candidate.firearmFinalTier })
             end
         end
     end
     for _, candidate in ipairs(candidates) do
         if candidate.kind == "AMMO" and candidate.utilityEligible then
-            local compatible = firearmsByFamily[candidate.metrics.familyKey] or {}
+            local compatible = firearmsByAmmoType[candidate.metrics.ammoType] or {}
             local bestTier, compatibleNames = nil, {}
             for _, firearm in ipairs(compatible) do
                 table.insert(compatibleNames, firearm.fullType)
@@ -4756,6 +4770,63 @@ function ItemRarityUtilityCalculator.calculate(results)
     return results
 end
 
+-- Explicit DEV-only forensic path for a reported ContainerUtility V2 error.
+-- It builds temporary candidates, scores one target alongside only the
+-- vanilla references of its own group, and never writes to scan rows or the
+-- registry.  The observer captures operands immediately before `percentile *
+-- weight` so an interop type error can be attributed to a concrete item.
+function ItemRarityUtilityCalculator.auditContainerV2(results)
+    local records, failures = {}, {}
+    for _, data in pairs(results or {}) do
+        if data.category == "CONTAINER" then
+            local ok, candidateOrError = pcall(function() return candidateFor(data) end)
+            if ok and candidateOrError and candidateOrError.kind == "CONTAINER" then
+                table.insert(records, { data = data, candidate = candidateOrError })
+            else
+                table.insert(failures, { data = data, stage = "CandidateDiscovery", error = ok and "Container candidate was not returned" or tostring(candidateOrError) })
+            end
+        end
+    end
+    table.sort(records, function(a, b) return tostring(a.data.fullType or "") < tostring(b.data.fullType or "") end)
+    local output = { total = #records + #failures, records = records, failures = failures,
+        staticMultiplications = { "scoreContainerV2: numerator + percentile * weight" } }
+    for _, target in ipairs(records) do
+        local candidate, groupName = target.candidate, target.candidate.containerV2Group
+        target.operands = {}
+        if candidate.utilityEligible and groupName then
+            local trial, included = {}, {}
+            for _, reference in ipairs(records) do
+                if reference.candidate.containerV2Group == groupName and tostring(reference.data.fullType or ""):match("^Base%.") then
+                    table.insert(trial, reference.candidate)
+                    included[reference.data.fullType] = true
+                end
+            end
+            if not included[target.data.fullType] then table.insert(trial, candidate) end
+            local lastOperand = nil
+            local function observe(observed, metricName, value, rank, percentile, weight)
+                if observed == candidate then
+                    lastOperand = {
+                        metric = metricName, value = value, valueType = type(value), low = rank and rank.low, lowType = type(rank and rank.low),
+                        high = rank and rank.high, highType = type(rank and rank.high), percentile = percentile,
+                        percentileType = type(percentile), weight = weight, weightType = type(weight),
+                    }
+                end
+            end
+            local ok, errorText = pcall(function() scoreContainerV2(trial, observe) end)
+            target.operands = lastOperand
+            if not ok then
+                target.failed = true
+                target.error = tostring(errorText)
+                target.probableExpression = "percentile * weight"
+                table.insert(failures, { data = target.data, candidate = candidate, stage = "scoreContainerV2", error = target.error, operand = lastOperand })
+            end
+        else
+            target.skipped = candidate.ineligibleReason or "deferred Container V2 group"
+        end
+    end
+    return output
+end
+
 -- This is intentionally limited to the two complete models approved for
 -- independent gameplay items.  It uses a temporary, structural-only
 -- reference population and never passes a synthetic row through the active
@@ -4802,6 +4873,13 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
         -- therefore cannot execute mod OnCreate callbacks.
         return ranged or contains(scriptType, "weapon") or contains(itemType, "weapon")
     end
+    local function potentialDirectAmmo(scriptItem)
+        -- This is only an admission gate. makeAmmoCandidate remains the
+        -- authority for excluding boxes, weapon scripts and containers.
+        local tags = string.lower(tostring(readString(scriptItem, "getTags", "tags") or ""))
+        local ammoType = canonicalAmmoType(firearmString(nil, scriptItem, { "getAmmoType" }, { "ammoType" }))
+        return contains(tags, "base:ammo") and ammoType ~= ""
+    end
     local function fishFullTypes()
         local fish = {}
         for _, configuration in ipairs(fishingConfigurations() or {}) do
@@ -4822,11 +4900,14 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
         -- firearm metrics. Reuse them in the temporary reference population
         -- instead of creating a second runtime InventoryItem for the same
         -- loot-backed script during this augmentation.
+        local manager = getScriptManager and getScriptManager() or nil
+        local scriptItem = manager and manager:FindItem(data.fullType) or nil
         return {
             data = { fullType = data.fullType },
             kind = "FIREARM",
             subgroup = data.utilitySubgroup,
             functionalGroup = data.utilityFunctionalGroup,
+            firearmAmmoType = canonicalAmmoType(firearmString(nil, scriptItem, { "getAmmoType" }, { "ammoType" })),
             metrics = data.utilityMetrics,
             profile = data.utilityProfile,
             utilityEligible = true,
@@ -4842,6 +4923,7 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
             candidate.firearmFinalScore, candidate.firearmFinalTier = combined, firearmFinalTier(combined)
             return candidate.firearmFinalTier
         end
+        if candidate.kind == "AMMO" then return candidate.ammoInheritedFirearmTier end
         return candidate.kind == "FISH" and candidate.fishFinalTier or nil
     end
     local function makeSynthetic(candidate, tier)
@@ -4868,6 +4950,7 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
         total = 0,
         firearm = 0,
         fish = 0,
+        ammo = 0,
         withScarcity = 0,
         routeWeighted = 0,
         otherUtility = 0,
@@ -4891,16 +4974,22 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
         -- no-loot path intentionally reads only structural declarations: a
         -- generic candidateFor call would instantiate every incompatible
         -- builder and can execute third-party OnCreate callbacks.
-        if fullType and not results[fullType] and (fishTypes[fullType] or potentialFirearm(scriptItem)) then
+        if fullType and not results[fullType] and (fishTypes[fullType] or potentialFirearm(scriptItem) or potentialDirectAmmo(scriptItem)) then
             local data = scratchData(fullType, scriptItem)
-            local candidate = fishTypes[fullType]
-                and makeFishCandidate(data, scriptItem)
-                or makeFirearmCandidate(data, scriptItem, false)
-            -- This remains restricted to the two explicitly approved complete
-            -- models. A static weapon-shaped script still needs the full
-            -- ranged/ammo/attribute proof from makeFirearmCandidate.
+            local candidate = nil
+            if fishTypes[fullType] then
+                candidate = makeFishCandidate(data, scriptItem)
+            elseif potentialFirearm(scriptItem) then
+                candidate = makeFirearmCandidate(data, scriptItem, false)
+            elseif potentialDirectAmmo(scriptItem) then
+                candidate = makeAmmoCandidate(data, scriptItem)
+            end
+            -- A static weapon-shaped script still needs the full
+            -- ranged/ammo/attribute proof from makeFirearmCandidate. Direct
+            -- ammo additionally needs the exact declared AmmoType link scored
+            -- below; boxes and magazine-like parts fail makeAmmoCandidate.
             if candidate and candidate.utilityEligible
-                and (candidate.kind == "FIREARM" or candidate.kind == "FISH") then
+                and (candidate.kind == "FIREARM" or candidate.kind == "FISH" or candidate.kind == "AMMO") then
                 table.insert(candidates, candidate)
             end
         end
@@ -4914,6 +5003,7 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
     local savedBounds = ItemRarityUtilityCalculator.lastFirearmNormalizationBounds
     scoreFirearmUtility(candidates)
     scoreFishUtility(candidates)
+    scoreAmmoInheritance(candidates)
     ItemRarityUtilityCalculator.lastFirearmNormalizationBounds = savedBounds
 
     for _, candidate in ipairs(candidates) do
@@ -4941,11 +5031,14 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
                 data.finalRarityTier = tier
                 data.utilityAdjustmentReason = candidate.kind == "FIREARM"
                     and "UTILITY_ONLY Firearm: CombinedFirearmScore direct tier; Scarcity UNKNOWN and RouteWeighted skipped"
-                    or "UTILITY_ONLY Fish: FishUtility V1 direct tier; Scarcity UNKNOWN and RouteWeighted skipped"
+                    or candidate.kind == "FISH"
+                    and "UTILITY_ONLY Fish: FishUtility V1 direct tier; Scarcity UNKNOWN and RouteWeighted skipped"
+                    or "UTILITY_ONLY Ammo: inherited exact AmmoType firearm tier; Scarcity UNKNOWN and RouteWeighted skipped"
                 results[fullType] = data
                 statistics.total = statistics.total + 1
                 if candidate.kind == "FIREARM" then statistics.firearm = statistics.firearm + 1
                 elseif candidate.kind == "FISH" then statistics.fish = statistics.fish + 1
+                elseif candidate.kind == "AMMO" then statistics.ammo = statistics.ammo + 1
                 else statistics.otherUtility = statistics.otherUtility + 1 end
                 if data.scarcityPercentile ~= nil or data.baseScarcityTier ~= nil or data.rarityTier ~= nil then
                     statistics.withScarcity = statistics.withScarcity + 1

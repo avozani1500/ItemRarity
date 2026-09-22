@@ -63,7 +63,7 @@ local function drawRaritySlots(hotbar)
                 local color = visual.color
                 local effect = ItemRarityConfig.visualEffects and ItemRarityConfig.visualEffects[tier]
                 hotbar:drawRectBorderStatic(slotX, slotY, slotWidth, slotHeight,
-                    effect and effect.borderAlpha or 0.70, color.r, color.g, color.b)
+                    ItemRarityPresentation.getBorderAlpha(tier, effect and effect.borderAlpha or 0.70), color.r, color.g, color.b)
                 -- Clean Hot Bar puts the slot number at the lower edge. Keep
                 -- its marker tiny and at the upper-left corner instead; the
                 -- vanilla fallback preserves the existing lower marker.

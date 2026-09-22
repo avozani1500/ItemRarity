@@ -148,6 +148,16 @@ if Events and Events.OnClientCommand then
             else
                 ItemRarityUtils.warn("Global ScriptItem coverage audit did not expose a writer")
             end
+        elseif module == "ItemRarity" and command == "ammoMagazineCoverageAudit" then
+            -- Explicit forensic shadow calculation for no-result ammunition,
+            -- magazines, boxes and magazine-shaped WeaponParts. It never
+            -- scans, publishes, or changes the active registry.
+            require "ItemRarity/Diagnostics/AmmoMagazineCoverageAudit"
+            if ItemRarityAmmoMagazineCoverageAudit and ItemRarityAmmoMagazineCoverageAudit.write then
+                ItemRarityAmmoMagazineCoverageAudit.write(ItemRarityScanner.results)
+            else
+                ItemRarityUtils.warn("Ammo/Magazine coverage audit did not expose a writer")
+            end
         elseif module == "ItemRarity" and command == "performanceProfile" then
             -- Explicit dev-only action. The profiler is not required by
             -- normal startup or rescan and writes one aggregate report only
@@ -164,6 +174,25 @@ if Events and Events.OnClientCommand then
                 ItemRarityGameplayAnomalyAudit.write(ItemRarityScanner.results)
             else
                 ItemRarityUtils.warn("Gameplay anomaly audit did not expose a writer")
+            end
+        elseif module == "ItemRarity" and command == "containerV3Simulation" then
+            -- Explicit dev-only structural simulation. It reads completed scan
+            -- data and writes a report, but never invokes a scan or changes
+            -- active ContainerUtility V2 behavior.
+            require "ItemRarity/Diagnostics/ContainerV3Simulation"
+            if ItemRarityContainerV3Simulation and ItemRarityContainerV3Simulation.write then
+                ItemRarityContainerV3Simulation.write(ItemRarityScanner.results)
+            else
+                ItemRarityUtils.warn("Container V3 simulation did not expose a writer")
+            end
+        elseif module == "ItemRarity" and command == "containerV2FailureAudit" then
+            -- Explicit forensic action for the reported Java/Lua arithmetic
+            -- exception. It only exercises isolated temporary candidates.
+            require "ItemRarity/Diagnostics/ContainerV2FailureAudit"
+            if ItemRarityContainerV2FailureAudit and ItemRarityContainerV2FailureAudit.write then
+                ItemRarityContainerV2FailureAudit.write(ItemRarityScanner.results)
+            else
+                ItemRarityUtils.warn("Container V2 failure audit did not expose a writer")
             end
         elseif module == "ItemRarity" and command == "reloadRuntimePipeline" then
             -- Deliberately fixed, small server-side reload path for normal
