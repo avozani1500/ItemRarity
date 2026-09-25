@@ -1,6 +1,7 @@
 require "ItemRarity/RarityConfig"
 require "ItemRarity/RarityTiers"
 require "ItemRarity/ItemClassifier"
+require "ItemRarity/UtilityIsolation"
 require "ItemRarity/RarityUtils"
 
 -- Computes a category-local utility score after Strategy D has finished. It
@@ -1885,13 +1886,59 @@ end
 -- Active ContainerUtility V2.  Unlike the retired generic wearable-container
 -- pass, every safe structural group is scored against only its vanilla
 -- mechanical profiles.  Mods are members, never reference points.
-local function scoreContainerV2(candidates, auditObserver)
+local function scoreContainerV2(candidates, auditObserver, auditTarget)
+    -- Global configuration is not attributed to an individual ScriptItem.
+    local configs = UTILITY.container.v2.groups
+    for groupName, config in pairs(configs) do
+        assert(type(config) == "table" and type(config.weights) == "table", "Invalid ContainerUtility group configuration")
+        for metricName, weight in pairs(config.weights) do
+            assert(ItemRarityUtilityIsolation.finite(weight) and weight >= 0,
+                "Invalid ContainerUtility weight: " .. tostring(groupName) .. ":" .. tostring(metricName))
+        end
+    end
+    local function admissible(candidate)
+        local ok, accepted = ItemRarityUtilityIsolation.run(candidate, "Container:ReferenceAdmission", function()
+            if not ItemRarityUtilityIsolation.validate(candidate) then return false end
+            local config = configs[candidate.containerV2Group]
+            if not config or type(candidate.profile) ~= "string" or type(candidate.metrics) ~= "table"
+                or type(candidate.directions) ~= "table" then
+                ItemRarityUtilityIsolation.mark(candidate, "Container:ReferenceAdmission", "PARTIAL_DEFER",
+                    "Missing Container comparison metadata", {group=candidate.containerV2Group,profile=candidate.profile})
+                return false
+            end
+            -- Read every participating metric before building ANY reference
+            -- arrays. A missing capacity cannot still contribute weight ranks.
+            for name, weight in pairs(config.weights) do
+                if weight > 0 and not ItemRarityUtilityIsolation.finite(candidate.metrics[name]) then
+                    ItemRarityUtilityIsolation.mark(candidate, "Container:ReferenceAdmission:" .. name, "PARTIAL_DEFER",
+                        "Required Container metric unavailable", {value=candidate.metrics[name],luaType=type(candidate.metrics[name])})
+                    return false
+                end
+                if type(candidate.directions[name]) ~= "boolean" then
+                    ItemRarityUtilityIsolation.mark(candidate, "Container:ReferenceAdmission:" .. name, "PARTIAL_DEFER",
+                        "Missing metric direction", {value=candidate.directions[name],luaType=type(candidate.directions[name])})
+                    return false
+                end
+            end
+            return true
+        end)
+        return ok and accepted
+    end
+    -- If a reference unexpectedly fails during item scoring, discard that
+    -- reference and rebuild this Utility's local ranks before publication.
+    -- No scan retry, callback-driven discovery or singleton scoring occurs.
+    local retry
+    repeat
+    retry = false
     local groups = {}
     for _, candidate in ipairs(candidates) do
-        if candidate.kind == "CONTAINER" and candidate.utilityEligible and candidate.containerV2Group then
+        if candidate.kind == "CONTAINER" and candidate.utilityEligible and candidate.containerV2Group
+            and not candidate.isolationStatus and admissible(candidate) then
             local group = candidate.containerV2Group
             groups[group] = groups[group] or { members = {}, vanilla = {} }
-            table.insert(groups[group].members, candidate)
+            -- Explicit forensic replay may score only one cloned target while
+            -- retaining its full reference population. Normal calls omit it.
+            if auditTarget == nil or candidate == auditTarget then table.insert(groups[group].members, candidate) end
             if tostring(candidate.data.fullType or ""):match("^Base%.") then table.insert(groups[group].vanilla, candidate) end
         end
     end
@@ -1906,6 +1953,13 @@ local function scoreContainerV2(candidates, auditObserver)
         local profileCount = #references
         local rankingConfidence = containerRankingConfidence(profileCount)
         local config = UTILITY.container.v2.groups[groupName]
+        -- Configuration errors are global programming errors, not bad items.
+        -- Deliberately validate outside the item-local exception boundary.
+        assert(type(config) == "table" and type(config.weights) == "table", "Invalid ContainerUtility group configuration")
+        for metricName, weight in pairs(config.weights) do
+            assert(ItemRarityUtilityIsolation.finite(weight) and weight >= 0,
+                "Invalid ContainerUtility weight: " .. tostring(metricName))
+        end
         if groupName == "KEY_CONTAINER" or groupName == "TORSO_AMMO" then
             for _, candidate in ipairs(group.members) do
                 candidate.utility = 50
@@ -1934,20 +1988,55 @@ local function scoreContainerV2(candidates, auditObserver)
                     ranks[metricName] = { low = low, high = high, values = uniqueSorted(bounded) }
                 end
             end
-            for _, candidate in ipairs(group.members) do
+            local targets, referenceSet = {}, {}
+            for _, reference in ipairs(references) do referenceSet[reference] = true end
+            if auditTarget then
+                targets = group.members
+            else
+                -- Validate reference scoring before allowing dependent modded
+                -- members to consume its anchors. A failed reference aborts
+                -- this local pass only, not the scan.
+                for _, reference in ipairs(references) do table.insert(targets, reference) end
+                for _, member in ipairs(group.members) do
+                    if not referenceSet[member] then table.insert(targets, member) end
+                end
+            end
+            for _, candidate in ipairs(targets) do
+            if not retry then
+            ItemRarityUtilityIsolation.run(candidate, "scoreContainerV2", function()
                 local numerator, denominator, valid = 0, 0, 0
                 candidate.metricPercentiles = {}
                 for metricName, weight in pairs(config.weights) do
                     local rank = ranks[metricName]
                     local value = candidate.metrics[metricName]
+                    if weight > 0 and (not rank or value == nil) then
+                        ItemRarityUtilityIsolation.mark(candidate, "scoreContainerV2:" .. metricName, "PARTIAL_DEFER",
+                            "Required Container component unavailable", { value=value, weight=weight, rankAvailable=rank ~= nil })
+                        return
+                    end
                     if rank and value ~= nil then
+                        if not ItemRarityUtilityIsolation.finite(value) or not ItemRarityUtilityIsolation.finite(rank.low)
+                            or not ItemRarityUtilityIsolation.finite(rank.high) then
+                            ItemRarityUtilityIsolation.mark(candidate, "scoreContainerV2:" .. metricName, "PARTIAL_DEFER",
+                                "Container numeric input/bounds unavailable", { value=value, low=rank.low, high=rank.high, weight=weight })
+                            return
+                        end
                         local percentile = percentileRank(rank.values, clamp(value, rank.low, rank.high), candidate.directions[metricName])
                         candidate.metricPercentiles[metricName] = percentile
                         -- The observer is development-only and supplied only
                         -- by the explicit Container V2 audit. It records the
                         -- exact operands before the active multiplication;
-                        -- normal scans pass nil and retain the original path.
-                        if auditObserver then auditObserver(candidate, metricName, value, rank, percentile, weight) end
+                        -- normal scans pass nil. Missing percentiles defer the
+                        -- entire Utility instead of scoring a reduced formula.
+                        if auditObserver then auditObserver(candidate, metricName, value, rank, percentile, weight,
+                            numerator, denominator, valid, profileCount, references) end
+                        if not ItemRarityUtilityIsolation.finite(percentile) then
+                            ItemRarityUtilityIsolation.mark(candidate, "scoreContainerV2:" .. metricName, "PARTIAL_DEFER",
+                                "Percentile absent from the vanilla reference ranks",
+                                { percentile=percentile, percentileType=type(percentile), weight=weight, value=value,
+                                    numerator=numerator, denominator=denominator })
+                            return
+                        end
                         numerator, denominator, valid = numerator + percentile * weight, denominator + weight, valid + 1
                     end
                 end
@@ -1960,15 +2049,34 @@ local function scoreContainerV2(candidates, auditObserver)
                 candidate.normalizationGroup = "CONTAINER_V2:" .. groupName .. ":VANILLA_REFERENCE"
                 candidate.utilityScoreVersion = UTILITY.container.v2.utilityVersion
                 if not candidate.essentialsPresent then candidate.ineligibleReason = "missing essential ContainerUtility V2 attribute" end
+            end)
+            if referenceSet[candidate] and candidate.isolationStatus then retry = true end
+            end
             end
         end
+        for _, reference in ipairs(references) do
+            if reference.isolationStatus then retry = true end
+        end
     end
+    until not retry
 end
 
 local function scoreMeleeV2(candidates)
+    local weights = UTILITY.meleeWeapon.v2
+    for _, name in ipairs({"offense", "efficiency", "control", "architecture", "softBalance"}) do
+        assert(type(weights[name]) == "table", "Invalid Melee configuration: " .. name)
+        for key, value in pairs(weights[name]) do
+            assert(ItemRarityUtilityIsolation.finite(value), "Invalid Melee coefficient: " .. name .. ":" .. tostring(key))
+        end
+    end
+    local function scorePass()
     local members, representativesByProfile = {}, {}
     for _, candidate in ipairs(candidates) do
         if candidate.utilityEligible and candidate.kind == "MELEE_WEAPON" then
+            ItemRarityUtilityIsolation.run(candidate, "Melee:ReferenceAdmission", function()
+            if not ItemRarityUtilityIsolation.requireNumbers(candidate, "Melee:ReferenceAdmission", {
+                "averageDamage", "attackTempo", "runtimeCritical", "multiHit", "strainProxy", "weight", "range", "knockdown", "durability",
+            }) then return end
             -- B42 runtime HandWeapon critical is the only critical input used
             -- by the active V2 mechanical profile.
             candidate.metrics.critical = candidate.metrics.runtimeCritical
@@ -1978,6 +2086,7 @@ local function scoreMeleeV2(candidates)
             })
             table.insert(members, candidate)
             if not representativesByProfile[candidate.profile] then representativesByProfile[candidate.profile] = candidate end
+            end)
         end
     end
     local representatives = {}
@@ -2008,8 +2117,7 @@ local function scoreMeleeV2(candidates)
             end
         end
     end
-    local weights = UTILITY.meleeWeapon.v2
-    for _, candidate in ipairs(members) do
+    ItemRarityUtilityIsolation.each(members, ipairs, "Melee:FinalScore", nil, function(candidate)
         local p = function(name) return candidate.metricPercentiles and candidate.metricPercentiles[name] or nil end
         local averageDamage, runtimeCritical, multiHit, attackTempo = p("averageDamage"), p("runtimeCritical"), p("multiHit"), p("attackTempo")
         local strainProxy, weight = p("strainProxy"), p("weight")
@@ -2034,6 +2142,12 @@ local function scoreMeleeV2(candidates)
         else
             candidate.utility = nil
             candidate.ineligibleReason = "V2 missing runtime melee attribute"
+            ItemRarityUtilityIsolation.mark(candidate, "Melee:FinalScore", "PARTIAL_DEFER", candidate.ineligibleReason)
+            return
+        end
+        if not ItemRarityUtilityIsolation.finite(candidate.utility) then
+            ItemRarityUtilityIsolation.mark(candidate, "Melee:FinalScore", "ERROR_ISOLATED", "Non-finite Utility", {value=candidate.utility})
+            return
         end
         candidate.utilityConfidence = essentials and valid >= NORMALIZATION.highConfidenceValidAttributes and profileCount >= NORMALIZATION.highConfidenceProfiles
             and "HIGH" or (essentials and valid >= NORMALIZATION.minimumValidAttributes and profileCount >= NORMALIZATION.minimumProfiles and "MEDIUM" or "LOW")
@@ -2042,7 +2156,11 @@ local function scoreMeleeV2(candidates)
         candidate.essentialsPresent = essentials
         candidate.normalizationGroup = "MELEE_WEAPON:V2_GLOBAL"
         candidate.utilityScoreVersion = UTILITY.meleeWeapon.utilityVersion
+    end)
+    for _, reference in ipairs(representatives) do if reference.isolationStatus then return true end end
+    return false
     end
+    while scorePass() do end
 end
 
 local function firearmRankingConfidence(profileCount)
@@ -2156,7 +2274,7 @@ local function firearmV1Components(rows, references)
     }
     local weights, offenseWeights, handlingWeights = UTILITY.firearm.offense, UTILITY.firearm.offenseComponents, UTILITY.firearm.handling
     local result = {}
-    for _, candidate in ipairs(rows) do
+    ItemRarityUtilityIsolation.each(rows, ipairs, "Firearm:Components", nil, function(candidate)
         local m = candidate.metrics
         local offense = offenseWeights.averageDamage * scales.damage(m.averageDamage)
             + offenseWeights.multiHit * scales.multiHit(math.sqrt(clamp(m.maxHitCount or 1, 1, 9)))
@@ -2167,11 +2285,17 @@ local function firearmV1Components(rows, references)
             + handlingWeights.weight * (100 - scales.weight(m.weight))
             + handlingWeights.sound * (100 - scales.sound(m.soundRadius))
         local capacity, range = scales.capacity(m.maxAmmo), scales.range(m.maxRange)
+        local raw = weights.damage * offense + weights.capacity * capacity + weights.handling * handling + weights.range * range
+        if not ItemRarityUtilityIsolation.finite(raw) then
+            ItemRarityUtilityIsolation.mark(candidate, "Firearm:Components", "ERROR_ISOLATED",
+                "Non-finite component result", {offense=offense,capacity=capacity,handling=handling,range=range,raw=raw})
+            return
+        end
         result[candidate] = {
             offense = offense, capacity = capacity, handling = handling, range = range,
-            raw = weights.damage * offense + weights.capacity * capacity + weights.handling * handling + weights.range * range,
+            raw = raw,
         }
-    end
+    end)
     return result, {
         damage = damageBounds, multiHit = multiHitBounds, critical = criticalBounds,
         range = rangeBounds, capacity = capacityBounds, weight = weightBounds,
@@ -2184,9 +2308,47 @@ end
 -- tiny sample; family position only refines that score according to its
 -- RankingConfidence.
 local function scoreFirearmUtility(candidates)
+    -- Configuration defects must propagate independently of individual items.
+    for _, name in ipairs({"offense", "offenseComponents", "handling", "relativeWeight", "tiers"}) do
+        assert(type(UTILITY.firearm[name]) == "table", "Invalid Firearm configuration: " .. name)
+        for key, value in pairs(UTILITY.firearm[name]) do
+            assert(ItemRarityUtilityIsolation.finite(value), "Invalid Firearm coefficient: " .. name .. ":" .. tostring(key))
+        end
+    end
+    assert(ItemRarityUtilityIsolation.finite(UTILITY.firearm.scarcityWeight), "Invalid Firearm Scarcity coefficient")
+    local function admissible(candidate)
+        local ok, accepted = ItemRarityUtilityIsolation.run(candidate, "Firearm:ReferenceAdmission", function()
+            if not ItemRarityUtilityIsolation.requireNumbers(candidate, "Firearm:ReferenceAdmission", {
+                "averageDamage", "maxHitCount", "criticalChance", "criticalMultiplier", "maxRange",
+                "maxAmmo", "weight", "recoilDelay", "aimingTime", "reloadTime", "soundRadius",
+            }) then return false end
+            if type(candidate.profile) ~= "string" or type(candidate.subgroup) ~= "string"
+                or type(candidate.data.fullType) ~= "string" then
+                ItemRarityUtilityIsolation.mark(candidate, "Firearm:ReferenceAdmission", "PARTIAL_DEFER",
+                    "Missing comparison identity", {profile=candidate.profile,family=candidate.subgroup})
+                return false
+            end
+            local critical = candidate.metrics.criticalChance * candidate.metrics.criticalMultiplier
+            if not ItemRarityUtilityIsolation.finite(critical) then
+                ItemRarityUtilityIsolation.mark(candidate, "Firearm:ReferenceAdmission", "ERROR_ISOLATED",
+                    "Non-finite critical product", {critical=critical})
+                return false
+            end
+            local scarcity = candidate.data.scarcityPercentile
+            if scarcity == nil and candidate.data.tableAvailability then scarcity = candidate.data.tableAvailability.routeWeightedPercentile end
+            if scarcity ~= nil and not ItemRarityUtilityIsolation.finite(scarcity) then
+                ItemRarityUtilityIsolation.mark(candidate, "Firearm:ReferenceAdmission", "ERROR_ISOLATED",
+                    "Invalid item Scarcity input", {value=scarcity,luaType=type(scarcity)})
+                return false
+            end
+            return true
+        end)
+        return ok and accepted
+    end
+    local function scorePass()
     local firearms, vanilla, families = {}, {}, {}
     for _, candidate in ipairs(candidates) do
-        if candidate.kind == "FIREARM" and candidate.utilityEligible then
+        if candidate.kind == "FIREARM" and candidate.utilityEligible and admissible(candidate) then
             table.insert(firearms, candidate)
             if tostring(candidate.data.fullType or ""):match("^Base%.") then table.insert(vanilla, candidate) end
             families[candidate.subgroup] = families[candidate.subgroup] or { members = {}, vanilla = {} }
@@ -2197,6 +2359,7 @@ local function scoreFirearmUtility(candidates)
     local vanillaReferences = firearmV1Representatives(vanilla)
     if #vanillaReferences == 0 then return end
     local absoluteParts, absoluteBounds = firearmV1Components(firearms, vanillaReferences)
+    for _, reference in ipairs(vanillaReferences) do if reference.isolationStatus then return true end end
     local absoluteScale, absoluteRawBounds = firearmV1Scale((function()
         local rows = {}
         for _, candidate in ipairs(vanillaReferences) do
@@ -2219,7 +2382,8 @@ local function scoreFirearmUtility(candidates)
         local rankingConfidence = firearmRankingConfidence(profileCount)
         local relativeWeight = UTILITY.firearm.relativeWeight[rankingConfidence] or 0
         local relativeParts = profileCount > 0 and firearmV1Components(family.members, familyReferences) or nil
-        for _, candidate in ipairs(family.members) do
+        for _, reference in ipairs(familyReferences) do if reference.isolationStatus then return true end end
+        ItemRarityUtilityIsolation.each(family.members, ipairs, "Firearm:FinalScore", nil, function(candidate)
             local absolute = absoluteParts[candidate]
             local relative = relativeParts and relativeParts[candidate]
             local relativeScore = relative and relative.raw or 50
@@ -2227,6 +2391,11 @@ local function scoreFirearmUtility(candidates)
             local combined = (1 - relativeWeight) * absoluteValue + relativeWeight * relativeScore
             local scarcityStrength = 100 - (candidate.data.scarcityPercentile or (candidate.data.tableAvailability and candidate.data.tableAvailability.routeWeightedPercentile) or 50)
             local finalScore = combined * (1 - UTILITY.firearm.scarcityWeight) + scarcityStrength * UTILITY.firearm.scarcityWeight
+            if not ItemRarityUtilityIsolation.finite(finalScore) then
+                ItemRarityUtilityIsolation.mark(candidate, "Firearm:FinalScore", "ERROR_ISOLATED",
+                    "Non-finite final score", {combined=combined,scarcity=scarcityStrength,finalScore=finalScore})
+                return
+            end
             candidate.utility = finalScore
             candidate.utilityConfidence = "HIGH"
             candidate.profileCount = profileCount
@@ -2248,8 +2417,14 @@ local function scoreFirearmUtility(candidates)
                 relativeOffense = relative and relative.offense or nil, relativeCapacity = relative and relative.capacity or nil,
                 relativeHandling = relative and relative.handling or nil, relativeRange = relative and relative.range or nil,
             }
-        end
+        end)
     end
+    for _, reference in ipairs(vanillaReferences) do if reference.isolationStatus then return true end end
+    return false
+    end
+    -- A failed reference never survives into published family ranks/anchors.
+    -- Only this pure Utility pass is rebuilt; discovery/callbacks are not rerun.
+    while scorePass() do end
 end
 
 local function canonicalFirearmFullType(value)
@@ -3609,6 +3784,9 @@ end
 local function publishCandidateFields(candidates)
     for _, candidate in ipairs(candidates) do
         local data = candidate.data
+        data.utilityIsolationStatus = candidate.isolationStatus
+        data.utilityIsolationStage = candidate.isolationStage
+        data.failedUtilityKind = candidate.failedUtilityKind
         data.utilityKind = candidate.kind
         data.utilitySubgroup = candidate.subgroup
         data.utilityFunctionalGroup = candidate.functionalGroup
@@ -3779,6 +3957,14 @@ end
 local function applyTierAdjustment(data, candidate)
     data.baseScarcityTier = data.rarityTier
     data.finalRarityTier = data.rarityTier
+    if candidate.isolationStatus then
+        -- Existing loot-backed Scarcity remains independent evidence. Do not
+        -- execute any failed Utility policy or manufacture a Utility score.
+        data.utility, data.utilityMetrics, data.utilityComponents = nil, nil, nil
+        data.utilityEligible, data.utilityConfidence = false, "LOW"
+        data.utilitySupport, data.utilityAdjustmentReason = "UTILITY_PARTIAL", candidate.ineligibleReason
+        return
+    end
     data.utilityEligible = candidate.utilityEligible == true
     data.utilitySubgroup = candidate.subgroup
     data.utilityFunctionalGroup = candidate.functionalGroup
@@ -4688,17 +4874,18 @@ function ItemRarityUtilityCalculator.calculate(results)
     -- These caches live only for one complete scan. They reuse immutable
     -- ScriptItem/body-topology data and cannot carry state across rescans.
     ItemRarityUtilityCalculator._scanBodyLocationGraphs = {}
+    ItemRarityUtilityIsolation.beginScan()
     local candidates = {}
     local profiler = activeProfiler()
     for _, data in pairs(results) do
         if profiler then
             local started = profiler.nowNs()
-            local candidate = candidateFor(data)
+            local candidate = ItemRarityUtilityIsolation.discover(data, function() return candidateFor(data) end)
             local finished = profiler.nowNs()
             profiler.record((candidate.kind or "UNSUPPORTED") .. " CandidateDiscovery", finished - started, 1, 1)
             table.insert(candidates, candidate)
         else
-            table.insert(candidates, candidateFor(data))
+            table.insert(candidates, ItemRarityUtilityIsolation.discover(data, function() return candidateFor(data) end))
         end
     end
     -- Every score pass deduplicates profiles by keeping the first candidate it
@@ -4767,6 +4954,13 @@ function ItemRarityUtilityCalculator.calculate(results)
     -- classification. Do not retain it in scanner results or registry state.
     for _, data in pairs(results) do data._scriptItem = nil end
     ItemRarityUtilityCalculator._scanBodyLocationGraphs = nil
+    for _, candidate in ipairs(candidates) do
+        if candidate.data.utilitySupport == "UTILITY_UNSUPPORTED" then
+            ItemRarityUtilityIsolation.report.unsupportedItems = ItemRarityUtilityIsolation.report.unsupportedItems + 1
+        end
+    end
+    ItemRarityUtilityIsolation.report.calculateCompleted = true
+    ItemRarityUtilityCalculator.lastItemIsolationReport = ItemRarityUtilityIsolation.report
     return results
 end
 
