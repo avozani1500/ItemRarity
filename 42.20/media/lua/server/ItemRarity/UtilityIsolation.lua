@@ -124,6 +124,120 @@ function I.requireNumbers(candidate, stage, names)
     return true
 end
 
+-- Explicit opt-in for required non-metric fields/components. No coercion.
+function I.requireFields(candidate, stage, source, names)
+    for _, name in ipairs(names) do
+        local value = nil
+        if type(source) == "table" then value = source[name] end
+        if not I.finite(value) then
+            I.mark(candidate, stage, value == nil and "PARTIAL_DEFER" or "ERROR_ISOLATED",
+                "Required numeric field unavailable: " .. name, {value=value,luaType=type(value),field=name})
+            return false
+        end
+    end
+    return true
+end
+
+-- A proof for the existing zero-benefit Clothing policy is independent of
+-- comparative rank, body regions and durability. Six measured zeroes are
+-- evidence; a missing getter is not. Special/ambiguous functions stay out.
+function I.clothingStructuralPolicy(candidate)
+    if candidate.kind ~= "CLOTHING" or candidate.isolationStatus
+        or candidate.mechanicalSpecialBehavior or type(candidate.metrics) ~= "table" then return false end
+    for _, name in ipairs({"biteDefense","scratchDefense","bulletDefense","insulation","windResistance","waterResistance"}) do
+        local value=candidate.metrics[name]
+        if not I.finite(value) or value ~= 0 then return false end
+    end
+    candidate.structuralPolicy = "CLOTHING_TRIVIAL"
+    candidate.utilityState = "STRUCTURAL_POLICY_RESOLVED"
+    candidate.rankingEligible = false
+    candidate.clothingUtilityCandidate = false
+    candidate.utilityEligible, candidate.utility = false, nil
+    candidate.utilityConfidence = "HIGH"
+    candidate.mechanicalAttributesKnown = true
+    candidate.mechanicalBaseBenefit, candidate.mechanicalValue = 0, 0
+    candidate.mechanicalValueStatus = "MECHANICALLY_TRIVIAL"
+    -- Do not invent durability/cost or a numerical ClothingUtility. The
+    -- existing final-tier policy owns COMMON; this is not a new tier formula.
+    candidate.ineligibleReason = "Clothing trivial structural policy resolved; no mechanical ranking required"
+    return true
+end
+
+function I.clothingAdmission(candidate)
+    candidate.rankingEligible = false
+    if not I.requireNumbers(candidate, "Clothing:ReferenceAdmission", {
+        "biteDefense","scratchDefense","bulletDefense","durability","weight",
+        "runSpeedModifier","combatSpeedModifier","visionModifier","hearingModifier",
+        "discomfortModifier","insulation","windResistance","waterResistance",
+    }) then return false end
+    if type(candidate.profile) ~= "string" or type(candidate.functionalGroup) ~= "string"
+        or type(candidate.clothingDiscovery) ~= "table" then
+        I.mark(candidate,"Clothing:ReferenceAdmission","PARTIAL_DEFER","Missing Clothing comparison metadata")
+        return false
+    end
+    local regions = candidate.clothingDiscovery.coveredRegions
+    if type(regions) ~= "table" or #regions == 0 then
+        I.mark(candidate,"Clothing:ReferenceAdmission","PARTIAL_DEFER","Missing anatomical regions")
+        return false
+    end
+    for _, region in pairs(regions) do
+        if type(region) ~= "string" then
+            I.mark(candidate,"Clothing:ReferenceAdmission","ERROR_ISOLATED","Invalid anatomical region",{value=region})
+            return false
+        end
+    end
+    local graph = candidate.equipmentGraph
+    if graph ~= nil and type(graph) ~= "table" then
+        I.mark(candidate,"Clothing:ReferenceAdmission","ERROR_ISOLATED","Invalid equipment graph",{value=graph})
+        return false
+    end
+    if graph and graph.resolved then
+        if type(graph.slotId) ~= "string" then
+            I.mark(candidate,"Clothing:ReferenceAdmission","PARTIAL_DEFER","Missing resolved slot identity")
+            return false
+        end
+        if graph.exclusive ~= nil and type(graph.exclusive) ~= "table" then
+            I.mark(candidate,"Clothing:ReferenceAdmission","ERROR_ISOLATED","Invalid exclusive slots",{value=graph.exclusive})
+            return false
+        end
+    end
+    local scarcity=candidate.data.scarcityPercentile
+    if scarcity == nil and candidate.data.tableAvailability then scarcity=candidate.data.tableAvailability.routeWeightedPercentile end
+    if scarcity ~= nil and not I.finite(scarcity) then
+        I.mark(candidate,"Clothing:ReferenceAdmission","ERROR_ISOLATED","Invalid Clothing Scarcity input",{value=scarcity})
+        return false
+    end
+    candidate.rankingEligible = true
+    return true
+end
+
+function I.foodAdmission(candidate)
+    if not I.requireNumbers(candidate,"Food:ReferenceAdmission",{
+        "hungerChange","thirstChange","hungerBenefit","thirstBenefit","calories","daysTotallyRotten",
+        "unhappyChange","boredomChange","stressChange","foodSicknessChange",
+    }) then return false end
+    if type(candidate.profile) ~= "string" or (candidate.functionalGroup ~= "FOOD" and candidate.functionalGroup ~= "DRINK") then
+        I.mark(candidate,"Food:ReferenceAdmission","PARTIAL_DEFER","Missing Food comparison identity")
+        return false
+    end
+    for _, name in ipairs({"cookable","dangerousUncooked","poison"}) do
+        local value=candidate.metrics[name]
+        if type(value) ~= "boolean" then
+            I.mark(candidate,"Food:ReferenceAdmission",value == nil and "PARTIAL_DEFER" or "ERROR_ISOLATED",
+                "Required Food flag unavailable: "..name,{value=value,luaType=type(value)})
+            return false
+        end
+    end
+    if candidate.metrics.cookable and not I.requireNumbers(candidate,"Food:ReferenceAdmission",{"minutesToCook"}) then return false end
+    local scarcity=candidate.data.scarcityPercentile
+    if scarcity == nil and candidate.data.tableAvailability then scarcity=candidate.data.tableAvailability.routeWeightedPercentile end
+    if scarcity ~= nil and not I.finite(scarcity) then
+        I.mark(candidate,"Food:ReferenceAdmission","ERROR_ISOLATED","Invalid Food Scarcity input",{value=scarcity})
+        return false
+    end
+    return true
+end
+
 -- Runs one loop body, retaining the original candidate object and the original
 -- complete reference population. No retry, singleton normalization or cache.
 function I.each(collection, iterator, stage, ownerOf, action)

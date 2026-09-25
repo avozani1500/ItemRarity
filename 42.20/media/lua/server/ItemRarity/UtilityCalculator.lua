@@ -2643,12 +2643,12 @@ end
 local function assignFunctionalCoverageFactors(clothing)
     local weights = ANATOMICAL_COVERAGE_MODELS.B_MODERATE
     local maximum = anatomicalModelMaximum(clothing, weights)
-    for _, candidate in ipairs(clothing) do
+    ItemRarityUtilityIsolation.each(clothing, ipairs, "Clothing:Coverage", nil, function(candidate)
         local total = anatomicalWeightTotal(candidate.clothingDiscovery and candidate.clothingDiscovery.coveredRegions, weights)
         candidate.anatomicalCoverageTotal = total
         candidate.functionalCoverageFactor = total and maximum and (UTILITY.clothing.coverage.minimumFactor
             + (UTILITY.clothing.coverage.maximumFactor - UTILITY.clothing.coverage.minimumFactor) * total / maximum) or nil
-    end
+    end)
 end
 
 local function clothingProgressiveLoss(loss, freeLoss)
@@ -2659,7 +2659,7 @@ end
 
 local function assignClothingMechanicalBaseBenefit(clothing)
     local scales = clothingGlobalRobustScales(clothing, { "durability", "insulation", "windResistance", "waterResistance" })
-    for _, candidate in ipairs(clothing) do
+    ItemRarityUtilityIsolation.each(clothing, ipairs, "Clothing:MechanicalBenefit", nil, function(candidate)
         local m = candidate.metrics or {}
         local coreKnown = m.biteDefense ~= nil and m.scratchDefense ~= nil and m.bulletDefense ~= nil
             and m.insulation ~= nil and m.windResistance ~= nil and m.waterResistance ~= nil
@@ -2673,12 +2673,15 @@ local function assignClothingMechanicalBaseBenefit(clothing)
         candidate.mechanicalBaseBenefit = rawProtection * .85 + weather * .15
         candidate.mechanicalDurabilityFactor = .75 + .25 * durability / 100
         candidate.mechanicalAttributesKnown = coreKnown
-    end
+        ItemRarityUtilityIsolation.requireFields(candidate,"Clothing:MechanicalBenefit",candidate,
+            {"mechanicalBaseBenefit","mechanicalDurabilityFactor"})
+    end)
 end
 
 local function assignClothingMechanicalValueStatus(candidates)
     for _, candidate in ipairs(candidates) do
         if candidate.clothingUtilityCandidate then
+            ItemRarityUtilityIsolation.run(candidate,"Clothing:MechanicalPolicy",function()
             local m = candidate.metrics or {}
             local direct = candidate.utilityComponents and candidate.utilityComponents.directSlot or {}
             local combatLoss = clamp((1 - (m.combatSpeedModifier or 1)) * 100, 0, 100)
@@ -2700,6 +2703,9 @@ local function assignClothingMechanicalValueStatus(candidates)
             else
                 candidate.mechanicalValueStatus = "MECHANICAL_VALUE_KNOWN"
             end
+            ItemRarityUtilityIsolation.requireFields(candidate,"Clothing:MechanicalPolicy",candidate,
+                {"mechanicalFunctionalCost","mechanicalValue"})
+            end)
         end
     end
 end
@@ -2740,12 +2746,36 @@ local function assignAccessoryMechanicalValueStatus(candidates)
 end
 
 local function scoreClothingUtility(candidates)
+    for _, section in ipairs({"coverage","protection","weather"}) do
+        assert(type(UTILITY.clothing[section]) == "table", "Invalid Clothing configuration: " .. section)
+        for name, value in pairs(UTILITY.clothing[section]) do
+            assert(ItemRarityUtilityIsolation.finite(value), "Invalid Clothing coefficient: " .. section .. ":" .. tostring(name))
+        end
+    end
+    local function scorePass()
     local clothing = {}
-    for _, candidate in ipairs(candidates) do if candidate.clothingUtilityCandidate then table.insert(clothing, candidate) end end
+    for _, candidate in ipairs(candidates) do
+        if candidate.clothingUtilityCandidate then
+            -- Resolve existing structural policies before imposing the
+            -- stricter requirements of quantitative comparison populations.
+            ItemRarityUtilityIsolation.run(candidate,"Clothing:StructuralPolicy",function()
+                return ItemRarityUtilityIsolation.clothingStructuralPolicy(candidate)
+            end)
+        end
+        if candidate.clothingUtilityCandidate then
+            local ok, accepted = ItemRarityUtilityIsolation.run(candidate,"Clothing:ReferenceAdmission",function()
+                return ItemRarityUtilityIsolation.clothingAdmission(candidate)
+            end)
+            if ok and accepted then table.insert(clothing,candidate) end
+        end
+    end
     assignFunctionalCoverageFactors(clothing)
+    for _, candidate in ipairs(clothing) do if candidate.isolationStatus then return true end end
     assignClothingMechanicalBaseBenefit(clothing)
+    for _, candidate in ipairs(clothing) do if candidate.isolationStatus then return true end end
     local grouped = {}
     for _, candidate in ipairs(clothing) do
+        ItemRarityUtilityIsolation.run(candidate,"Clothing:Grouping",function()
         local groupKey, references, groupMode = clothingNormalizationGroup(candidate, clothing)
         local nativeReferences = {}
         for _, other in ipairs(clothing) do
@@ -2758,7 +2788,9 @@ local function scoreClothingUtility(candidates)
         candidate.functionalComparisonProfileCount = countProfiles(references)
         grouped[groupKey] = grouped[groupKey] or { members = {}, references = references }
         table.insert(grouped[groupKey].members, candidate)
+        end)
     end
+    for _, candidate in ipairs(clothing) do if candidate.isolationStatus then return true end end
     local config = UTILITY.clothing
     -- Bite/scratch/bullet are explicit game percentages and must retain an
     -- absolute shared scale. Ranking them only within FULL_BODY would make a
@@ -2776,7 +2808,7 @@ local function scoreClothingUtility(candidates)
             ranks[metric] = { values = values, low = low, high = high }
         end
         group.ranks = ranks
-        for _, candidate in ipairs(group.members) do
+        ItemRarityUtilityIsolation.each(group.members, ipairs, "Clothing:Preparation", nil, function(candidate)
             candidate.metricPercentiles = {}
             for _, metric in ipairs(rankedMetrics) do
                 local rank = ranks[metric]
@@ -2808,8 +2840,14 @@ local function scoreClothingUtility(candidates)
             else
                 candidate.utilityComponents = nil
             end
-        end
+            ItemRarityUtilityIsolation.requireFields(candidate,"Clothing:Preparation",candidate.utilityComponents,
+                {"protectionCoverage","coverageFactor","weatherProtection"})
+        end)
     end
+    for _, candidate in ipairs(clothing) do if candidate.isolationStatus then return true end end
+    return false
+    end
+    while scorePass() do end
 end
 
 -- Active ClothingUtility V1.  This is deliberately based on exact resolved
@@ -3059,6 +3097,8 @@ local function clothingV2RemainingComponents(candidate, macro)
 end
 
 local function scoreClothingDirectSlotV1(candidates)
+    local function scorePass()
+    local failuresBefore = #ItemRarityUtilityIsolation.report.entries
     local slots, entries = {}, {}
     local function ranker(records, field, inverted)
         local seen, values = {}, {}
@@ -3072,6 +3112,9 @@ local function scoreClothingDirectSlotV1(candidates)
     for _, candidate in ipairs(candidates) do
         local graph, metrics, parts = candidate.equipmentGraph, candidate.metrics or {}, candidate.utilityComponents or {}
         if candidate.clothingUtilityCandidate and graph and graph.resolved and candidate.profile and parts.protectionCoverage ~= nil then
+            ItemRarityUtilityIsolation.run(candidate,"Clothing:SlotAdmission",function()
+            if not ItemRarityUtilityIsolation.requireFields(candidate,"Clothing:SlotAdmission",parts,
+                {"protectionCoverage","coverageFactor","weatherProtection"}) then return end
             local run, combat = metrics.runSpeedModifier, metrics.combatSpeedModifier
             local vision, hearing = metrics.visionModifier, metrics.hearingModifier
             local values = {
@@ -3091,8 +3134,10 @@ local function scoreClothingDirectSlotV1(candidates)
             local slotId = graph.slotId
             slots[slotId] = slots[slotId] or { records={}, role=record.role }
             table.insert(slots[slotId].records, record)
+            end)
         end
     end
+    if #ItemRarityUtilityIsolation.report.entries > failuresBefore then return true end
     for _, slot in pairs(slots) do
         local ranks = {
             protection=ranker(slot.records, "protection", false), coverage=ranker(slot.records, "coverage", false),
@@ -3107,7 +3152,7 @@ local function scoreClothingDirectSlotV1(candidates)
         slot.profileCount = profileCount
         slot.rankingConfidence = profileCount >= 20 and "HIGH" or (profileCount >= 8 and "MEDIUM" or "LOW")
             local weights = clothingDirectSlotV1Weights(slot.role)
-        for _, record in pairs(representatives) do
+        ItemRarityUtilityIsolation.each(representatives, pairs, "Clothing:SlotScore", function(r) return r.candidate end, function(record)
             local components = {}
             for field, getter in pairs(ranks) do components[field] = getter(record) or 50 end
             local metrics, parts = record.candidate.metrics, record.candidate.utilityComponents
@@ -3181,8 +3226,10 @@ local function scoreClothingDirectSlotV1(candidates)
                 + components.mobility * weights.mobility + components.weight * weights.weight + components.discomfort * weights.discomfort
                 + components.senses * weights.senses + components.weather * weights.weather
             record.components = components
+            if not ItemRarityUtilityIsolation.requireFields(record.candidate,"Clothing:SlotScore",record,{"quality"}) then return end
             table.insert(entries, record)
-        end
+        end)
+        for _, record in ipairs(slot.records) do if record.candidate.isolationStatus then return true end end
         local ordered, scores = {}, {}
         for _, record in pairs(representatives) do table.insert(ordered, record); table.insert(scores, record.quality) end
         table.sort(ordered, function(a, b) return a.quality > b.quality end)
@@ -3192,6 +3239,7 @@ local function scoreClothingDirectSlotV1(candidates)
             for _, record in ipairs(slot.records) do
                 if record.candidate.profile == representative.candidate.profile then
                     local candidate = record.candidate
+                    ItemRarityUtilityIsolation.run(candidate,"Clothing:SlotAssignment",function()
                     local assignedComponents, assignedQuality = representative.components, representative.quality
                     -- Profiles intentionally remain deduplicated for the
                     -- existing rank-derived axes.  HEAD V2 Senses, however,
@@ -3232,26 +3280,62 @@ local function scoreClothingDirectSlotV1(candidates)
                     candidate.utilityComponents.directSlot = assignedComponents
                     if candidate.utilityConfidence == "LOW" then candidate.ineligibleReason = "ClothingUtility V1 incomplete intrinsic runtime attributes; visual ceiling RARE"
                     else candidate.ineligibleReason = nil end
+                    ItemRarityUtilityIsolation.requireFields(candidate,"Clothing:SlotAssignment",candidate,{"utility"})
+                    end)
                 end
             end
         end
+        for _, record in ipairs(slot.records) do if record.candidate.isolationStatus then return true end end
     end
     -- Frozen from the approved Balanced P2 calibration for this loaded B42
     -- dataset.  Do not silently re-derive the cuts from a different internal
     -- population than the diagnostic calibration report.
     local balanced = { good=53.64, excellent=61.28, slotConfirm=70 }
     for _, candidate in ipairs(candidates) do if candidate.clothingUtilityCandidate then candidate.clothingBalancedThresholds = balanced end end
+    return false
+    end
+    -- Rebuild all shared Clothing inputs as well as slot ranks after a late
+    -- failure. Never rerun discovery or use a singleton comparison population.
+    while scorePass() do scoreClothingUtility(candidates) end
+end
+
+function ItemRarityUtilityCalculator._finalizeClothingPolicies(candidates)
+    local changed
+    repeat
+        local before = #ItemRarityUtilityIsolation.report.entries
+        assignClothingMechanicalValueStatus(candidates)
+        changed = #ItemRarityUtilityIsolation.report.entries > before
+        if changed then scoreClothingUtility(candidates); scoreClothingDirectSlotV1(candidates) end
+    until not changed
 end
 
 -- Active MedicalUtility V1.  Each functional treatment problem owns an
 -- isolated reference population. Effect is deliberately dominant and real
 -- drainable uses are a minor secondary signal; weight is diagnostic-only.
 local function scoreMedicalUtility(candidates)
+    for _, name in ipairs({"efficacyWeight","usesWeight","mediumConfidenceProfiles","highConfidenceProfiles"}) do
+        assert(ItemRarityUtilityIsolation.finite(UTILITY.medical[name]),"Invalid Medical coefficient: "..name)
+    end
+    local function scorePass()
     local grouped = {}
     for _, candidate in ipairs(candidates) do
         if candidate.kind == "MEDICAL" and candidate.utilityEligible then
-            grouped[candidate.subgroup] = grouped[candidate.subgroup] or {}
-            table.insert(grouped[candidate.subgroup], candidate)
+            ItemRarityUtilityIsolation.run(candidate,"Medical:ReferenceAdmission",function()
+                if not ItemRarityUtilityIsolation.validate(candidate)
+                    or not ItemRarityUtilityIsolation.requireFields(candidate,"Medical:ReferenceAdmission",candidate,
+                        {"medicalDominantEffect","medicalUses"}) then return end
+                if type(candidate.profile) ~= "string" or type(candidate.subgroup) ~= "string" then
+                    ItemRarityUtilityIsolation.mark(candidate,"Medical:ReferenceAdmission","PARTIAL_DEFER","Missing Medical comparison identity")
+                    return
+                end
+                if candidate.medicalDominantEffect < 0 or candidate.medicalUses < 0 then
+                    ItemRarityUtilityIsolation.mark(candidate,"Medical:ReferenceAdmission","ERROR_ISOLATED","Negative Medical effect/uses",
+                        {effect=candidate.medicalDominantEffect,uses=candidate.medicalUses})
+                    return
+                end
+                grouped[candidate.subgroup] = grouped[candidate.subgroup] or {}
+                table.insert(grouped[candidate.subgroup], candidate)
+            end)
         end
     end
     for subgroup, members in pairs(grouped) do
@@ -3274,10 +3358,11 @@ local function scoreMedicalUtility(candidates)
         local confidence = profileCount >= UTILITY.medical.highConfidenceProfiles and "HIGH"
             or (profileCount >= UTILITY.medical.mediumConfidenceProfiles and "MEDIUM" or "LOW")
         local scores = {}
-        for _, candidate in pairs(representatives) do
+        ItemRarityUtilityIsolation.each(representatives,pairs,"Medical:Score",nil,function(candidate)
             local effectPercentile = percentileRank(effects, candidate.medicalDominantEffect, false)
             local usesPercentile = percentileRank(uses, candidate.medicalUses, false)
             candidate.metricPercentiles = { dominantEffect=effectPercentile, uses=usesPercentile }
+            if not ItemRarityUtilityIsolation.requireFields(candidate,"Medical:Score",candidate.metricPercentiles,{"dominantEffect","uses"}) then return end
             candidate.utility = effectPercentile * UTILITY.medical.efficacyWeight + usesPercentile * UTILITY.medical.usesWeight
             candidate.utilityConfidence = confidence
             candidate.profileCount = profileCount
@@ -3285,10 +3370,12 @@ local function scoreMedicalUtility(candidates)
             candidate.essentialsPresent = candidate.medicalDominantEffect ~= nil and candidate.medicalUses ~= nil
             candidate.normalizationGroup = "MEDICAL:" .. subgroup
             candidate.utilityScoreVersion = UTILITY.medical.utilityVersion
+            if not ItemRarityUtilityIsolation.requireFields(candidate,"Medical:Score",candidate,{"utility"}) then return end
             table.insert(scores, candidate.utility)
-        end
+        end)
+        for _,candidate in ipairs(members) do if candidate.isolationStatus then return true end end
         scores = sortedCopy(scores)
-        for _, candidate in ipairs(members) do
+        ItemRarityUtilityIsolation.each(members,ipairs,"Medical:Assignment",nil,function(candidate)
             local representative = representatives[candidate.profile]
             candidate.utility = representative.utility
             candidate.utilityConfidence = representative.utilityConfidence
@@ -3299,8 +3386,13 @@ local function scoreMedicalUtility(candidates)
             candidate.normalizationGroup = representative.normalizationGroup
             candidate.utilityScoreVersion = representative.utilityScoreVersion
             candidate.data.utilityPercentile = percentileRank(scores, candidate.utility, false)
-        end
+            ItemRarityUtilityIsolation.requireFields(candidate,"Medical:Assignment",candidate,{"utility"})
+        end)
+        for _,candidate in ipairs(members) do if candidate.isolationStatus then return true end end
     end
+    return false
+    end
+    while scorePass() do end
 end
 
 local function foodPositiveRank(values, value)
@@ -3491,11 +3583,27 @@ end
 -- dominant. Food tiers use absolute quality bands, not the weapon/clothing
 -- Scarcity × percentile matrix.
 local function scoreFoodUtility(candidates)
+    for _, section in ipairs({"food","drink","mood","tiers"}) do
+        assert(type(UTILITY.food[section]) == "table", "Invalid Food configuration: "..section)
+        for name,value in pairs(UTILITY.food[section]) do
+            assert(ItemRarityUtilityIsolation.finite(value),"Invalid Food coefficient: "..section..":"..tostring(name))
+        end
+    end
+    for _,name in ipairs({"energyHalfSaturationCalories","negativePower","negativeFactor","scarcityWeight","mediumConfidenceProfiles","highConfidenceProfiles"}) do
+        assert(ItemRarityUtilityIsolation.finite(UTILITY.food[name]),"Invalid Food coefficient: "..name)
+    end
+    assert(UTILITY.food.energyHalfSaturationCalories > 0, "Food energy saturation must be positive")
+    local function scorePass()
     local grouped = {}
     for _, candidate in ipairs(candidates) do
         if candidate.kind == "FOOD" and candidate.utilityEligible then
-            grouped[candidate.functionalGroup] = grouped[candidate.functionalGroup] or {}
-            table.insert(grouped[candidate.functionalGroup], candidate)
+            local ok,accepted=ItemRarityUtilityIsolation.run(candidate,"Food:ReferenceAdmission",function()
+                return ItemRarityUtilityIsolation.foodAdmission(candidate)
+            end)
+            if ok and accepted then
+                grouped[candidate.functionalGroup] = grouped[candidate.functionalGroup] or {}
+                table.insert(grouped[candidate.functionalGroup], candidate)
+            end
         end
     end
     for group, members in pairs(grouped) do
@@ -3504,7 +3612,7 @@ local function scoreFoodUtility(candidates)
             if not seen[candidate.profile] then seen[candidate.profile] = candidate; table.insert(representatives, candidate) end
         end
         local samples = { hunger={}, thirst={}, calories={}, preservation={}, moodUnhappy={}, moodBoredom={}, moodStress={} }
-        for _, candidate in ipairs(representatives) do
+        ItemRarityUtilityIsolation.each(representatives,ipairs,"Food:Samples",nil,function(candidate)
             local metrics = candidate.metrics
             table.insert(samples.hunger, metrics.hungerBenefit or 0)
             table.insert(samples.thirst, metrics.thirstBenefit or 0)
@@ -3513,7 +3621,8 @@ local function scoreFoodUtility(candidates)
             table.insert(samples.moodUnhappy, math.max(0, -(metrics.unhappyChange or 0)))
             table.insert(samples.moodBoredom, math.max(0, -(metrics.boredomChange or 0)))
             table.insert(samples.moodStress, math.max(0, -(metrics.stressChange or 0)))
-        end
+        end)
+        for _,candidate in ipairs(representatives) do if candidate.isolationStatus then return true end end
         local profileCount = #representatives
         local rankingConfidence = foodRankingConfidence(profileCount)
         local moodCaps = {
@@ -3522,7 +3631,7 @@ local function scoreFoodUtility(candidates)
             stress = foodPositiveQuantile(samples.moodStress, UTILITY.food.mood.capPercentile),
         }
         local scores = {}
-        for _, candidate in ipairs(representatives) do
+        ItemRarityUtilityIsolation.each(representatives,ipairs,"Food:Score",nil,function(candidate)
             local metrics = candidate.metrics
             local rawRisk = metrics.dangerousUncooked and 35 or 0
             local cook = metrics.cookable and math.min(100, ((metrics.minutesToCook or 60) / 60) * 55) or 0
@@ -3559,10 +3668,12 @@ local function scoreFoodUtility(candidates)
             candidate.foodScarcityStrength = 100 - (candidate.data.scarcityPercentile or (candidate.data.tableAvailability and candidate.data.tableAvailability.routeWeightedPercentile) or 50)
             candidate.foodFinalScore = candidate.utility * (1 - UTILITY.food.scarcityWeight)
                 + candidate.foodScarcityStrength * UTILITY.food.scarcityWeight
+            if not ItemRarityUtilityIsolation.requireFields(candidate,"Food:Score",candidate,{"utility","foodFinalScore"}) then return end
             table.insert(scores, candidate.utility)
-        end
+        end)
+        for _,candidate in ipairs(representatives) do if candidate.isolationStatus then return true end end
         scores = sortedCopy(scores)
-        for _, candidate in ipairs(members) do
+        ItemRarityUtilityIsolation.each(members,ipairs,"Food:Assignment",nil,function(candidate)
             local representative = seen[candidate.profile]
             candidate.utility = representative.utility
             candidate.utilityComponents = representative.utilityComponents
@@ -3578,8 +3689,13 @@ local function scoreFoodUtility(candidates)
                 + candidate.foodScarcityStrength * UTILITY.food.scarcityWeight
             candidate.data.utilityPercentile = percentileRank(scores, candidate.utility, false)
             candidate.foodFinalTier = foodFinalTier(candidate)
-        end
+            ItemRarityUtilityIsolation.requireFields(candidate,"Food:Assignment",candidate,{"utility","foodFinalScore"})
+        end)
+        for _,candidate in ipairs(members) do if candidate.isolationStatus then return true end end
     end
+    return false
+    end
+    while scorePass() do end
 end
 
 local function lightFireTierForScore(score)
@@ -3771,6 +3887,7 @@ end
 
 local function utilitySupportStatus(candidate)
     if candidate.utilitySupport then return candidate.utilitySupport end
+    if candidate.structuralPolicy == "CLOTHING_TRIVIAL" then return "UTILITY_SUPPORTED" end
     if candidate.kind == "MEDICAL" and candidate.medicalValueStatus == "MECHANICAL_VALUE_PARTIAL" then return "UTILITY_PARTIAL" end
     if candidate.clothingUtilityCandidate then
         if candidate.utility == nil or candidate.utilityConfidence == "LOW" then return "UTILITY_LOW_CONFIDENCE" end
@@ -4921,7 +5038,7 @@ function ItemRarityUtilityCalculator.calculate(results)
         timedUtilityPass(profiler, "NoiseMakerUtility", candidates, "NOISE_MAKER", scoreNoiseMakerUtility)
         timedUtilityPass(profiler, "ExplosiveUtility", candidates, "EXPLOSIVE", scoreExplosiveUtility)
         timedUtilityPass(profiler, "IncendiaryUtility", candidates, "INCENDIARY", scoreIncendiaryUtility)
-        timedUtilityPass(profiler, "ClothingMechanicalPolicies", candidates, "CLOTHING", assignClothingMechanicalValueStatus)
+        timedUtilityPass(profiler, "ClothingMechanicalPolicies", candidates, "CLOTHING", ItemRarityUtilityCalculator._finalizeClothingPolicies)
         timedUtilityPass(profiler, "AccessoryPolicies", candidates, "ACCESSORY", assignAccessoryMechanicalValueStatus)
         timedUtilityPass(profiler, "PublishCandidateFields", candidates, nil, publishCandidateFields)
         local subfamily = profiler.beginPhase("SubfamilyMetrics", 1, #candidates)
@@ -4944,7 +5061,7 @@ function ItemRarityUtilityCalculator.calculate(results)
         scoreNoiseMakerUtility(candidates)
         scoreExplosiveUtility(candidates)
         scoreIncendiaryUtility(candidates)
-        assignClothingMechanicalValueStatus(candidates)
+        ItemRarityUtilityCalculator._finalizeClothingPolicies(candidates)
         assignAccessoryMechanicalValueStatus(candidates)
         publishCandidateFields(candidates)
         buildSubfamilyMetrics(results)

@@ -14,16 +14,17 @@ function ItemRarityScanner.rescan()
     if mode == "stale" then return end
     I.beginScan()
     local results = {}
-    for _, kind in ipairs({"CONTAINER", "FIREARM", "MELEE_WEAPON"}) do
+    for _, kind in ipairs({"CONTAINER", "FIREARM", "MELEE_WEAPON", "CLOTHING", "FOOD", "MEDICAL"}) do
         local id = "Base.Test_" .. kind
         local data = {fullType=id,utilityKind=kind,finalRarityTier="UNCOMMON",utility=50}
         results[id] = data
         local c = I.discover(data, function()
-            return {data=data,kind=kind,utilityEligible=true,metrics={weight=1},profile="profile",
+            return {data=data,kind=kind,utilityEligible=kind ~= "CLOTHING",metrics={weight=1},profile="profile",
                 subgroup="group",utility=50,profileCount=1,metricPercentiles={weight=50}}
         end)
-        local stage = kind == "CONTAINER" and "Container" or kind == "FIREARM" and "Firearm" or "Melee"
+        local stage = ({CONTAINER="Container",FIREARM="Firearm",MELEE_WEAPON="Melee",CLOTHING="Clothing",FOOD="Food",MEDICAL="Medical"})[kind]
         I.run(c, stage .. ":ReferenceAdmission", function()
+            if kind == "CLOTHING" then c.utilityEligible=true end
             if mode == "invalid" and kind == "CONTAINER" then
                 I.mark(c, "fixture", "ERROR_ISOLATED", "invalid fixture")
                 data.failedUtilityKind, data.utilityKind = kind, c.kind
@@ -34,7 +35,7 @@ function ItemRarityScanner.rescan()
             if mode == "population" and kind == "CONTAINER" then c.profile="other" end
             if mode == "tier" and kind == "CONTAINER" then data.finalRarityTier="RARE" end
             if mode == "partial" and kind == "CONTAINER" then c.utilityEligible=false; return false end
-            if kind ~= "MELEE_WEAPON" then return true end
+            if kind ~= "MELEE_WEAPON" and kind ~= "MEDICAL" then return true end
         end)
         if mode == "removed" and kind == "CONTAINER" then results[id]=nil end
         -- Same-fullType augmentation proxy must not shadow the real candidate.
@@ -77,5 +78,13 @@ assert(not D.snapshots.A,"stale snapshot survived fatal")
 mode="stable"; D.run("A")
 mode="stale"; assert(not pcall(D.run,"B"),"stale report accepted"); cleanHooks()
 assert(not D.snapshots.B)
+mode="stable"; D.run("A",2)
+assert(not pcall(D.run,"B",1),"mixed batch comparison accepted"); cleanHooks()
+r=D.run("B",2); cleanHooks()
+assert(r.HEALTHY_ITEMS_COMPARED==3 and r.HEALTHY_ITEM_REGRESSION==0,"batch2 scope failed")
+assert(D.snapshots.A.rows["Base.Test_MEDICAL"].population.admitted,"Medical nil success lost")
+assert(D.snapshots.A.rows["Base.Test_CLOTHING"].candidateState=="SAFE","Clothing discovery PARTIAL was not updated")
+assert(r.CLOTHING_HEALTHY_COMPARED==1 and r.CLOTHING_HEALTHY_REGRESSION==0,"Clothing effective counters incorrect")
+assert(D.snapshots.A.rows["Base.Test_CONTAINER"]==nil,"batch2 leaked batch1")
 return "BATCH_DIAGNOSTIC_TESTS=PASS", "WRITER_CALLS=0", "OBSERVER_RESTORED=yes",
     "GLOBAL_ERRORS_RETHROWN=yes", "DEEP_SNAPSHOTS=yes", "DIFFERENCES_DETECTED=yes", "WORLD_SCAN=NOT_RUN"
