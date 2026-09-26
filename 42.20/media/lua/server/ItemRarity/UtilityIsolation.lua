@@ -101,6 +101,9 @@ function I.discover(data, action)
         return owner
     end
     I.run(candidate, "CandidateValidation", function() return I.validate(candidate) end)
+    if candidate.kind=="LITERATURE" and not candidate.isolationStatus then
+        I.run(candidate,"Literature:PolicyAdmission",function() return I.literaturePolicy(candidate) end)
+    end
     if not candidate.isolationStatus then
         if candidate.kind == "UNSUPPORTED" then candidate.utilityState = "UNSUPPORTED"
         elseif candidate.utilityEligible == false then candidate.utilityState = "PARTIAL"
@@ -236,6 +239,98 @@ function I.foodAdmission(candidate)
         return false
     end
     return true
+end
+
+-- Declared relationship keys are strings, not an invitation to stringify
+-- arbitrary bridge objects. This validates representation, not identity.
+function I.requireStrings(candidate, stage, source, names)
+    for _, name in ipairs(names) do
+        local value = nil
+        if type(source) == "table" then value = source[name] end
+        if type(value) ~= "string" or value == "" then
+            I.mark(candidate,stage,(value == nil or value == "") and "PARTIAL_DEFER" or "ERROR_ISOLATED",
+                "Required string unavailable: "..name,{value=value,luaType=type(value),field=name})
+            return false
+        end
+    end
+    return true
+end
+
+-- Fish references are API species, including species with no loot row.
+-- Validate each configuration before it can contribute to bait denominators.
+-- minLength=10 is the existing Fishing size-model default, not a missing score.
+function I.fishConfigurations(configurations, excluded)
+    if configurations == nil then return {} end
+    assert(type(configurations)=="table","Invalid global Fishing configuration collection")
+    local valid={}
+    for index,configuration in ipairs(configurations) do
+        local owner={kind="FISH",data={fullType="<Fishing configuration "..index..">"}}
+        I.run(owner,"Fish:ConfigurationAdmission",function()
+            if type(configuration)~="table" then
+                I.mark(owner,"Fish:ConfigurationAdmission","ERROR_ISOLATED","Invalid fish configuration",{value=configuration}); return
+            end
+            if configuration.itemType then
+                owner.data.fullType=configuration.itemType
+                if type(configuration.itemType)=="string" then owner.data.module=configuration.itemType:match("^([^%.]+)") end
+            end
+            if configuration.isHaveDifferentSizes==false then return end
+            for _,flag in ipairs({"isHaveDifferentSizes","isPredator"}) do
+                if configuration[flag]~=nil and type(configuration[flag])~="boolean" then
+                    I.mark(owner,"Fish:ConfigurationAdmission","ERROR_ISOLATED","Invalid Fish flag: "..flag,{value=configuration[flag]}); return
+                end
+            end
+            if not I.requireStrings(owner,"Fish:ConfigurationAdmission",configuration,{"itemType"}) then return end
+            if excluded and excluded[configuration.itemType] then return end
+            if not I.requireFields(owner,"Fish:ConfigurationAdmission",configuration,{"maxWeight","maxLength","weightFactor"}) then return end
+            if configuration.minLength~=nil and not I.requireFields(owner,"Fish:ConfigurationAdmission",configuration,{"minLength"}) then return end
+            if configuration.maxWeight<=0 or configuration.weightFactor<=0 or configuration.maxLength<=(configuration.minLength or 10) then
+                I.mark(owner,"Fish:ConfigurationAdmission","PARTIAL_DEFER","Invalid fish size range",{
+                    maxWeight=configuration.maxWeight,maxLength=configuration.maxLength,minLength=configuration.minLength,weightFactor=configuration.weightFactor}); return
+            end
+            if type(configuration.lure)~="table" then
+                I.mark(owner,"Fish:ConfigurationAdmission","PARTIAL_DEFER","Missing fish bait profile"); return
+            end
+            for bait,value in pairs(configuration.lure) do
+                if type(bait)~="string" or not I.finite(value) or value<0 then
+                    I.mark(owner,"Fish:ConfigurationAdmission","ERROR_ISOLATED","Invalid bait coefficient",{bait=bait,value=value}); return
+                end
+            end
+            valid[#valid+1]=configuration
+        end)
+    end
+    return valid
+end
+
+function I.literaturePolicy(candidate)
+    if not candidate.utilityEligible then return false end -- preserve SPECIAL_PARTIAL
+    if not I.requireFields(candidate,"Literature:PolicyAdmission",candidate,{"utility"}) then return false end
+    if not I.requireStrings(candidate,"Literature:PolicyAdmission",candidate,{"functionalGroup","literatureFinalTier"}) then return false end
+    local tiers={COMMON=true,UNCOMMON=true,RARE=true,EPIC=true,EXOTIC=true}
+    if not tiers[candidate.literatureFinalTier] then
+        I.mark(candidate,"Literature:PolicyAdmission","ERROR_ISOLATED","Invalid Literature policy tier",{value=candidate.literatureFinalTier}); return false
+    end
+    local group=candidate.functionalGroup
+    if group=="SKILLBOOK" then
+        if not I.requireFields(candidate,"Literature:PolicyAdmission",candidate,{"literatureStructuralTier"}) then return false end
+    elseif group=="MAP" then
+        if not I.requireStrings(candidate,"Literature:PolicyAdmission",candidate,{"mapId"}) then return false end
+    elseif group=="RECIPE_LITERATURE" then
+        if not I.requireFields(candidate,"Literature:PolicyAdmission",candidate,{
+            "recipeUniqueCount","recipeValue","recipeScarcityStrength","recipeFinalScore"}) then return false end
+    elseif group=="ENTERTAINMENT_LITERATURE" or group=="TRIVIAL_LITERATURE" then
+        if not I.requireNumbers(candidate,"Literature:PolicyAdmission",{"unhappy","boredom","stress"}) then return false end
+    end
+    return true
+end
+
+-- Optional builders may legitimately reject with nil. Only exceptions and
+-- invalid returned candidates are isolated; rejection is not a fake failure.
+function I.optionalDiscover(data, kind, action)
+    local owner={data=data,kind=kind}
+    local ok,candidate=I.run(owner,kind..":CandidateDiscovery",action)
+    if not ok then return owner end
+    if candidate==nil then return nil end
+    return I.discover(data,function() return candidate end)
 end
 
 -- Runs one loop body, retaining the original candidate object and the original

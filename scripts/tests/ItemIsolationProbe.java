@@ -12,8 +12,11 @@ public class ItemIsolationProbe {
         return s.substring(a,b);
     }
     static String gitCalculator(Path repo, String revision) throws Exception {
+        return gitFile(repo,revision,"42.20/media/lua/server/ItemRarity/UtilityCalculator.lua");
+    }
+    static String gitFile(Path repo, String revision, String path) throws Exception {
         Process process=new ProcessBuilder("git","-C",repo.toString(),"show",
-            revision+":42.20/media/lua/server/ItemRarity/UtilityCalculator.lua").start();
+            revision+":"+path).start();
         ByteArrayOutputStream buffer=new ByteArrayOutputStream();
         byte[] bytes=new byte[8192]; int length;
         while((length=process.getInputStream().read(bytes))!=-1)buffer.write(bytes,0,length);
@@ -22,6 +25,8 @@ public class ItemIsolationProbe {
     }
     public static void main(String[] args) throws Exception {
         Path repo=Paths.get(args[0]);
+        boolean batch3=args.length>1 && args[1].matches("(magazine|ammo|fish|literature)-isolation-probe\\.lua");
+        String oracleRevision=batch3 ? "d660f37" : "4c8a0a6a5a2af71f8df695ecbdcfb9139c71d9ef";
         String source=read(repo.resolve("42.20/media/lua/server/ItemRarity/UtilityCalculator.lua"));
         if(Boolean.getBoolean("itemrarity.staged")) source=gitCalculator(repo, "");
         String isolation=read(repo.resolve("42.20/media/lua/server/ItemRarity/UtilityIsolation.lua"));
@@ -47,21 +52,47 @@ public class ItemIsolationProbe {
             "if FIREARM_FINAL_HOOK then FIREARM_FINAL_HOOK(candidate) end\n local absolute = absoluteParts[candidate]");
         instrumented=instrumented.replace("local p = function(name) return candidate.metricPercentiles",
             "if MELEE_FINAL_HOOK then MELEE_FINAL_HOOK(candidate) end\n local p = function(name) return candidate.metricPercentiles");
+        String literatureHook="local function attemptCandidateBuilder(name, builder, data, scriptItem)";
+        instrumented=instrumented.replace("local function makeMagazineCandidate(data, scriptItem)",
+            "ItemRarityUtilityCalculator.fixtureFirearm=makeFirearmCandidate\nlocal function makeMagazineCandidate(data, scriptItem)");
+        instrumented=instrumented.replace(literatureHook,
+            "ItemRarityUtilityCalculator.fixtureLiterature=makeLiteratureCandidate\n"+literatureHook);
+        instrumented=instrumented.replace("local function clothingNormalizationGroup(candidate, candidates)",
+            "ItemRarityUtilityCalculator.fixtureAmmoInheritance=scoreAmmoInheritance\nlocal function clothingNormalizationGroup(candidate, candidates)");
         String[] setup={"require=function() end",
             read(repo.resolve("common/media/lua/shared/ItemRarity/RarityConfig.lua")),
             read(repo.resolve("common/media/lua/shared/ItemRarity/RarityTiers.lua")),
             read(repo.resolve("common/media/lua/shared/ItemRarity/RarityUtils.lua")),
+            read(repo.resolve("common/media/lua/shared/ItemRarity/ItemClassifier.lua")),
             isolation,
-            gitCalculator(repo,"4c8a0a6a5a2af71f8df695ecbdcfb9139c71d9ef").replace("local function candidateFor(data)",
-                "local function candidateFor(data)\n if FIXTURE_DISCOVERY then return FIXTURE_DISCOVERY(data) end"),
-            "LEGACY_CALCULATE=ItemRarityUtilityCalculator.calculate",
+            batch3 ? "POST_ISOLATION=ItemRarityUtilityIsolation; ItemRarityUtilityIsolation=nil" : "",
+            batch3 ? gitFile(repo,oracleRevision,"42.20/media/lua/server/ItemRarity/UtilityIsolation.lua") : "",
+            batch3 ? "PRE_ISOLATION=ItemRarityUtilityIsolation" : "",
+            gitCalculator(repo,oracleRevision).replace("local function candidateFor(data)",
+                "local function candidateFor(data)\n if FIXTURE_DISCOVERY then return FIXTURE_DISCOVERY(data) end")
+                .replace(literatureHook,"ItemRarityUtilityCalculator.fixtureLiterature=makeLiteratureCandidate\n"+literatureHook),
+            "LEGACY_CALCULATE=ItemRarityUtilityCalculator.calculate; LEGACY_LITERATURE=ItemRarityUtilityCalculator.fixtureLiterature",
+            batch3 ? "local original=LEGACY_CALCULATE; LEGACY_CALCULATE=function(rows) "
+                +"local saved=ItemRarityUtilityIsolation; ItemRarityUtilityIsolation=PRE_ISOLATION; "
+                +"local ok,result=pcall(original,rows); ItemRarityUtilityIsolation=saved; "
+                +"if not ok then error(result) end; return result end; ItemRarityUtilityIsolation=POST_ISOLATION" : "",
             // Test-only injection at discovery. The rest of calculate executes
             // unchanged, with all Utility passes and candidate publication.
             instrumented,
-            read(repo.resolve("42.20/media/lua/server/ItemRarity/Diagnostics/BatchComparison.lua"))};
+            read(repo.resolve("42.20/media/lua/server/ItemRarity/Diagnostics/BatchComparison.lua")),
+            read(repo.resolve("42.20/media/lua/server/ItemRarity/Diagnostics/Batch3Coverage.lua"))};
         for(String chunk:setup) {
             Object[] loaded=(Object[])pcall.invoke(thread,compile.invoke(null,chunk,"Fixture setup",env),new Object[0]);
             if(!Boolean.TRUE.equals(loaded[0]))throw new AssertionError(java.util.Arrays.toString(loaded));
+        }
+        if(args.length>1 && args[1].equals("batch3-shadow-probe.lua")) {
+            Method compileFile=Class.forName("se.krka.kahlua.luaj.compiler.LuaCompiler")
+                .getMethod("loadis",java.io.Reader.class,String.class,tt);
+            for(String name:new String[]{"Batch3ShadowGenerated.lua","Batch3Shadow.lua"}) {
+                Object[] loaded=(Object[])pcall.invoke(thread,compileFile.invoke(null,
+                    new java.io.StringReader(read(repo.resolve("42.20/media/lua/server/ItemRarity/Diagnostics/"+name))),name,env),new Object[0]);
+                if(!Boolean.TRUE.equals(loaded[0]))throw new AssertionError(java.util.Arrays.toString(loaded));
+            }
         }
         String code="\nlocal UTILITY=ItemRarityConfig.utility; local NORMALIZATION=UTILITY.normalization\n"
             +isolation.replace("\nreturn I", "\n")
@@ -73,5 +104,6 @@ public class ItemIsolationProbe {
             compile.invoke(null,code,"ItemIsolationProbe",env),new Object[0]);
         if(!Boolean.TRUE.equals(result[0]))throw new AssertionError(java.util.Arrays.toString(result));
         for(int i=1;i<result.length;i++)System.out.println(result[i]);
+        System.out.println("SCORING_ORACLE="+oracleRevision+"; CONTROLLED_INPUTS_ONLY=true; HISTORICAL_WORLD_REGISTRY=false");
     }
 }

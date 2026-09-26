@@ -4,6 +4,7 @@ ItemRarityBatchComparison = ItemRarityBatchComparison or { snapshots={} }
 local D = ItemRarityBatchComparison
 local kinds = { CONTAINER=true, FIREARM=true, MELEE_WEAPON=true }
 local batch2Kinds = { CLOTHING=true, ACCESSORY=true, FOOD=true, MEDICAL=true }
+local batch3Kinds = { MAGAZINE=true, AMMO=true, FISH=true, LITERATURE=true }
 local admissions = {
     ["Container:ReferenceAdmission"]=true,
     ["Firearm:ReferenceAdmission"]=true,
@@ -11,6 +12,10 @@ local admissions = {
     ["Clothing:ReferenceAdmission"]=true,
     ["Food:ReferenceAdmission"]=true,
     ["Medical:ReferenceAdmission"]=true,
+    ["Magazine:Score"]=true,
+    ["Ammo:Inheritance"]=true,
+    ["Fish:CandidateAdmission"]=true,
+    ["Literature:PolicyAdmission"]=true,
 }
 
 local function copy(value, seen)
@@ -69,7 +74,7 @@ local function structuralPolicy(c)
     return nil
 end
 
-local function capture(observed, admitted, everAdmitted, selected, batch)
+local function capture(observed, admitted, everAdmitted, selected, batch, fishReferences)
     local rows, references, missing, deferAudit = {}, {}, 0, {}
     local results = ItemRarityScanner.results
     for _, id in ipairs(keys(results)) do
@@ -86,6 +91,7 @@ local function capture(observed, admitted, everAdmitted, selected, batch)
                 if c.isolationStatus then
                     state = c.isolationStatus == "ERROR_ISOLATED" and "ERROR_ISOLATED" or "PARTIAL"
                 elseif policyResolved then state="STRUCTURAL_POLICY_RESOLVED"
+                elseif c.kind=="AMMO" and c.utilityEligible and c.ammoInheritedFirearmTier then state="SAFE"
                 elseif c.utilityEligible == true and ItemRarityUtilityIsolation.finite(c.utility) then state="SAFE"
                 elseif c.kind == "UNSUPPORTED" then state="UNSUPPORTED" end
                 local member = admitted[c] == true and not c.isolationStatus
@@ -108,6 +114,10 @@ local function capture(observed, admitted, everAdmitted, selected, batch)
                 if kind == "FIREARM" then policy="FIREARM_SCORE"
                 elseif kind == "CLOTHING" then finalScore=data.clothingAdjustedScore; policy="CLOTHING_C1_IF_AVAILABLE"
                 elseif kind == "FOOD" then finalScore=data.foodFinalScore; policy="FOOD_SCORE" end
+                if kind=="MAGAZINE" then finalScore=c.magazineFinalScore; policy="MAGAZINE_CONTEXTUAL"
+                elseif kind=="FISH" then finalScore=c.utility; policy="FISH_YIELD_AND_POSITION"
+                elseif kind=="LITERATURE" then finalScore=c.utility; policy="LITERATURE_STRUCTURAL_OR_ABSOLUTE"
+                elseif kind=="AMMO" then finalScore=nil; policy="AMMO_TIER_INHERITANCE_NO_SCORE" end
                 local slot = nil
                 if type(c.equipmentGraph) == "table" then slot=c.equipmentGraph.slotId end
                 local oldDefer = priorClothingDefer(c)
@@ -139,6 +149,8 @@ local function capture(observed, admitted, everAdmitted, selected, batch)
                     baseScarcityTier=data.baseScarcityTier,
                     metrics=copy(c.metrics), components=copy(c.utilityComponents),
                     percentiles=copy(c.metricPercentiles), profileCount=c.profileCount,
+                    relationships=copy(c.ammoCompatibleFirearms),
+                    fishReferences=kind=="FISH" and copy(fishReferences) or nil,
                 }
             end
         end
@@ -153,7 +165,7 @@ function D.compare(beforeLabel, afterLabel)
     local a, b = D.snapshots[beforeLabel], D.snapshots[afterLabel]
     assert(a and b, "Both in-memory snapshots are required")
     assert(a.batch == b.batch,"Cannot compare different batches")
-    local selected = a.batch == 2 and batch2Kinds or kinds
+    local selected = a.batch == 3 and batch3Kinds or a.batch == 2 and batch2Kinds or kinds
     local all, compared, changed, membership, counts, perKindChanges = {}, 0, 0, 0, {}, {}
     local trivialRegressions=0
     for id in pairs(a.rows) do all[id] = true end
@@ -209,6 +221,28 @@ function D.compare(beforeLabel, afterLabel)
     if a.missing+b.missing > 0 then result.HEALTHY_ITEM_REGRESSION="UNKNOWN" end
     for _, name in ipairs(keys(result)) do print("[ItemRarity][BATCH] " .. name .. "=" .. tostring(result[name])) end
     for _, kind in ipairs(keys(selected)) do print("[ItemRarity][BATCH] " .. kind .. "_HEALTHY_COMPARED=" .. tostring(counts[kind] or 0)) end
+    if a.batch==3 then
+        for _,kind in ipairs(keys(batch3Kinds)) do
+            local status=0
+            if (counts[kind] or 0)==0 then status="NOT_VALIDATED_NO_HEALTHY_ITEMS" end
+            if a.missing+b.missing>0 then status="UNKNOWN" end
+            for _,snapshot in ipairs({a,b}) do
+                for _,row in pairs(snapshot.rows) do
+                    if row.comparisonKind==kind and row.isolated and row.admittedBeforeFailure then status="UNKNOWN" end
+                end
+                for _,entry in ipairs(snapshot.report.entries or {}) do
+                    if kind=="FISH" and entry.utility=="FISH" and (entry.stage=="Fish:Score" or entry.stage=="Fish:Assignment") then
+                        status="UNKNOWN" -- late rebuild evidence is covered by fixtures, not inferred from A/B
+                    end
+                end
+            end
+            result[kind.."_POPULATION_CONTAMINATION"]=status
+            local regression=(counts[kind] or 0)>0 and (perKindChanges[kind] or 0) or "NOT_VALIDATED_NO_HEALTHY_ITEMS"
+            result[kind.."_HEALTHY_ITEM_REGRESSION"]=regression
+            print("[ItemRarity][BATCH] "..kind.."_POPULATION_CONTAMINATION="..tostring(status))
+            print("[ItemRarity][BATCH] "..kind.."_HEALTHY_ITEM_REGRESSION="..tostring(regression))
+        end
+    end
     if a.batch == 2 then
         result.CLOTHING_HEALTHY_COMPARED=counts.CLOTHING or 0
         result.CLOTHING_HEALTHY_REGRESSION=perKindChanges.CLOTHING or 0
@@ -244,14 +278,15 @@ function D.run(label, batch)
     assert(not D.running, "Batch comparison already running")
     if label == "B" then assert(D.snapshots.A, "Run A first") end
     batch = batch or (label == "B" and D.snapshots.A.batch) or 1
-    assert(batch == 1 or batch == 2,"Use batch 1 or 2")
+    assert(batch == 1 or batch == 2 or batch==3,"Use batch 1, 2 or 3")
     if label == "B" then assert(batch == D.snapshots.A.batch,"Use the same batch for A and B") end
-    local selected = batch == 2 and batch2Kinds or kinds
+    local selected = batch == 3 and batch3Kinds or batch == 2 and batch2Kinds or kinds
     local I = assert(ItemRarityUtilityIsolation, "Isolation module unavailable")
     assert(ItemRarityScanner and ItemRarityScanner.rescan, "Scanner unavailable")
     local originalRun, originalDiscover = I.run, I.discover
     local oldReport = ItemRarityUtilityCalculator.lastItemIsolationReport
     local observed, admitted, everAdmitted = {}, {}, {}
+    local fishReferences={}
     D.running = true
     if label == "A" then D.snapshots = {}; D.lastComparison = nil end
     D.snapshots[label] = nil
@@ -260,10 +295,18 @@ function D.run(label, batch)
         -- Augmentation creates reference proxies with the SAME fullType but
         -- a different data table. Never let a proxy replace the actual row.
         if candidate.data then observed[candidate.data] = candidate end
+        if candidate.data and (candidate.kind=="FISH" or candidate.failedUtilityKind=="FISH") then
+            if candidate.isolationStatus then fishReferences[candidate.data.fullType]=nil
+            elseif stage=="Fish:Score" and ok then
+                fishReferences[candidate.data.fullType]={metrics=copy(candidate.metrics),components=copy(candidate.utilityComponents),
+                    utility=candidate.utility,tier=candidate.fishFinalTier,profileCount=candidate.profileCount}
+            end
+        end
         if admissions[stage] then
             -- Melee admission returns nil on success; the other two return true.
             admitted[candidate] = ok and not candidate.isolationStatus
-                and (stage == "Melee:ReferenceAdmission" or stage == "Medical:ReferenceAdmission" or value == true)
+                and (stage == "Melee:ReferenceAdmission" or stage == "Medical:ReferenceAdmission" or value == true
+                    or ((stage=="Magazine:Score" or stage=="Ammo:Inheritance" or stage=="Fish:CandidateAdmission") and candidate.utilityEligible==true))
             if admitted[candidate] then everAdmitted[candidate]=true end
         end
         return ok, value
@@ -283,7 +326,7 @@ function D.run(label, batch)
     end
     local report = ItemRarityUtilityCalculator.lastItemIsolationReport
     assert(report and report ~= oldReport and report.calculateCompleted, "No fresh completed calculation")
-    D.snapshots[label] = capture(observed, admitted, everAdmitted, selected, batch)
+    D.snapshots[label] = capture(observed, admitted, everAdmitted, selected, batch, fishReferences)
     print("[ItemRarity][BATCH] LOT="..batch.."; SNAPSHOT=" .. label .. "; GLOBAL_SCAN_COMPLETED=yes; GLOBAL_SCAN_FATALS=0")
     if label == "B" then return D.compare("A", "B") end
     return true

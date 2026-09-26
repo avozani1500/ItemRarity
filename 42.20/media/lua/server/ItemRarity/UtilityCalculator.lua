@@ -899,7 +899,7 @@ local function fishingConfigurations()
 end
 
 local function fishConfigurationFor(fullType)
-    local configurations = fishingConfigurations()
+    local configurations = ItemRarityUtilityIsolation.fishConfigurations(fishingConfigurations())
     if not configurations then return nil end
     for _, configuration in ipairs(configurations) do
         if configuration.itemType == fullType then return configuration end
@@ -950,8 +950,8 @@ local function fishExpectedWeight(configuration)
     return chanceSum > 0 and weightedSum / chanceSum or nil
 end
 
-local function fishBaitProfile(configuration)
-    local configurations = fishingConfigurations()
+local function fishBaitProfile(configuration, configurations)
+    configurations = configurations or ItemRarityUtilityIsolation.fishConfigurations(fishingConfigurations())
     if not configurations or not configuration or type(configuration.lure) ~= "table" then return nil, nil end
     local allBaits, totals = {}, {}
     for _, other in ipairs(configurations) do
@@ -982,7 +982,7 @@ end
 -- source used by Fishing.onCreateFish. `scriptItem` is optional because the
 -- FishUtility reference universe also includes valid catchable species that
 -- have no current loot-table route (and therefore no scanner registry row).
-local function fishMetricsForConfiguration(configuration, scriptItem)
+local function fishMetricsForConfiguration(configuration, scriptItem, configurations)
     if not configuration or configuration.isHaveDifferentSizes == false then return nil end
     local expectedWeight = fishExpectedWeight(configuration)
     local minimumSkill = fishMinimumSkill(configuration)
@@ -992,7 +992,7 @@ local function fishMetricsForConfiguration(configuration, scriptItem)
     if not baseCalories or baseCalories <= 0 then
         baseCalories = UTILITY.fish.declaredBaseCaloriesFallback
     end
-    local baitCount, conditionalShare, totalBaits = fishBaitProfile(configuration)
+    local baitCount, conditionalShare, totalBaits = fishBaitProfile(configuration, configurations)
     if not baitCount or totalBaits <= 0 then return nil end
     return {
         expectedWeight = expectedWeight,
@@ -1309,9 +1309,9 @@ local function makeMagazineCandidate(data, scriptItem)
     local runtimeItem = createDiscoveryRuntimeItem(scriptItem)
     local ammoType = firearmString(runtimeItem, scriptItem, { "getAmmoType" }, { "ammoType" })
     local gunType = firearmString(runtimeItem, scriptItem, { "getGunType" }, { "gunType" })
-    local maxAmmo = firearmNumber(runtimeItem, scriptItem, { "getMaxAmmo" }, { "maxAmmo" }) or 0
+    local maxAmmo = firearmNumber(runtimeItem, scriptItem, { "getMaxAmmo" }, { "maxAmmo" })
     if contains(string.lower(tostring(data.scriptType or "")), "weapon") then return nil end
-    if ammoType == "" or gunType == "" or maxAmmo <= 0 then return nil end
+    if ammoType == "" or gunType == "" or maxAmmo == nil or maxAmmo <= 0 then return nil end
     local metrics = { maxAmmo = maxAmmo, ammoType = ammoType, gunType = gunType }
     return {
         data = data, kind = "MAGAZINE", subgroup = "MAGAZINE", functionalGroup = "MAGAZINE",
@@ -1539,6 +1539,7 @@ end
 
 local function makeLiteratureCandidate(data, scriptItem)
     if data.category ~= "LITERATURE" then return nil end
+    local owner={data=data,kind="LITERATURE"}
     -- Preserve the established ScriptItem/runtime bridge for frozen
     -- SkillBook/Entertainment behavior. RecipeValue itself never consults
     -- this instance: `literatureUniqueRecipes` above reads static ScriptItem
@@ -1559,8 +1560,28 @@ local function makeLiteratureCandidate(data, scriptItem)
         return declaredText(readString(runtimeItem, getter, scriptField))
     end
     local function readMetric(getter, scriptField, fallback)
-        local v = readNumber(scriptItem, getter, scriptField, nil)
-        return v ~= nil and v or readNumber(runtimeItem, getter, scriptField, fallback)
+        for _, source in ipairs({scriptItem, runtimeItem}) do
+            local ok,raw=pcall(function()
+                local methodOk,method=pcall(function() return source[getter] end)
+                if methodOk and type(method)=="function" then
+                    local value=method(source)
+                    if value~=nil then return value end
+                end
+                local fieldOk,value=pcall(function() return source[scriptField] end)
+                if fieldOk then return value end
+                return nil -- inaccessible Java property is absence, not zero
+            end)
+            if not ok then error(raw) end
+            if raw~=nil then
+                local value=tonumber(raw)
+                if not ItemRarityUtilityIsolation.finite(value) then
+                    ItemRarityUtilityIsolation.mark(owner,"Literature:MetricRead","ERROR_ISOLATED","Invalid Literature metric: "..scriptField,{value=raw,luaType=type(raw)})
+                    return nil
+                end
+                return value
+            end
+        end
+        return fallback
     end
     local skill = read("getSkillTrained", "skillTrained") or ""
     local level = readMetric("getLvlSkillTrained", "lvlSkillTrained", nil)
@@ -1570,9 +1591,10 @@ local function makeLiteratureCandidate(data, scriptItem)
     local mapId = read("getMapID", "map") or read("getMapId", "mapId") or read("getMap", "map") or ""
     local onRead = read("getOnRead", "onRead") or ""
     local doubleClickRecipe = read("getDoubleClickRecipe", "doubleClickRecipe") or ""
-    local unhappy = readMetric("getUnhappyChange", "unhappyChange", 0) or 0
-    local boredom = readMetric("getBoredomChange", "boredomChange", 0) or 0
-    local stress = readMetric("getStressChange", "stressChange", 0) or 0
+    local unhappy = readMetric("getUnhappyChange", "unhappyChange", nil)
+    local boredom = readMetric("getBoredomChange", "boredomChange", nil)
+    local stress = readMetric("getStressChange", "stressChange", nil)
+    if owner.isolationStatus then return owner end
     local position = skill ~= "" and literatureStructuralPosition(level) or nil
     local metrics = {
         skill = skill, level = level, mapId = mapId, uniqueRecipeCount = #recipes,
@@ -1609,9 +1631,11 @@ local function makeLiteratureCandidate(data, scriptItem)
     end
     if #recipes > 0 then
         local r = literature.recipe
-        local recipeValue = 100 * #recipes / (#recipes + r.recipeValueDenominatorOffset)
         local scarcityPercentile = data.scarcityPercentile
-            or (data.tableAvailability and data.tableAvailability.routeWeightedPercentile) or 50
+        if scarcityPercentile == nil and data.tableAvailability then scarcityPercentile=data.tableAvailability.routeWeightedPercentile end
+        owner.metrics=metrics
+        if not ItemRarityUtilityIsolation.requireFields(owner,"Literature:RecipeInputs",{scarcityPercentile=scarcityPercentile},{"scarcityPercentile"}) then return owner end
+        local recipeValue = 100 * #recipes / (#recipes + r.recipeValueDenominatorOffset)
         local scarcityStrength = 100 - scarcityPercentile
         local finalScore = recipeValue * r.recipeValueWeight + scarcityStrength * r.scarcityStrengthWeight
         return {
@@ -1636,6 +1660,11 @@ local function makeLiteratureCandidate(data, scriptItem)
             utilityScoreVersion = literature.utilityVersion,
         }
     end
+    owner.metrics=metrics
+    if skill~="" and position==nil then
+        ItemRarityUtilityIsolation.mark(owner,"Literature:SkillbookInputs","PARTIAL_DEFER","Unknown skillbook level",{level=level}); return owner
+    end
+    if not ItemRarityUtilityIsolation.requireNumbers(owner,"Literature:MoodInputs",{"unhappy","boredom","stress"}) then return owner end
     if unhappy < 0 or boredom < 0 or stress < 0 then
         local e = literature.entertainment
         local unhappyBenefit = clamp(math.max(0, -unhappy) / e.unhappyCap, 0, 1) * 100
@@ -2453,15 +2482,34 @@ end
 -- MagazineUtility V1 consumes the already-computed FirearmUtility V1 final
 -- score. It never rebuilds firearms, reference bounds or scarcity values.
 local function scoreMagazineUtility(candidates)
+    local config = UTILITY.magazine
+    for _, key in ipairs({"capacitySaturation","compatibleWeaponWeight","capacityWeight"}) do
+        assert(ItemRarityUtilityIsolation.finite(config[key]),"Invalid global Magazine coefficient: "..key)
+    end
+    assert(config.capacitySaturation > 0,"Invalid global Magazine capacity saturation")
+    assert(TIER_INDEX[config.maxTier],"Invalid global Magazine ceiling")
+    for _,key in ipairs({"uncommon","rare","epic","exotic"}) do
+        assert(ItemRarityUtilityIsolation.finite(UTILITY.firearm.tiers[key]),"Invalid global Magazine/Firearm threshold: "..key)
+    end
     local firearms = {}
     for _, candidate in ipairs(candidates) do
         if candidate.kind == "FIREARM" and candidate.utilityEligible and candidate.firearmFinalScore ~= nil then
-            firearms[canonicalFirearmFullType(candidate.data.fullType)] = candidate.firearmFinalScore
+            ItemRarityUtilityIsolation.run(candidate,"Magazine:FirearmReference",function()
+                if not ItemRarityUtilityIsolation.requireFields(candidate,"Magazine:FirearmReference",candidate,{"firearmFinalScore"}) then return end
+                if not ItemRarityUtilityIsolation.requireStrings(candidate,"Magazine:FirearmReference",candidate.data,{"fullType"}) then return end
+                firearms[canonicalFirearmFullType(candidate.data.fullType)] = candidate.firearmFinalScore
+            end)
         end
     end
-    local config = UTILITY.magazine
     for _, candidate in ipairs(candidates) do
         if candidate.kind == "MAGAZINE" and candidate.utilityEligible then
+            ItemRarityUtilityIsolation.run(candidate,"Magazine:Score",function()
+            if not ItemRarityUtilityIsolation.requireNumbers(candidate,"Magazine:Admission",{"maxAmmo"}) then return end
+            if not ItemRarityUtilityIsolation.requireStrings(candidate,"Magazine:Admission",candidate.metrics,{"gunType","ammoType"}) then return end
+            if candidate.metrics.maxAmmo <= 0 then
+                ItemRarityUtilityIsolation.mark(candidate,"Magazine:Admission","PARTIAL_DEFER","Magazine capacity must be positive")
+                return
+            end
             local compatible, values = magazineTargets(candidate.metrics.gunType), {}
             for _, fullType in ipairs(compatible) do
                 if firearms[fullType] ~= nil then table.insert(values, firearms[fullType]) end
@@ -2478,6 +2526,7 @@ local function scoreMagazineUtility(candidates)
             else
                 local capacityValue = 100 * candidate.metrics.maxAmmo / (candidate.metrics.maxAmmo + config.capacitySaturation)
                 local score = config.compatibleWeaponWeight * best + config.capacityWeight * capacityValue
+                if not ItemRarityUtilityIsolation.requireFields(candidate,"Magazine:Score",{score=score,capacityValue=capacityValue},{"score","capacityValue"}) then return end
                 candidate.magazineCompatibleWeaponValue = best
                 candidate.magazineCompatibleWeaponAverage = total / #values
                 candidate.magazineCapacityValue = capacityValue
@@ -2492,6 +2541,7 @@ local function scoreMagazineUtility(candidates)
                 candidate.magazineFinalTier = tier == "EXOTIC" and config.maxTier or tier
                 candidate.utilityComponents = { compatibleWeaponValue = best, capacityValue = capacityValue }
             end
+            end)
         end
     end
 end
@@ -2503,15 +2553,24 @@ local function scoreAmmoInheritance(candidates)
     local firearmsByAmmoType = {}
     for _, candidate in ipairs(candidates) do
         if candidate.kind == "FIREARM" and candidate.utilityEligible and candidate.firearmFinalTier then
+            ItemRarityUtilityIsolation.run(candidate,"Ammo:FirearmReference",function()
+            if not ItemRarityUtilityIsolation.requireStrings(candidate,"Ammo:FirearmReference",candidate,{"firearmAmmoType","firearmFinalTier"}) then return end
+            if not TIER_INDEX[candidate.firearmFinalTier] then
+                ItemRarityUtilityIsolation.mark(candidate,"Ammo:FirearmReference","ERROR_ISOLATED","Invalid firearm tier",{value=candidate.firearmFinalTier})
+                return
+            end
             local key = canonicalAmmoType(candidate.firearmAmmoType)
             if key ~= "" then
                 firearmsByAmmoType[key] = firearmsByAmmoType[key] or {}
                 table.insert(firearmsByAmmoType[key], { fullType = candidate.data.fullType, tier = candidate.firearmFinalTier })
             end
+            end)
         end
     end
     for _, candidate in ipairs(candidates) do
         if candidate.kind == "AMMO" and candidate.utilityEligible then
+            ItemRarityUtilityIsolation.run(candidate,"Ammo:Inheritance",function()
+            if not ItemRarityUtilityIsolation.requireStrings(candidate,"Ammo:Admission",candidate.metrics,{"ammoType"}) then return end
             local compatible = firearmsByAmmoType[candidate.metrics.ammoType] or {}
             local bestTier, compatibleNames = nil, {}
             for _, firearm in ipairs(compatible) do
@@ -2525,6 +2584,7 @@ local function scoreAmmoInheritance(candidates)
                 candidate.utilityEligible = false
                 candidate.ineligibleReason = "AmmoUtility V1: no structurally compatible FirearmUtility result"
             end
+            end)
         end
     end
 end
@@ -3484,10 +3544,33 @@ end
 -- derived from Fishing.FishConfig, not Strategy D and not an InventoryItem.
 -- Yield owns the maximum visual tier; difficulty only refines within it.
 local function scoreFishUtility(candidates)
+    for _,key in ipairs({"uncommon","rare","epic","exotic"}) do
+        assert(ItemRarityUtilityIsolation.finite(UTILITY.fish.yieldTiers[key]),"Invalid global Fish threshold: "..key)
+    end
+    local limits=Fishing and Fishing.Utils and Fishing.Utils.skillSizeLimit
+    if limits~=nil then
+        assert(type(limits)=="table","Invalid global Fishing skill limits")
+        for level=0,10 do if limits[level]~=nil then
+            assert(ItemRarityUtilityIsolation.finite(limits[level]),"Invalid global Fishing skill limit")
+        end end
+    end
+    for _, section in ipairs({UTILITY.fish.expectedYield,UTILITY.fish.catchDifficulty,UTILITY.fish.position}) do
+        for key,value in pairs(section) do assert(ItemRarityUtilityIsolation.finite(value),"Invalid global Fish coefficient: "..key) end
+    end
+    assert(UTILITY.fish.expectedYield.caloriesHalfSaturation>0,"Invalid global Fish calorie saturation")
+    local excluded={}
+    local function scorePass()
     local members = {}
     for _, candidate in ipairs(candidates) do
+        if candidate.isolationStatus and candidate.failedUtilityKind=="FISH" then excluded[candidate.data.fullType]=true end
         if candidate.kind == "FISH" and candidate.utilityEligible then
-            table.insert(members, candidate)
+            ItemRarityUtilityIsolation.run(candidate,"Fish:CandidateAdmission",function()
+                if ItemRarityUtilityIsolation.requireNumbers(candidate,"Fish:CandidateAdmission",{
+                    "expectedHunger","expectedCalories","minimumFishingSkill","baitCount","conditionalSpeciesShare"}) then
+                    table.insert(members,candidate)
+                else excluded[candidate.data.fullType]=true end
+            end)
+            if candidate.isolationStatus then excluded[candidate.data.fullType]=true end
         end
     end
     if #members == 0 then return end
@@ -3496,16 +3579,27 @@ local function scoreFishUtility(candidates)
     -- not just species that happen to have a loot-table route. This keeps
     -- species scores stable while preserving the scanner's 3416-item scope.
     local references, byFullType = {}, {}
-    for _, configuration in ipairs(fishingConfigurations() or {}) do
-        local metrics = fishMetricsForConfiguration(configuration, nil)
-        if metrics then
-            local reference = { fullType = configuration.itemType, metrics = metrics }
+    local configurations=ItemRarityUtilityIsolation.fishConfigurations(fishingConfigurations(),excluded)
+    local rebuild=false
+    for _, configuration in ipairs(configurations) do
+        local reference = {kind="FISH",data={fullType=configuration.itemType},fullType=configuration.itemType}
+        ItemRarityUtilityIsolation.run(reference,"Fish:ReferenceAdmission",function()
+            reference.metrics=fishMetricsForConfiguration(configuration,nil,configurations)
+            if not ItemRarityUtilityIsolation.requireNumbers(reference,"Fish:ReferenceAdmission",{
+                "expectedHunger","expectedCalories","minimumFishingSkill","baitCount","conditionalSpeciesShare"}) then return end
             table.insert(references, reference)
             byFullType[configuration.itemType] = reference
-        end
+        end)
+        if reference.isolationStatus then excluded[configuration.itemType]=true; rebuild=true end
     end
+    if rebuild then return true end
     table.sort(references, function(a, b) return a.fullType < b.fullType end)
-    if #references == 0 then return end
+    if #references == 0 then
+        for _,candidate in ipairs(members) do
+            ItemRarityUtilityIsolation.mark(candidate,"Fish:Assignment","PARTIAL_DEFER","No admitted Fishing reference")
+        end
+        return
+    end
 
     local maxHunger, minShare, maxShare, maxBaitCount = 0, nil, nil, 0
     for _, reference in ipairs(references) do
@@ -3517,6 +3611,7 @@ local function scoreFishUtility(candidates)
     end
     local scores = {}
     for _, reference in ipairs(references) do
+        ItemRarityUtilityIsolation.run(reference,"Fish:Score",function()
         local metrics = reference.metrics
         local hunger = maxHunger > 0 and 100 * (metrics.expectedHunger or 0) / maxHunger or 0
         local calories = math.max(0, metrics.expectedCalories or 0)
@@ -3541,6 +3636,9 @@ local function scoreFishUtility(candidates)
         local positionIndex = TIER_INDEX[reference.fishPositionTier]
         reference.fishFinalTier = TIER_STRENGTH[math.min(ceilingIndex, positionIndex)]
         reference.utility = expectedFoodYield
+        if not ItemRarityUtilityIsolation.requireFields(reference,"Fish:Score",{
+            expectedFoodYield=expectedFoodYield,catchDifficulty=catchDifficulty,positionScore=positionScore},
+            {"expectedFoodYield","catchDifficulty","positionScore"}) then return end
         reference.utilityComponents = {
             expectedHunger = hunger,
             expectedCaloriesSaturated = caloriesSaturated,
@@ -3553,9 +3651,13 @@ local function scoreFishUtility(candidates)
         reference.profileCount = #references
         reference.utilityScoreVersion = UTILITY.fish.utilityVersion
         table.insert(scores, expectedFoodYield)
+        end)
+        if reference.isolationStatus then excluded[reference.fullType]=true; rebuild=true end
     end
+    if rebuild then return true end
     scores = sortedCopy(scores)
     for _, candidate in ipairs(members) do
+        ItemRarityUtilityIsolation.run(candidate,"Fish:Assignment",function()
         local reference = byFullType[candidate.data.fullType]
         if reference then
             candidate.utility = reference.utility
@@ -3573,8 +3675,15 @@ local function scoreFishUtility(candidates)
             candidate.fishPositionTier = reference.fishPositionTier
             candidate.fishFinalTier = reference.fishFinalTier
             candidate.data.utilityPercentile = percentileRank(scores, candidate.utility, false)
+        else
+            ItemRarityUtilityIsolation.mark(candidate,"Fish:Assignment","PARTIAL_DEFER","No admitted Fishing reference")
         end
+        end)
+        if candidate.isolationStatus and not excluded[candidate.data.fullType] then excluded[candidate.data.fullType]=true; rebuild=true end
     end
+    return rebuild
+    end
+    while scorePass() do end
 end
 
 -- Active FoodUtility V1. FOOD and DRINK are isolated populations; PARTIAL
@@ -4982,6 +5091,18 @@ function ItemRarityUtilityCalculator.writeCalibrationReport(results)
 end
 
 function ItemRarityUtilityCalculator.calculate(results)
+    -- Configuration failures are structural, not item failures. Check them
+    -- outside discovery's item-local boundary before Literature arithmetic.
+    for _,section in ipairs({UTILITY.literature.entertainment,UTILITY.literature.recipe.tiers}) do
+        for key,value in pairs(section) do assert(ItemRarityUtilityIsolation.finite(value),"Invalid global Literature coefficient: "..key) end
+    end
+    for _,key in ipairs({"recipeValueDenominatorOffset","recipeValueWeight","scarcityStrengthWeight"}) do
+        assert(ItemRarityUtilityIsolation.finite(UTILITY.literature.recipe[key]),"Invalid global Literature recipe coefficient: "..key)
+    end
+    assert(UTILITY.literature.recipe.recipeValueDenominatorOffset>0,"Invalid global Literature recipe saturation")
+    for _,key in ipairs({"unhappyCap","boredomCap","stressCap"}) do assert(UTILITY.literature.entertainment[key]>0,"Invalid global Literature mood cap") end
+    assert(TIER_INDEX[UTILITY.literature.mapFinalTier],"Invalid global Literature map tier")
+    for level=1,5 do assert(TIER_INDEX[UTILITY.literature.skillbookTiers[level]],"Invalid global Literature skill tier") end
     if not UTILITY.enabled then
         -- The ScriptItem bridge reference is purely scan-local even when a
         -- developer disables Utility dispatch entirely.
@@ -5193,7 +5314,7 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
     end
     local function fishFullTypes()
         local fish = {}
-        for _, configuration in ipairs(fishingConfigurations() or {}) do
+        for _, configuration in ipairs(ItemRarityUtilityIsolation.fishConfigurations(fishingConfigurations())) do
             if configuration.isHaveDifferentSizes ~= false and configuration.itemType then fish[tostring(configuration.itemType)] = true end
         end
         return fish
@@ -5289,11 +5410,11 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
             local data = scratchData(fullType, scriptItem)
             local candidate = nil
             if fishTypes[fullType] then
-                candidate = makeFishCandidate(data, scriptItem)
+                candidate = ItemRarityUtilityIsolation.optionalDiscover(data,"FISH",function() return makeFishCandidate(data, scriptItem) end)
             elseif potentialFirearm(scriptItem) then
                 candidate = makeFirearmCandidate(data, scriptItem, false)
             elseif potentialDirectAmmo(scriptItem) then
-                candidate = makeAmmoCandidate(data, scriptItem)
+                candidate = ItemRarityUtilityIsolation.optionalDiscover(data,"AMMO",function() return makeAmmoCandidate(data, scriptItem) end)
             end
             -- A static weapon-shaped script still needs the full
             -- ranged/ammo/attribute proof from makeFirearmCandidate. Direct

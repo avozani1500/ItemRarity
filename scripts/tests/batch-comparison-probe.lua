@@ -14,16 +14,20 @@ function ItemRarityScanner.rescan()
     if mode == "stale" then return end
     I.beginScan()
     local results = {}
-    for _, kind in ipairs({"CONTAINER", "FIREARM", "MELEE_WEAPON", "CLOTHING", "FOOD", "MEDICAL"}) do
+    for _, kind in ipairs({"CONTAINER", "FIREARM", "MELEE_WEAPON", "CLOTHING", "FOOD", "MEDICAL","MAGAZINE","AMMO","FISH","LITERATURE"}) do
         local id = "Base.Test_" .. kind
         local data = {fullType=id,utilityKind=kind,finalRarityTier="UNCOMMON",utility=50}
         results[id] = data
         local c = I.discover(data, function()
             return {data=data,kind=kind,utilityEligible=kind ~= "CLOTHING",metrics={weight=1},profile="profile",
-                subgroup="group",utility=50,profileCount=1,metricPercentiles={weight=50}}
+                subgroup="group",utility=50,profileCount=1,metricPercentiles={weight=50},
+                functionalGroup="MAP",literatureFinalTier="RARE",mapId="RosewoodMap"}
         end)
-        local stage = ({CONTAINER="Container",FIREARM="Firearm",MELEE_WEAPON="Melee",CLOTHING="Clothing",FOOD="Food",MEDICAL="Medical"})[kind]
-        I.run(c, stage .. ":ReferenceAdmission", function()
+        local stage = ({CONTAINER="Container:ReferenceAdmission",FIREARM="Firearm:ReferenceAdmission",MELEE_WEAPON="Melee:ReferenceAdmission",
+            CLOTHING="Clothing:ReferenceAdmission",FOOD="Food:ReferenceAdmission",MEDICAL="Medical:ReferenceAdmission",
+            MAGAZINE="Magazine:Score",AMMO="Ammo:Inheritance",FISH="Fish:CandidateAdmission",LITERATURE="Literature:PolicyAdmission"})[kind]
+        I.run(c, stage, function()
+            if kind=="AMMO" then c.utility=nil; data.utility=nil; c.ammoInheritedFirearmTier="UNCOMMON"; c.ammoCompatibleFirearms={"Base.MockGun"} end
             if kind == "CLOTHING" then c.utilityEligible=true end
             if mode == "invalid" and kind == "CONTAINER" then
                 I.mark(c, "fixture", "ERROR_ISOLATED", "invalid fixture")
@@ -37,10 +41,23 @@ function ItemRarityScanner.rescan()
             if mode == "partial" and kind == "CONTAINER" then c.utilityEligible=false; return false end
             if kind ~= "MELEE_WEAPON" and kind ~= "MEDICAL" then return true end
         end)
+        if kind=="FISH" then
+            local reference={data={fullType="Base.SpeciesReference"},kind="FISH",metrics={expectedHunger=10},utility=50,fishFinalTier="UNCOMMON"}
+            I.run(reference,"Fish:Score",function()
+                if mode=="fish-reference" then reference.metrics.expectedHunger=11 end
+            end)
+        end
         if mode == "removed" and kind == "CONTAINER" then results[id]=nil end
         -- Same-fullType augmentation proxy must not shadow the real candidate.
         local proxy={data={fullType=id},kind=kind,utilityEligible=true,metrics={weight=999}}
         I.run(proxy, "Proxy", function() end)
+        if mode=="coverage" and kind=="FIREARM" then
+            c.firearmAmmoType="fixture:valid"
+            proxy.firearmAmmoType=""
+            I.run(proxy,"Ammo:FirearmReference",function()
+                I.mark(proxy,"Ammo:FirearmReference","PARTIAL_DEFER","empty proxy key")
+            end)
+        end
     end
     if mode == "missing" then
         results["Base.Unobserved"]={fullType="Base.Unobserved",utilityKind="CONTAINER"}
@@ -86,5 +103,34 @@ assert(D.snapshots.A.rows["Base.Test_MEDICAL"].population.admitted,"Medical nil 
 assert(D.snapshots.A.rows["Base.Test_CLOTHING"].candidateState=="SAFE","Clothing discovery PARTIAL was not updated")
 assert(r.CLOTHING_HEALTHY_COMPARED==1 and r.CLOTHING_HEALTHY_REGRESSION==0,"Clothing effective counters incorrect")
 assert(D.snapshots.A.rows["Base.Test_CONTAINER"]==nil,"batch2 leaked batch1")
+mode="stable"; D.run("A",3); r=D.run("B",3); cleanHooks()
+assert(r.HEALTHY_ITEMS_COMPARED==4 and r.HEALTHY_ITEM_REGRESSION==0,"batch3 scope failed")
+assert(D.snapshots.B.rows["Base.Test_AMMO"].candidateState=="SAFE","Ammo requires invented score")
+assert(D.snapshots.B.rows["Base.Test_AMMO"].utilityScore==nil)
+for _,kind in ipairs({"MAGAZINE","AMMO","FISH","LITERATURE"}) do assert(r[kind.."_POPULATION_CONTAMINATION"]==0,kind) end
+mode="fish-reference"; r=D.run("B",3); cleanHooks()
+assert(r.FISH_HEALTHY_ITEM_REGRESSION==1,"Fish API population change missed")
+mode="coverage"
+getScriptManager=function() return {getAllItems=function() return {{
+    getFullName=function() return "Base.Test_FIREARM" end,
+    getAmmoType=function() return "fixture:valid" end,
+    getType=function() return "Weapon" end,
+    -- Deliberately no getItemType/getFullType: absent getters must not be called.
+}} end} end
+local realPcall=pcall
+local failedProtectedCalls=0
+pcall=function(...)
+    local result={realPcall(...)}
+    if not result[1] then failedProtectedCalls=failedProtectedCalls+1 end
+    return unpack(result)
+end
+local coverage=ItemRarityBatch3Coverage.run("A"); cleanHooks()
+pcall=realPcall; getScriptManager=nil
+assert(failedProtectedCalls==0,"diagnostic invoked absent getter under pcall")
+assert(#coverage.firearms==1,"deferred reference not captured")
+assert(coverage.firearms[1].candidateAmmoType=="fixture:valid" and coverage.firearms[1].referenceAmmoType=="","proxy shadowed real candidate")
+assert(coverage.firearms[1].referenceIsPublishedRow==false)
+assert(coverage.counts.detected==1 and coverage.counts.healthy==1,"Literature effective state lost")
+assert(coverage.ammo["Base.Test_AMMO"].tier=="UNCOMMON","Ammo effective tier lost")
 return "BATCH_DIAGNOSTIC_TESTS=PASS", "WRITER_CALLS=0", "OBSERVER_RESTORED=yes",
     "GLOBAL_ERRORS_RETHROWN=yes", "DEEP_SNAPSHOTS=yes", "DIFFERENCES_DETECTED=yes", "WORLD_SCAN=NOT_RUN"

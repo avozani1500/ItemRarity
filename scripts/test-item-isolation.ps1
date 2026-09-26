@@ -1,6 +1,7 @@
 param(
     [string]$GameRoot = 'C:\Program Files (x86)\Steam\steamapps\common\ProjectZomboid',
-    [switch]$StagedCalculator
+    [switch]$StagedCalculator,
+    [ValidateSet('magazine','ammo','fish','literature','batch3-shadow')][string]$Utility
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path $PSScriptRoot -Parent
@@ -15,11 +16,15 @@ New-Item -ItemType Directory -Path $probeDir | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Probe compilation failed.' }
 Push-Location $GameRoot
 try {
-    foreach ($fixtureName in @('item-isolation-probe.lua', 'firearm-isolation-probe.lua', 'melee-isolation-probe.lua', 'clothing-isolation-probe.lua', 'food-isolation-probe.lua', 'medical-isolation-probe.lua', 'batch-comparison-probe.lua')) {
+    $fixtures = @('item-isolation-probe.lua', 'firearm-isolation-probe.lua', 'melee-isolation-probe.lua', 'clothing-isolation-probe.lua', 'food-isolation-probe.lua', 'medical-isolation-probe.lua', 'magazine-isolation-probe.lua', 'ammo-isolation-probe.lua', 'fish-isolation-probe.lua', 'literature-isolation-probe.lua', 'batch-comparison-probe.lua')
+    if ($Utility) { $fixtures = @("$Utility-isolation-probe.lua") }
+    if ($Utility -eq 'batch3-shadow') { $fixtures = @('batch3-shadow-probe.lua') }
+    foreach ($fixtureName in $fixtures) {
         & $javaPath "-Ditemrarity.staged=$($StagedCalculator.IsPresent.ToString().ToLowerInvariant())" -cp ($probeDir + ';' + $jarPath) ItemIsolationProbe $repoRoot $fixtureName
         if ($LASTEXITCODE -ne 0) { throw "Fixture failed: $fixtureName" }
     }
 } finally {
     Pop-Location
 }
-Write-Output 'FIXTURE_GATES_PASSED=6/15; WORLD_SCAN=NOT_RUN; SYNC=NOT_RUN'
+if ($Utility) { Write-Output "FIXTURE_GATE_PASSED=$Utility; WORLD_SCAN=NOT_RUN; SYNC=NOT_RUN" }
+else { Write-Output 'FIXTURE_GATES_PASSED=10/15; WORLD_SCAN=NOT_RUN; SYNC=NOT_RUN' }
