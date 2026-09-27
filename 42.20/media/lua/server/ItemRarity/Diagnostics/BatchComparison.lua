@@ -5,6 +5,7 @@ local D = ItemRarityBatchComparison
 local kinds = { CONTAINER=true, FIREARM=true, MELEE_WEAPON=true }
 local batch2Kinds = { CLOTHING=true, ACCESSORY=true, FOOD=true, MEDICAL=true }
 local batch3Kinds = { MAGAZINE=true, AMMO=true, FISH=true, LITERATURE=true }
+local batch4Kinds = { LIGHTFIRE=true, EXPLOSIVE=true, INCENDIARY=true, NOISE_MAKER=true, ACCESSORY=true }
 local admissions = {
     ["Container:ReferenceAdmission"]=true,
     ["Firearm:ReferenceAdmission"]=true,
@@ -16,6 +17,10 @@ local admissions = {
     ["Ammo:Inheritance"]=true,
     ["Fish:CandidateAdmission"]=true,
     ["Literature:PolicyAdmission"]=true,
+    ["LightFire:Admission"]=true,
+    ["Explosive:Admission"]=true,
+    ["Incendiary:Admission"]=true,
+    ["NoiseMaker:Admission"]=true,
 }
 
 local function copy(value, seen)
@@ -91,6 +96,7 @@ local function capture(observed, admitted, everAdmitted, selected, batch, fishRe
                 if c.isolationStatus then
                     state = c.isolationStatus == "ERROR_ISOLATED" and "ERROR_ISOLATED" or "PARTIAL"
                 elseif policyResolved then state="STRUCTURAL_POLICY_RESOLVED"
+                elseif c.kind=="ACCESSORY" and c.accessoryMechanicalValueStatus=="MECHANICAL_VALUE_KNOWN" then state="STRUCTURAL_POLICY_RESOLVED"
                 elseif c.kind=="AMMO" and c.utilityEligible and c.ammoInheritedFirearmTier then state="SAFE"
                 elseif c.utilityEligible == true and ItemRarityUtilityIsolation.finite(c.utility) then state="SAFE"
                 elseif c.kind == "UNSUPPORTED" then state="UNSUPPORTED" end
@@ -101,7 +107,7 @@ local function capture(observed, admitted, everAdmitted, selected, batch, fishRe
                 -- Representative identities below are RECONSTRUCTED using the
                 -- existing deterministic fullType/profile deduplication rule;
                 -- private percentile/anchor arrays are not directly exposed.
-                if member and (kind == "MELEE_WEAPON" or selected == batch2Kinds or id:match("^Base%.")) then
+                if member and (kind == "MELEE_WEAPON" or selected == batch2Kinds or selected==batch4Kinds or id:match("^Base%.")) then
                     local refKey = kind .. ":" .. tostring(group) .. ":" .. tostring(c.profile)
                     if kind == "MELEE_WEAPON" then refKey = kind .. ":" .. tostring(c.profile) end
                     if not references[refKey] then references[refKey]=true; reference=true end
@@ -118,6 +124,10 @@ local function capture(observed, admitted, everAdmitted, selected, batch, fishRe
                 elseif kind=="FISH" then finalScore=c.utility; policy="FISH_YIELD_AND_POSITION"
                 elseif kind=="LITERATURE" then finalScore=c.utility; policy="LITERATURE_STRUCTURAL_OR_ABSOLUTE"
                 elseif kind=="AMMO" then finalScore=nil; policy="AMMO_TIER_INHERITANCE_NO_SCORE" end
+                if selected==batch4Kinds then
+                    finalScore=c.utility;policy="ABSOLUTE_EFFECT_OR_LIGHTFIRE"
+                    if kind=="ACCESSORY" then finalScore=c.accessoryMechanicalValue;policy="ACCESSORY_STRUCTURAL_POLICY" end
+                end
                 local slot = nil
                 if type(c.equipmentGraph) == "table" then slot=c.equipmentGraph.slotId end
                 local oldDefer = priorClothingDefer(c)
@@ -165,7 +175,7 @@ function D.compare(beforeLabel, afterLabel)
     local a, b = D.snapshots[beforeLabel], D.snapshots[afterLabel]
     assert(a and b, "Both in-memory snapshots are required")
     assert(a.batch == b.batch,"Cannot compare different batches")
-    local selected = a.batch == 3 and batch3Kinds or a.batch == 2 and batch2Kinds or kinds
+    local selected = a.batch==4 and batch4Kinds or a.batch == 3 and batch3Kinds or a.batch == 2 and batch2Kinds or kinds
     local all, compared, changed, membership, counts, perKindChanges = {}, 0, 0, 0, {}, {}
     local trivialRegressions=0
     for id in pairs(a.rows) do all[id] = true end
@@ -220,9 +230,12 @@ function D.compare(beforeLabel, afterLabel)
         OBSERVATION_MISSING=a.missing+b.missing }
     if a.missing+b.missing > 0 then result.HEALTHY_ITEM_REGRESSION="UNKNOWN" end
     for _, name in ipairs(keys(result)) do print("[ItemRarity][BATCH] " .. name .. "=" .. tostring(result[name])) end
-    for _, kind in ipairs(keys(selected)) do print("[ItemRarity][BATCH] " .. kind .. "_HEALTHY_COMPARED=" .. tostring(counts[kind] or 0)) end
-    if a.batch==3 then
-        for _,kind in ipairs(keys(batch3Kinds)) do
+    for _, kind in ipairs(keys(selected)) do
+        result[kind.."_HEALTHY_COMPARED"]=counts[kind] or 0
+        print("[ItemRarity][BATCH] " .. kind .. "_HEALTHY_COMPARED=" .. tostring(counts[kind] or 0))
+    end
+    if a.batch==3 or a.batch==4 then
+        for _,kind in ipairs(keys(selected)) do
             local status=0
             if (counts[kind] or 0)==0 then status="NOT_VALIDATED_NO_HEALTHY_ITEMS" end
             if a.missing+b.missing>0 then status="UNKNOWN" end
@@ -278,9 +291,9 @@ function D.run(label, batch)
     assert(not D.running, "Batch comparison already running")
     if label == "B" then assert(D.snapshots.A, "Run A first") end
     batch = batch or (label == "B" and D.snapshots.A.batch) or 1
-    assert(batch == 1 or batch == 2 or batch==3,"Use batch 1, 2 or 3")
+    assert(batch == 1 or batch == 2 or batch==3 or batch==4,"Use batch 1, 2, 3 or 4")
     if label == "B" then assert(batch == D.snapshots.A.batch,"Use the same batch for A and B") end
-    local selected = batch == 3 and batch3Kinds or batch == 2 and batch2Kinds or kinds
+    local selected = batch==4 and batch4Kinds or batch == 3 and batch3Kinds or batch == 2 and batch2Kinds or kinds
     local I = assert(ItemRarityUtilityIsolation, "Isolation module unavailable")
     assert(ItemRarityScanner and ItemRarityScanner.rescan, "Scanner unavailable")
     local originalRun, originalDiscover = I.run, I.discover
@@ -330,6 +343,80 @@ function D.run(label, batch)
     print("[ItemRarity][BATCH] LOT="..batch.."; SNAPSHOT=" .. label .. "; GLOBAL_SCAN_COMPLETED=yes; GLOBAL_SCAN_FATALS=0")
     if label == "B" then return D.compare("A", "B") end
     return true
+end
+
+-- Read-only follow-up: inspects existing facts/snapshots, never constructs an
+-- InventoryItem, invokes discovery/scoring, or changes the live registry.
+function D.auditEffects()
+    local function call(object,name)
+        if object==nil then return nil end
+        local ok,fn=pcall(function() return object[name] end)
+        if not ok or type(fn)~="function" then return nil end
+        local worked,value=pcall(fn,object)
+        if worked then return value end
+        return nil
+    end
+    local function positive(v) return type(v)=="number" and v>0 end
+    local manager=assert(getScriptManager(),"ScriptManager unavailable")
+    local all=assert(call(manager,"getAllItems"),"ScriptItems unavailable")
+    local scripts={}
+    local function add(item)
+        local id=call(item,"getFullName")
+        if id then scripts[tostring(id)]=item end
+    end
+    if type(all)=="table" then for _,item in pairs(all) do add(item) end
+    else for index=0,all:size()-1 do add(all:get(index)) end end
+    local results=assert(ItemRarityScanner.results)
+    local snapshot=D.snapshots.B or D.snapshots.A
+    assert(snapshot and snapshot.batch==4,"Run batch 4 A/B first")
+    -- Names below select audit sanity rows only; never determine eligibility.
+    local sanity={['Base.Firecracker']=true,['Base.Firecracker_Crafted']=true,['Base.NoiseTrap']=true,['Base.SmokeBomb']=true}
+    local counts={}
+    for _,kind in ipairs({'EXPLOSIVE','INCENDIARY','NOISE_MAKER'}) do
+        counts[kind]={detected=0,gatePass=0,built=0,admitted=0,scored=0,published=0}
+    end
+    for _,id in ipairs(keys(scripts)) do
+        local item=scripts[id]
+        local power,range,fire,noise=call(item,'getExplosionPower'),call(item,'getExplosionRange'),call(item,'getFireRange'),call(item,'getNoiseRange')
+        local category=ItemRarityItemClassifier.getFunctionalCategory(id)
+        local display=call(item,'getDisplayCategory')
+        local row=results[id]
+        local observed=snapshot.rows[id]
+        local kind=row and (row.failedUtilityKind or row.utilityKind)
+        local gate=category=='AMMO' and string.lower(tostring(display))=='explosives'
+        local detected={EXPLOSIVE=positive(power) and positive(range),INCENDIARY=positive(fire),NOISE_MAKER=positive(noise)}
+        local relevant=sanity[id] or counts[kind]~=nil or string.lower(tostring(display))=='explosives' or string.lower(tostring(display))=='wepbomb'
+        for family,yes in pairs(detected) do
+            if yes then
+                relevant=true
+                local n=counts[family];n.detected=n.detected+1
+                if gate then n.gatePass=n.gatePass+1 end
+            end
+        end
+        if counts[kind] then
+            local n=counts[kind];n.built=n.built+1
+            if observed and observed.rankingMembership then n.admitted=n.admitted+1 end
+            if row.utility~=nil and not row.utilityIsolationStatus then n.scored=n.scored+1 end
+            if ItemRarity.registry[id] then n.published=n.published+1 end
+        end
+        if relevant then
+            local reason=not gate and 'PREEXISTING_CATEGORY_DISPLAY_GATE' or 'INSPECT_EFFECT_EXCLUSIONS_OR_PRECEDENCE'
+            if observed and observed.candidateState=='SAFE' then reason='SCORED_OBSERVED' end
+            print('[ItemRarity][BATCH4_PIPELINE] '..id..' | display='..tostring(display)..' | classifier='..tostring(category)
+                ..' | lootClassifier='..tostring(row and row.category)..' | power/range/fire/noise='..tostring(power)..'/'..tostring(range)..'/'..tostring(fire)..'/'..tostring(noise)
+                ..' | candidateKind='..tostring(kind)..' | admitted='..tostring(observed and observed.rankingMembership)
+                ..' | score='..tostring(row and row.utility)..' | finalTier='..tostring(row and row.finalRarityTier)
+                ..' | diagnosticState='..tostring(observed and observed.candidateState)..' | registryPublished='..tostring(ItemRarity.registry[id]~=nil)
+                ..' | reason='..reason)
+        end
+    end
+    for _,kind in ipairs(keys(counts)) do
+        local n=counts[kind]
+        print('[ItemRarity][BATCH4_PIPELINE_TOTAL] '..kind..' | positiveScriptEffects='..n.detected..' | staticGatePass='..n.gatePass
+            ..' | finalCandidateRows='..n.built..' | admitted='..n.admitted..' | scored='..n.scored..' | published='..n.published)
+    end
+    print('[ItemRarity][BATCH4_PIPELINE] SCOPE=EXISTING_RESULTS_AND_SNAPSHOTS; RUNTIME_CREATIONS=0; MISSING_SCRIPT_GETTERS=UNKNOWN_NOT_ZERO')
+    return counts
 end
 
 return D

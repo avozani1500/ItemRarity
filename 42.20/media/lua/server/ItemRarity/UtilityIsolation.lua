@@ -36,6 +36,11 @@ function I.mark(candidate, stage, status, reason, values)
     -- eligible for publication or compatible-weapon inheritance afterwards.
     candidate.firearmFinalTier, candidate.firearmFinalScore = nil, nil
     candidate.ammoInheritedFirearmTier, candidate.magazineFinalTier = nil, nil
+    candidate.lightUtility,candidate.fireUtility,candidate.lightTier,candidate.fireTier=nil,nil,nil,nil
+    candidate.lightFireFinalTier,candidate.lightFireSelectedFunction=nil,nil
+    candidate.explosiveScore,candidate.explosiveFinalTier,candidate.explosivePowerValue,candidate.explosiveRangeValue=nil,nil,nil,nil
+    candidate.incendiaryFinalTier,candidate.incendiaryFireRange,candidate.noiseMakerScore,candidate.noiseMakerFinalTier=nil,nil,nil,nil
+    candidate.accessoryMechanicalValue,candidate.accessoryMechanicalBaseBenefit=nil,nil
     if not I.report then I.beginScan() end
     table.insert(I.report.entries, entry)
     if status == "ERROR_ISOLATED" then I.report.isolatedItemFailures = I.report.isolatedItemFailures + 1
@@ -100,7 +105,14 @@ function I.discover(data, action)
             {value=candidate,luaType=type(candidate)})
         return owner
     end
-    I.run(candidate, "CandidateValidation", function() return I.validate(candidate) end)
+    -- Proven zero-benefit accessory policies do not require unrelated weight,
+    -- durability or sensory metrics. Preserve their established precedence.
+    local accessoryResolved=false
+    if candidate.accessoryMechanicalCandidate then
+        local policyOk,resolved=I.run(candidate,"Accessory:StructuralPolicy",function() return I.accessoryTrivialPolicy(candidate) end)
+        accessoryResolved=policyOk and resolved==true
+    end
+    if not accessoryResolved then I.run(candidate, "CandidateValidation", function() return I.validate(candidate) end) end
     if candidate.kind=="LITERATURE" and not candidate.isolationStatus then
         I.run(candidate,"Literature:PolicyAdmission",function() return I.literaturePolicy(candidate) end)
     end
@@ -253,6 +265,46 @@ function I.requireStrings(candidate, stage, source, names)
             return false
         end
     end
+    return true
+end
+
+-- Light/fire admission is separate from its two scoring axes. A partial
+-- discovery is never upgraded by containment. Invalid members cannot set maxima.
+function I.lightFireAdmission(c)
+    if not c.utilityEligible then return false end
+    if not I.requireStrings(c,"LightFire:Admission",c,{"profile"}) then return false end
+    if type(c.lightFunction)~="boolean" or type(c.fireFunction)~="boolean" or not (c.lightFunction or c.fireFunction) then
+        I.mark(c,"LightFire:Admission","PARTIAL_DEFER","Missing structural light/fire function"); return false
+    end
+    local names=c.lightFunction and {"lightStrength","lightDistance","estimatedUses"} or {"estimatedUses"}
+    if not I.requireNumbers(c,"LightFire:Admission",names) then return false end
+    for _,name in ipairs(names) do
+        if c.metrics[name]<0 or (name=="estimatedUses" and c.metrics[name]<=0) then
+            I.mark(c,"LightFire:Admission","PARTIAL_DEFER","Invalid LightFire magnitude: "..name,{value=c.metrics[name]}); return false
+        end
+    end
+    return true
+end
+
+function I.positiveEffectAdmission(c,stage,names)
+    if not I.requireStrings(c,stage,c,{"profile"}) or not I.requireNumbers(c,stage,names) then return false end
+    for _,name in ipairs(names) do if c.metrics[name]<=0 then
+        I.mark(c,stage,"PARTIAL_DEFER","Nonpositive effect: "..name,{value=c.metrics[name]}); return false
+    end end
+    return true
+end
+
+function I.accessoryTrivialPolicy(c)
+    if not c.accessoryMechanicalCandidate or c.accessoryMechanicalSpecialBehavior or c.accessoryTimepiecePartial then return false end
+    if type(c.metrics)~="table" then return false end
+    for _,name in ipairs({"biteDefense","scratchDefense","bulletDefense","insulation","windResistance","waterResistance"}) do
+        if not I.finite(c.metrics[name]) or c.metrics[name]~=0 then return false end
+    end
+    c.accessoryMechanicalBaseBenefit=0
+    c.accessoryMechanicalDurabilityFactor=1
+    c.accessoryMechanicalFunctionalCost=0
+    c.accessoryMechanicalValue=0
+    c.accessoryMechanicalValueStatus="MECHANICALLY_TRIVIAL"
     return true
 end
 

@@ -1430,7 +1430,9 @@ local function makeLightFireCandidate(data, scriptItem)
     -- its declared category because its actual FireUtility is still gated by
     -- a finite structural UseDelta.
     local displayCategory = string.lower(tostring(data.displayCategory or readString(scriptItem, "getDisplayCategory", "displayCategory") or ""))
-    local isLight = (metrics.lightStrength or 0) > 0 or (metrics.lightDistance or 0) > 0
+    local owner={data=data,kind="LIGHTFIRE",metrics=metrics}
+    if not ItemRarityUtilityIsolation.validate(owner) then return owner end
+    local isLight = (metrics.lightStrength~=nil and metrics.lightStrength>0) or (metrics.lightDistance~=nil and metrics.lightDistance>0)
     local isFire = contains(tags, "base:startfire") or displayCategory == "firesource"
     if not isLight and not isFire then return nil end
     if metrics.useDelta and metrics.useDelta > 0 and metrics.useDelta <= 1 then
@@ -1471,12 +1473,15 @@ local function makeNoiseMakerCandidate(data, scriptItem)
     if displayCategory ~= "explosives" then return nil end
     local metrics = {
         noiseRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getNoiseRange", "noiseRange"),
-        explosionPower = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionPower", "explosionPower") or 0,
-        explosionRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionRange", "explosionRange") or 0,
-        fireRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getFireRange", "fireRange") or 0,
+        explosionPower = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionPower", "explosionPower"),
+        explosionRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionRange", "explosionRange"),
+        fireRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getFireRange", "fireRange"),
     }
-    if metrics.noiseRange == nil or metrics.noiseRange <= 0
-        or metrics.explosionPower > 0 or metrics.explosionRange > 0 or metrics.fireRange > 0 then return nil end
+    local owner={data=data,kind="NOISE_MAKER",metrics=metrics}
+    if not ItemRarityUtilityIsolation.validate(owner) then return owner end
+    if metrics.noiseRange == nil or metrics.noiseRange <= 0 then return nil end
+    if not ItemRarityUtilityIsolation.requireNumbers(owner,"NoiseMaker:DiscoveryExclusions",{"explosionPower","explosionRange","fireRange"}) then return owner end
+    if metrics.explosionPower > 0 or metrics.explosionRange > 0 or metrics.fireRange > 0 then return nil end
     return {
         data = data, kind = "NOISE_MAKER", subgroup = "NOISE_MAKER", functionalGroup = "NOISE_MAKER",
         parentGroup = "NOISE_MAKER", metrics = metrics,
@@ -1501,6 +1506,8 @@ local function makeExplosiveCandidate(data, scriptItem)
         explosionPower = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionPower", "explosionPower"),
         explosionRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionRange", "explosionRange"),
     }
+    local owner={data=data,kind="EXPLOSIVE",metrics=metrics}
+    if not ItemRarityUtilityIsolation.validate(owner) then return owner end
     if metrics.explosionPower == nil or metrics.explosionPower <= 0
         or metrics.explosionRange == nil or metrics.explosionRange <= 0 then return nil end
     return {
@@ -1523,9 +1530,13 @@ local function makeIncendiaryCandidate(data, scriptItem)
     local displayCategory = string.lower(tostring(data.displayCategory or readString(scriptItem, "getDisplayCategory", "displayCategory") or ""))
     if displayCategory ~= "explosives" then return nil end
     local fireRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getFireRange", "fireRange")
-    local explosionPower = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionPower", "explosionPower") or 0
-    local explosionRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionRange", "explosionRange") or 0
-    if fireRange == nil or fireRange <= 0 or explosionPower > 0 or explosionRange > 0 then return nil end
+    local explosionPower = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionPower", "explosionPower")
+    local explosionRange = readRuntimeOrScriptNumber(runtimeItem, scriptItem, "getExplosionRange", "explosionRange")
+    local owner={data=data,kind="INCENDIARY",metrics={fireRange=fireRange,explosionPower=explosionPower,explosionRange=explosionRange}}
+    if not ItemRarityUtilityIsolation.validate(owner) then return owner end
+    if fireRange == nil or fireRange <= 0 then return nil end
+    if not ItemRarityUtilityIsolation.requireNumbers(owner,"Incendiary:DiscoveryExclusions",{"explosionPower","explosionRange"}) then return owner end
+    if explosionPower > 0 or explosionRange > 0 then return nil end
     local metrics = { fireRange = fireRange }
     return {
         data = data, kind = "INCENDIARY", subgroup = "INCENDIARY", functionalGroup = "INCENDIARY",
@@ -2773,19 +2784,29 @@ end
 local function assignAccessoryMechanicalValueStatus(candidates)
     for _, candidate in ipairs(candidates) do
         if candidate.accessoryMechanicalCandidate then
+            ItemRarityUtilityIsolation.run(candidate,"Accessory:Policy",function()
+            if ItemRarityUtilityIsolation.accessoryTrivialPolicy(candidate) then return end
             local m = candidate.metrics or {}
             -- The active rule needs only a sound zero-benefit classification.
             -- Keep the richer coverage/durability/cost decomposition in the
             -- read-only diagnostic; avoiding it here prevents B42 Java value
             -- wrappers from influencing a simple structural ceiling.
-            local bite = tonumber(m.biteDefense) or 0
-            local scratch = tonumber(m.scratchDefense) or 0
-            local bullet = tonumber(m.bulletDefense) or 0
-            local insulation = tonumber(m.insulation) or 0
-            local wind = tonumber(m.windResistance) or 0
-            local water = tonumber(m.waterResistance) or 0
+            for _,name in ipairs({"biteDefense","scratchDefense","bulletDefense","insulation","windResistance","waterResistance"}) do
+                if m[name]==nil then
+                    candidate.accessoryMechanicalValueStatus="MECHANICAL_VALUE_PARTIAL"
+                    return -- absence is not a measured zero-benefit accessory
+                end
+            end
+            if not ItemRarityUtilityIsolation.requireNumbers(candidate,"Accessory:Policy",{"biteDefense","scratchDefense","bulletDefense","insulation","windResistance","waterResistance"}) then return end
+            local bite = m.biteDefense
+            local scratch = m.scratchDefense
+            local bullet = m.bulletDefense
+            local insulation = m.insulation
+            local wind = m.windResistance
+            local water = m.waterResistance
             candidate.accessoryMechanicalBaseBenefit = bite * .50 + scratch * .35 + bullet * .15
                 + insulation * .06 + wind * .05 + water * .04
+            assert(ItemRarityUtilityIsolation.finite(candidate.accessoryMechanicalBaseBenefit),"Nonfinite accessory benefit")
             candidate.accessoryMechanicalDurabilityFactor = 1
             candidate.accessoryMechanicalFunctionalCost = 0
             candidate.accessoryMechanicalValue = candidate.accessoryMechanicalBaseBenefit
@@ -2801,6 +2822,7 @@ local function assignAccessoryMechanicalValueStatus(candidates)
             else
                 candidate.accessoryMechanicalValueStatus = "MECHANICAL_VALUE_KNOWN"
             end
+            end)
         end
     end
 end
@@ -3834,10 +3856,23 @@ end
 -- maxima for light strength, reach and drain estimate. Fire remains absolute:
 -- uses map directly to the approved C/U/R/E bands.
 local function scoreLightFireUtility(candidates)
+    for _,name in ipairs({"light","fireUses"}) do
+        local section=UTILITY.lightFire[name]
+        assert(type(section)=="table","Invalid global LightFire configuration")
+        for key,value in pairs(section) do
+            if key=="maxTier" then assert(TIER_INDEX[value],"Invalid global LightFire ceiling")
+            else assert(ItemRarityUtilityIsolation.finite(value),"Invalid global LightFire coefficient: "..key) end
+        end
+    end
+    local function scorePass()
     local lights, fires = {}, {}
     local maxStrength, maxDistance, maxUses = 0, 0, 0
     for _, candidate in ipairs(candidates) do
         if candidate.kind == "LIGHTFIRE" and candidate.utilityEligible then
+            local ok,admitted=ItemRarityUtilityIsolation.run(candidate,"LightFire:Admission",function()
+                return ItemRarityUtilityIsolation.lightFireAdmission(candidate)
+            end)
+            if ok and admitted then
             local metrics = candidate.metrics
             if candidate.lightFunction then
                 table.insert(lights, candidate)
@@ -3846,10 +3881,12 @@ local function scoreLightFireUtility(candidates)
                 maxUses = math.max(maxUses, metrics.estimatedUses or 0)
             end
             if candidate.fireFunction then table.insert(fires, candidate) end
+            end
         end
     end
     local lightProfiles, fireProfiles = {}, {}
     for _, candidate in ipairs(lights) do
+        ItemRarityUtilityIsolation.run(candidate,"LightFire:LightScore",function()
         local m = candidate.metrics
         local strength = maxStrength > 0 and 100 * (m.lightStrength or 0) / maxStrength or 0
         local distance = maxDistance > 0 and 100 * (m.lightDistance or 0) / maxDistance or 0
@@ -3860,8 +3897,11 @@ local function scoreLightFireUtility(candidates)
         candidate.lightUtility = UTILITY.lightFire.light.illumination * illumination + UTILITY.lightFire.light.duration * duration
         candidate.lightTier = cappedTier(lightFireTierForScore(candidate.lightUtility), UTILITY.lightFire.light.maxTier)
         lightProfiles[candidate.profile] = true
+        assert(ItemRarityUtilityIsolation.finite(candidate.lightUtility),"Nonfinite light score")
+        end)
     end
     for _, candidate in ipairs(fires) do
+        ItemRarityUtilityIsolation.run(candidate,"LightFire:FireScore",function()
         local uses = candidate.metrics.estimatedUses or 0
         candidate.fireUtility = uses
         if uses >= UTILITY.lightFire.fireUses.epic then candidate.fireTier = "EPIC"
@@ -3870,12 +3910,16 @@ local function scoreLightFireUtility(candidates)
         else candidate.fireTier = "COMMON" end
         candidate.fireTier = cappedTier(candidate.fireTier, UTILITY.lightFire.fireUses.maxTier)
         fireProfiles[candidate.profile] = true
+        end)
     end
+    for _,c in ipairs(lights) do if c.isolationStatus then return true end end
+    for _,c in ipairs(fires) do if c.isolationStatus then return true end end
     local lightCount, fireCount = 0, 0
     for _ in pairs(lightProfiles) do lightCount = lightCount + 1 end
     for _ in pairs(fireProfiles) do fireCount = fireCount + 1 end
     for _, candidate in ipairs(candidates) do
         if candidate.kind == "LIGHTFIRE" and candidate.utilityEligible then
+            ItemRarityUtilityIsolation.run(candidate,"LightFire:Final",function()
             local lightIndex = TIER_INDEX[candidate.lightTier] or 0
             local fireIndex = TIER_INDEX[candidate.fireTier] or 0
             candidate.lightFireFinalTier = TIER_STRENGTH[math.max(lightIndex, fireIndex)] or "COMMON"
@@ -3884,21 +3928,37 @@ local function scoreLightFireUtility(candidates)
             candidate.profileCount = candidate.lightFireSelectedFunction == "LIGHTSOURCE" and lightCount or fireCount
             candidate.normalizationGroup = "LIGHTFIRE:" .. candidate.lightFireSelectedFunction
             candidate.utilityPercentile = nil
+            assert(ItemRarityUtilityIsolation.finite(candidate.utility),"Nonfinite LightFire utility")
+            end)
         end
     end
+    for _,c in ipairs(lights) do if c.isolationStatus then return true end end
+    for _,c in ipairs(fires) do if c.isolationStatus then return true end end
+    return false
+    end
+    while scorePass() do end
 end
 
 local function scoreNoiseMakerUtility(candidates)
     local tiers = UTILITY.noiseMaker.tiers
+    assert(TIER_INDEX[tiers.maxTier],"Invalid global NoiseMaker ceiling")
+    for _,key in ipairs({"uncommon","rare","epic"}) do assert(ItemRarityUtilityIsolation.finite(tiers[key]),"Invalid global NoiseMaker threshold: "..key) end
+    local function scorePass()
+    local members={}
     local profiles = {}
     for _, candidate in ipairs(candidates) do
-        if candidate.kind == "NOISE_MAKER" and candidate.utilityEligible then profiles[candidate.profile] = true end
+        if candidate.kind == "NOISE_MAKER" and candidate.utilityEligible then
+            local ok,valid=ItemRarityUtilityIsolation.run(candidate,"NoiseMaker:Admission",function()
+                return ItemRarityUtilityIsolation.positiveEffectAdmission(candidate,"NoiseMaker:Admission",{"noiseRange"})
+            end)
+            if ok and valid then profiles[candidate.profile]=true;members[#members+1]=candidate end
+        end
     end
     local profileCount = 0
     for _ in pairs(profiles) do profileCount = profileCount + 1 end
-    for _, candidate in ipairs(candidates) do
-        if candidate.kind == "NOISE_MAKER" and candidate.utilityEligible then
-            local noiseRange = candidate.metrics.noiseRange or 0
+    for _, candidate in ipairs(members) do
+        ItemRarityUtilityIsolation.run(candidate,"NoiseMaker:Score",function()
+            local noiseRange = candidate.metrics.noiseRange
             candidate.noiseMakerScore = noiseRange
             if noiseRange >= tiers.epic then candidate.noiseMakerFinalTier = "EPIC"
             elseif noiseRange >= tiers.rare then candidate.noiseMakerFinalTier = "RARE"
@@ -3908,8 +3968,12 @@ local function scoreNoiseMakerUtility(candidates)
             candidate.utility = noiseRange
             candidate.profileCount = profileCount
             candidate.utilityPercentile = nil
-        end
+        end)
     end
+    for _,c in ipairs(members) do if c.isolationStatus then return true end end
+    return false
+    end
+    while scorePass() do end
 end
 
 local function absoluteAnchorValue(value, anchors)
@@ -3940,18 +4004,38 @@ end
 -- simulation. No loaded-population normalization, percentile, Scarcity or
 -- trigger metadata can alter the result for a given blast profile.
 local function scoreExplosiveUtility(candidates)
+    for _,name in ipairs({"powerAnchors","rangeAnchors"}) do
+        local anchors=UTILITY.explosive[name]
+        assert(type(anchors)=="table" and #anchors>0,"Invalid global Explosive anchors")
+        local previous=nil
+        for _,anchor in ipairs(anchors) do
+            assert(type(anchor)=="table" and ItemRarityUtilityIsolation.finite(anchor[1]) and ItemRarityUtilityIsolation.finite(anchor[2]),"Invalid global Explosive anchor")
+            assert(previous==nil or anchor[1]>previous,"Unordered global Explosive anchors");previous=anchor[1]
+        end
+    end
+    for _,section in ipairs({UTILITY.explosive.weights,UTILITY.explosive.tiers}) do
+        for key,value in pairs(section) do assert(ItemRarityUtilityIsolation.finite(value),"Invalid global Explosive coefficient: "..key) end
+    end
+    local function scorePass()
+    local members={}
     local profiles = {}
     for _, candidate in ipairs(candidates) do
-        if candidate.kind == "EXPLOSIVE" and candidate.utilityEligible then profiles[candidate.profile] = true end
+        if candidate.kind == "EXPLOSIVE" and candidate.utilityEligible then
+            local ok,valid=ItemRarityUtilityIsolation.run(candidate,"Explosive:Admission",function()
+                return ItemRarityUtilityIsolation.positiveEffectAdmission(candidate,"Explosive:Admission",{"explosionPower","explosionRange"})
+            end)
+            if ok and valid then profiles[candidate.profile]=true;members[#members+1]=candidate end
+        end
     end
     local profileCount = 0
     for _ in pairs(profiles) do profileCount = profileCount + 1 end
-    for _, candidate in ipairs(candidates) do
-        if candidate.kind == "EXPLOSIVE" and candidate.utilityEligible then
+    for _, candidate in ipairs(members) do
+        ItemRarityUtilityIsolation.run(candidate,"Explosive:Score",function()
             local metrics = candidate.metrics
             local powerValue = absoluteAnchorValue(metrics.explosionPower, UTILITY.explosive.powerAnchors)
             local rangeValue = absoluteAnchorValue(metrics.explosionRange, UTILITY.explosive.rangeAnchors)
             local score = UTILITY.explosive.weights.power * powerValue + UTILITY.explosive.weights.range * rangeValue
+            assert(ItemRarityUtilityIsolation.finite(score),"Nonfinite Explosive score")
             candidate.explosivePowerValue = powerValue
             candidate.explosiveRangeValue = rangeValue
             candidate.explosiveScore = score
@@ -3959,8 +4043,12 @@ local function scoreExplosiveUtility(candidates)
             candidate.utility = score
             candidate.profileCount = profileCount
             candidate.utilityPercentile = nil
-        end
+        end)
     end
+    for _,c in ipairs(members) do if c.isolationStatus then return true end end
+    return false
+    end
+    while scorePass() do end
 end
 
 local function incendiaryFinalTier(fireRange)
@@ -3976,22 +4064,34 @@ end
 -- measured effect and must keep the same result regardless of the loaded
 -- population. No percentile or Scarcity path exists for Incendiary V1.
 local function scoreIncendiaryUtility(candidates)
+    for key,value in pairs(UTILITY.incendiary.tiers) do assert(ItemRarityUtilityIsolation.finite(value),"Invalid global Incendiary threshold: "..key) end
+    local function scorePass()
+    local members={}
     local profiles = {}
     for _, candidate in ipairs(candidates) do
-        if candidate.kind == "INCENDIARY" and candidate.utilityEligible then profiles[candidate.profile] = true end
+        if candidate.kind == "INCENDIARY" and candidate.utilityEligible then
+            local ok,valid=ItemRarityUtilityIsolation.run(candidate,"Incendiary:Admission",function()
+                return ItemRarityUtilityIsolation.positiveEffectAdmission(candidate,"Incendiary:Admission",{"fireRange"})
+            end)
+            if ok and valid then profiles[candidate.profile]=true;members[#members+1]=candidate end
+        end
     end
     local profileCount = 0
     for _ in pairs(profiles) do profileCount = profileCount + 1 end
-    for _, candidate in ipairs(candidates) do
-        if candidate.kind == "INCENDIARY" and candidate.utilityEligible then
-            local fireRange = candidate.metrics.fireRange or 0
+    for _, candidate in ipairs(members) do
+        ItemRarityUtilityIsolation.run(candidate,"Incendiary:Score",function()
+            local fireRange = candidate.metrics.fireRange
             candidate.incendiaryFireRange = fireRange
             candidate.incendiaryFinalTier = incendiaryFinalTier(fireRange)
             candidate.utility = fireRange
             candidate.profileCount = profileCount
             candidate.utilityPercentile = nil
-        end
+        end)
     end
+    for _,c in ipairs(members) do if c.isolationStatus then return true end end
+    return false
+    end
+    while scorePass() do end
 end
 
 local function utilitySupportStatus(candidate)

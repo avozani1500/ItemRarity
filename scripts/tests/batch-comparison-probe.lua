@@ -2,6 +2,7 @@
 local D, I = ItemRarityBatchComparison, ItemRarityUtilityIsolation
 local originalRun, originalDiscover = I.run, I.discover
 local mode, scans = "stable", 0
+local batch4Enabled = false
 getFileWriter = function() error("Writer must not be used") end
 local function cleanHooks()
     assert(I.run == originalRun and I.discover == originalDiscover and not D.running, "observer leaked")
@@ -14,7 +15,11 @@ function ItemRarityScanner.rescan()
     if mode == "stale" then return end
     I.beginScan()
     local results = {}
-    for _, kind in ipairs({"CONTAINER", "FIREARM", "MELEE_WEAPON", "CLOTHING", "FOOD", "MEDICAL","MAGAZINE","AMMO","FISH","LITERATURE"}) do
+    local scanKinds={"CONTAINER", "FIREARM", "MELEE_WEAPON", "CLOTHING", "FOOD", "MEDICAL","MAGAZINE","AMMO","FISH","LITERATURE"}
+    if batch4Enabled then
+        for _,kind in ipairs({"LIGHTFIRE","EXPLOSIVE","INCENDIARY","NOISE_MAKER","ACCESSORY"}) do scanKinds[#scanKinds+1]=kind end
+    end
+    for _, kind in ipairs(scanKinds) do
         local id = "Base.Test_" .. kind
         local data = {fullType=id,utilityKind=kind,finalRarityTier="UNCOMMON",utility=50}
         results[id] = data
@@ -25,10 +30,17 @@ function ItemRarityScanner.rescan()
         end)
         local stage = ({CONTAINER="Container:ReferenceAdmission",FIREARM="Firearm:ReferenceAdmission",MELEE_WEAPON="Melee:ReferenceAdmission",
             CLOTHING="Clothing:ReferenceAdmission",FOOD="Food:ReferenceAdmission",MEDICAL="Medical:ReferenceAdmission",
-            MAGAZINE="Magazine:Score",AMMO="Ammo:Inheritance",FISH="Fish:CandidateAdmission",LITERATURE="Literature:PolicyAdmission"})[kind]
+            MAGAZINE="Magazine:Score",AMMO="Ammo:Inheritance",FISH="Fish:CandidateAdmission",LITERATURE="Literature:PolicyAdmission",
+            LIGHTFIRE="LightFire:Admission",EXPLOSIVE="Explosive:Admission",INCENDIARY="Incendiary:Admission",NOISE_MAKER="NoiseMaker:Admission",ACCESSORY="Accessory:Policy"})[kind]
         I.run(c, stage, function()
             if kind=="AMMO" then c.utility=nil; data.utility=nil; c.ammoInheritedFirearmTier="UNCOMMON"; c.ammoCompatibleFirearms={"Base.MockGun"} end
             if kind == "CLOTHING" then c.utilityEligible=true end
+            if kind == "ACCESSORY" then
+                c.utilityEligible=false; c.utility=nil; data.utility=nil
+                c.accessoryMechanicalValueStatus="MECHANICALLY_TRIVIAL"
+                c.accessoryMechanicalValue=0; c.accessoryTrivialCosmeticEligible=true
+                data.finalRarityTier="COMMON"
+            end
             if mode == "invalid" and kind == "CONTAINER" then
                 I.mark(c, "fixture", "ERROR_ISOLATED", "invalid fixture")
                 data.failedUtilityKind, data.utilityKind = kind, c.kind
@@ -132,5 +144,27 @@ assert(coverage.firearms[1].candidateAmmoType=="fixture:valid" and coverage.fire
 assert(coverage.firearms[1].referenceIsPublishedRow==false)
 assert(coverage.counts.detected==1 and coverage.counts.healthy==1,"Literature effective state lost")
 assert(coverage.ammo["Base.Test_AMMO"].tier=="UNCOMMON","Ammo effective tier lost")
+mode="stable"; batch4Enabled=true
+D.run("A",4); r=D.run("B",4); cleanHooks()
+assert(r.HEALTHY_ITEMS_COMPARED==5 and r.HEALTHY_ITEM_REGRESSION==0,"batch4 scope failed")
+for _,kind in ipairs({"LIGHTFIRE","EXPLOSIVE","INCENDIARY","NOISE_MAKER","ACCESSORY"}) do
+    assert(r[kind.."_HEALTHY_COMPARED"]==1,kind.." effective healthy state lost")
+    assert(r[kind.."_POPULATION_CONTAMINATION"]==0,kind.." contamination")
+end
+assert(D.snapshots.B.rows["Base.Test_ACCESSORY"].candidateState=="STRUCTURAL_POLICY_RESOLVED","Accessory structural precedence lost")
+local savedClassifier=ItemRarityItemClassifier.getFunctionalCategory
+local savedApi=ItemRarity
+ItemRarity={registry={}}
+ItemRarityItemClassifier.getFunctionalCategory=function() return 'UNKNOWN' end
+getScriptManager=function() return {getAllItems=function() return {{
+    getFullName=function() return 'Base.Firecracker' end,
+    getDisplayCategory=function() return 'WepBomb' end,
+    getNoiseRange=function() return 80 end,
+}} end} end
+local scansBefore=scans
+local effectAudit=D.auditEffects()
+assert(effectAudit.NOISE_MAKER.detected==1 and effectAudit.NOISE_MAKER.gatePass==0)
+assert(effectAudit.NOISE_MAKER.built==0 and scans==scansBefore,'read-only audit ran scan')
+getScriptManager=nil;ItemRarity=savedApi;ItemRarityItemClassifier.getFunctionalCategory=savedClassifier
 return "BATCH_DIAGNOSTIC_TESTS=PASS", "WRITER_CALLS=0", "OBSERVER_RESTORED=yes",
     "GLOBAL_ERRORS_RETHROWN=yes", "DEEP_SNAPSHOTS=yes", "DIFFERENCES_DETECTED=yes", "WORLD_SCAN=NOT_RUN"

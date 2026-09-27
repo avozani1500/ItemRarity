@@ -25,8 +25,9 @@ public class ItemIsolationProbe {
     }
     public static void main(String[] args) throws Exception {
         Path repo=Paths.get(args[0]);
-        boolean batch3=args.length>1 && args[1].matches("(magazine|ammo|fish|literature)-isolation-probe\\.lua");
-        String oracleRevision=batch3 ? "d660f37" : "4c8a0a6a5a2af71f8df695ecbdcfb9139c71d9ef";
+        boolean batch4=args.length>1 && args[1].matches("(?i)(lightfire|explosive|incendiary|noisemaker|accessory)-isolation-probe\\.lua");
+        boolean batch3=batch4 || (args.length>1 && args[1].matches("(?i)(magazine|ammo|fish|literature)-isolation-probe\\.lua"));
+        String oracleRevision=batch4 ? "2fb7ebc" : batch3 ? "d660f37" : "4c8a0a6a5a2af71f8df695ecbdcfb9139c71d9ef";
         String source=read(repo.resolve("42.20/media/lua/server/ItemRarity/UtilityCalculator.lua"));
         if(Boolean.getBoolean("itemrarity.staged")) source=gitCalculator(repo, "");
         String isolation=read(repo.resolve("42.20/media/lua/server/ItemRarity/UtilityIsolation.lua"));
@@ -40,6 +41,9 @@ public class ItemIsolationProbe {
         // Compile the complete production chunk as well (including Kahlua's
         // local-variable limits), without executing its live dependencies.
         compile.invoke(null,source,"UtilityCalculator syntax",env);
+        Class.forName("se.krka.kahlua.luaj.compiler.LuaCompiler")
+            .getMethod("loadis",java.io.Reader.class,String.class,tt)
+            .invoke(null,new java.io.StringReader(source),"UtilityCalculator file syntax",env);
         Method pcall=tc.getMethod("pcall",Object.class,Object[].class);
         String instrumented=source.replace("local function candidateFor(data)",
             "local function candidateFor(data)\n if FIXTURE_DISCOVERY then return FIXTURE_DISCOVERY(data) end");
@@ -56,7 +60,8 @@ public class ItemIsolationProbe {
         instrumented=instrumented.replace("local function makeMagazineCandidate(data, scriptItem)",
             "ItemRarityUtilityCalculator.fixtureFirearm=makeFirearmCandidate\nlocal function makeMagazineCandidate(data, scriptItem)");
         instrumented=instrumented.replace(literatureHook,
-            "ItemRarityUtilityCalculator.fixtureLiterature=makeLiteratureCandidate\n"+literatureHook);
+            "ItemRarityUtilityCalculator.fixtureLiterature=makeLiteratureCandidate\n"
+            +"ItemRarityUtilityCalculator.fixtureBatch4Builders={LIGHTFIRE=makeLightFireCandidate,EXPLOSIVE=makeExplosiveCandidate,INCENDIARY=makeIncendiaryCandidate,NOISE_MAKER=makeNoiseMakerCandidate}\n"+literatureHook);
         instrumented=instrumented.replace("local function clothingNormalizationGroup(candidate, candidates)",
             "ItemRarityUtilityCalculator.fixtureAmmoInheritance=scoreAmmoInheritance\nlocal function clothingNormalizationGroup(candidate, candidates)");
         String[] setup={"require=function() end",
@@ -99,6 +104,7 @@ public class ItemIsolationProbe {
             +slice(source,"local function clamp(","local function confidenceAtLeast(")
             +slice(source,"local function essentialsPresent(","local function scoreGroup(")
             +slice(source,"local function containerRankingConfidence(","local function scoreMeleeV2(")
+            +(batch4 ? read(repo.resolve("scripts/tests/batch4-absolute-common.lua")) : "")
             +read(repo.resolve("scripts/tests/"+(args.length>1?args[1]:"item-isolation-probe.lua")));
         Object[] result=(Object[])tc.getMethod("pcall",Object.class,Object[].class).invoke(thread,
             compile.invoke(null,code,"ItemIsolationProbe",env),new Object[0]);
