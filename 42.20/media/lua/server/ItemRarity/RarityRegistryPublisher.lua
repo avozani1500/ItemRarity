@@ -1,5 +1,6 @@
 require "ItemRarity/RarityAPI"
 require "ItemRarity/RarityUtils"
+require "ItemRarity/UtilityIsolation"
 
 ItemRarityRegistryPublisher = ItemRarityRegistryPublisher or {}
 
@@ -76,12 +77,51 @@ local function copyEntry(data)
 end
 
 function ItemRarityRegistryPublisher.publish(results)
-    if type(results) ~= "table" then return nil end
+    assert(type(results)=="table", "Registry results must be a table")
+    assert(type(ItemRarity.setRegistry)=="function", "Registry sink unavailable")
+    local I=ItemRarityUtilityIsolation
+    local tiers={COMMON=1,UNCOMMON=2,RARE=3,EPIC=4,EXOTIC=5}
+    local publication={published=0,isolated=0}
+    ItemRarityRegistryPublisher.lastIsolationReport=publication
+    local function serializable(value,seen)
+        local kind=type(value)
+        if kind=='nil' or kind=='string' or kind=='boolean' then return end
+        if kind=='number' then assert(I.finite(value),'Nonfinite registry value');return end
+        assert(kind=='table','Nonserializable registry value: '..kind)
+        assert(not seen[value],'Cyclic registry value');seen[value]=true
+        for key,child in pairs(value) do
+            assert(type(key)=='string' or (type(key)=='number' and I.finite(key)),'Invalid registry field key')
+            serializable(child,seen)
+        end
+        seen[value]=nil
+    end
 
     local entries, count = {}, 0
     local summary = { profiles = {}, eligible = 0, promoted = 0, promotedProfiles = {}, demoted = 0 }
     for fullType, data in pairs(results) do
-        entries[fullType] = copyEntry(data)
+        local owner={data={fullType=type(fullType)=='string' and fullType or '<invalid registry key>'},kind='REGISTRY',metrics={row=data,rowType=type(data)}}
+        local ok,prepared=I.run(owner,'Registry:Row',function()
+            assert(type(fullType)=='string' and fullType~='', 'Invalid registry key')
+            assert(type(data)=='table' and data.fullType==fullType,'Registry row identity mismatch')
+            assert(data.tableAvailability==nil or type(data.tableAvailability)=='table','Invalid availability record')
+            local entry=copyEntry(data)
+            assert(type(entry.finalRarityTier)=='string' and tiers[entry.finalRarityTier], 'Missing/invalid final tier')
+            assert(entry.baseScarcityTier==nil or tiers[entry.baseScarcityTier], 'Invalid base tier')
+            for _,field in ipairs({'utility','utilityPercentile','percentile','scarcityPercentile','clothingMechanicalValue','accessoryMechanicalValue','foodQuality','foodFinalScore','fishExpectedFoodYield'}) do
+                assert(entry[field]==nil or I.finite(entry[field]),'Invalid numeric registry field: '..field)
+            end
+            assert(data.utilityEligible==nil or type(data.utilityEligible)=='boolean','Invalid eligibility')
+            assert(data.utilityProfile==nil or type(data.utilityProfile)=='string','Invalid profile')
+            assert(data.utilityKind==nil or type(data.utilityKind)=='string','Invalid Utility kind')
+            if entry.source=='UTILITY_ONLY' then
+                assert(entry.scarcityState=='UNKNOWN' and entry.hasLootRoute==false and entry.routeWeighted=='SKIPPED','Invalid utility-only provenance')
+                assert(entry.baseScarcityTier==nil and entry.scarcityPercentile==nil,'Invented utility-only scarcity')
+            end
+            serializable(entry,{})
+            return entry
+        end)
+        if ok then
+        entries[fullType] = prepared
         count = count + 1
         if data.utilityEligible then summary.eligible = summary.eligible + 1 end
         if data.utilityEligible and data.utilityProfile then summary.profiles[(data.utilityKind or "UNKNOWN") .. ":" .. data.utilityProfile] = true end
@@ -96,7 +136,9 @@ function ItemRarityRegistryPublisher.publish(results)
                 if data.utilityProfile then summary.promotedProfiles[(data.utilityKind or "UNKNOWN") .. ":" .. data.utilityProfile] = true end
             elseif finalIndex < baseIndex then summary.demoted = summary.demoted + 1 end
         end
+        else publication.isolated=publication.isolated+1 end
     end
+    publication.published=count
     local function countSet(set) local total = 0; for _ in pairs(set) do total = total + 1 end; return total end
 
     -- The server owns the registry. ModData makes the same compact lookup

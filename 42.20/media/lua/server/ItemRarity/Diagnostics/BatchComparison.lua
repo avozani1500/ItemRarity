@@ -419,4 +419,158 @@ function D.auditEffects()
     return counts
 end
 
+-- Final integration checkpoint. This is an explicit scan command, never an
+-- automatic hook. A/B is repeatability; fixtures separately prove PRE/POST.
+function D.runFinal(label)
+    assert(label=='A' or label=='B','Use A or B')
+    assert(not D.running,'Diagnostic already running')
+    if label=='A' then D.finalSnapshots={} end
+    assert(D.finalSnapshots and (label=='A' or D.finalSnapshots.A),'Run A first')
+    D.finalSnapshots[label]=nil
+    local I=ItemRarityUtilityIsolation
+    local original=I.run
+    local calculator=ItemRarityUtilityCalculator
+    local originalAugment=calculator.augmentUtilityOnly
+    local phase='NORMAL'
+    local traces,sequence={},0
+    local augmentationEvidence={}
+    local function traceFor(c)
+        if not traces[c] then
+            sequence=sequence+1
+            traces[c]={objectId=sequence,fullType=c.data and c.data.fullType,utilityKind=c.kind,
+                phase=phase,source=c.data and c.data.source,admissions={},memberships={},scores={},ammoConsumers={}}
+        end
+        return traces[c]
+    end
+    calculator.augmentUtilityOnly=function(results)
+        local before={}
+        for id,row in pairs(results) do before[id]=copy(row) end
+        phase='AUGMENTATION'
+        local statistics=originalAugment(results)
+        local changes={}
+        for id,row in pairs(before) do
+            local delta={};diff(row,results[id],'existingRow',delta)
+            if #delta>0 then changes[#changes+1]=id end
+        end
+        augmentationEvidence={existingRowsChanged=changes,statistics=copy(statistics)}
+        phase='NORMAL'
+        return statistics
+    end
+    local admitted={}
+    local priorReport=I.report
+    D.running=true
+    I.run=function(c,stage,action)
+        local trace=traceFor(c)
+        local ok,value=original(c,stage,action)
+        if admissions[stage] and ok and not c.isolationStatus and (value==true or c.utilityEligible==true) then
+            admitted[c]=true
+            trace.admissions[stage]=true
+            trace.memberships[stage]={family=c.subgroup or c.functionalGroup,profile=c.profile,phase=phase}
+            trace.admissionState='SAFE'
+            trace.comparisonFamily=c.subgroup or c.functionalGroup
+        end
+        if ok and not c.isolationStatus and (string.find(stage,'Score',1,true) or stage=='Firearm:Components') then
+            trace.scores[stage]={utility=c.utility,firearmScore=c.firearmCombinedScore}
+        end
+        if stage=='Ammo:FirearmReference' then trace.ammoReferenceAccepted=ok and not c.isolationStatus end
+        if stage=='Ammo:Inheritance' and ok and not c.isolationStatus then
+            trace.ammoConsumers=copy(c.ammoCompatibleFirearms or {})
+        end
+        if c.isolationStatus then
+            trace.failureStage=c.isolationStage;trace.failureReason=c.ineligibleReason
+        end
+        return ok,value
+    end
+    local ok,err=pcall(ItemRarityScanner.rescan,'DEV final robustness '..label)
+    I.run=original;calculator.augmentUtilityOnly=originalAugment;D.running=false
+    if not ok then print('[ItemRarity][FINAL_HARDENING] GLOBAL_SCAN_FATALS=1');error(err) end
+    assert(I.report~=priorReport and I.report.calculateCompleted,'No fresh completed scan')
+    local snap={rows=copy(ItemRarity.registry),signature=ItemRarityScanner.lastScanSignature,utilityOnly={},fallback={},
+        populationContamination=0,invalidProvenance=0,warnings={},publication=copy(ItemRarityRegistryPublisher.lastIsolationReport),report=copy(I.report)}
+    snap.lateFailures={};snap.augmentationEvidence=augmentationEvidence
+    snap.populationBeforeScoring={};snap.populationAfterFailureFilter={}
+    D.lateWarningKeys=D.lateWarningKeys or {}
+    for c,trace in pairs(traces) do
+        local unhealthy=c.isolationStatus~=nil or c.kind=='UNSUPPORTED' or c.utilityEligible==false
+        if admitted[c] then
+            snap.populationBeforeScoring[trace.objectId]=copy(trace.memberships)
+            snap.populationAfterFailureFilter[trace.objectId]={healthy=not unhealthy,ammoReferenceAccepted=trace.ammoReferenceAccepted,
+                note='Admission history is not proof of membership in a later Utility; private populations remain unobserved'}
+        end
+        if admitted[c] and unhealthy then
+            snap.populationContamination='UNKNOWN_LATE_FAILURE'
+            trace.finalUtilityState=c.utilityState or c.isolationStatus or 'PARTIAL'
+            trace.failureStage=trace.failureStage or 'ELIGIBILITY_CHANGED_WITHOUT_EXCEPTION'
+            trace.failureReason=trace.failureReason or c.ineligibleReason or 'unknown'
+            trace.realResultRow=c.data==ItemRarityScanner.results[trace.fullType]
+            trace.proxy=c.publishedFirearmTier~=nil
+            trace.source=trace.source or (trace.proxy and 'PUBLISHED_FIREARM_REFERENCE_PROXY'
+                or (trace.phase=='AUGMENTATION' and 'UTILITY_ONLY_CANDIDATE' or 'NORMAL_SCAN_CANDIDATE'))
+            trace.publishedFirearmTier=c.publishedFirearmTier
+            trace.publicAmmoConsumers={}
+            for _,consumer in pairs(traces) do
+                if consumer.phase==trace.phase then
+                    for _,id in ipairs(consumer.ammoConsumers) do
+                        if id==trace.fullType then trace.publicAmmoConsumers[#trace.publicAmmoConsumers+1]=consumer.fullType end
+                    end
+                end
+            end
+            snap.lateFailures[#snap.lateFailures+1]=copy(trace)
+        end
+    end
+    table.sort(snap.lateFailures,function(a,b) if a.fullType==b.fullType then return a.objectId<b.objectId end;return tostring(a.fullType)<tostring(b.fullType) end)
+    for _,trace in ipairs(snap.lateFailures) do
+        local key=tostring(trace.fullType)..'|'..tostring(trace.utilityKind)..'|'..trace.failureStage..'|'..trace.failureReason
+        if not D.lateWarningKeys[key] then
+            D.lateWarningKeys[key]=true
+            print('[ItemRarity][LateFailure] fullType='..tostring(trace.fullType)..' | utility='..tostring(trace.utilityKind)
+                ..' | source='..trace.source..' | phase='..trace.phase..' | objectId='..trace.objectId
+                ..' | realResultRow='..tostring(trace.realResultRow)..' | publishedReferenceProxy='..tostring(trace.proxy)
+                ..' | admittedStage='..table.concat(keys(trace.admissions),',')..' | population='..tostring(trace.comparisonFamily)
+                ..' | scoreState='..table.concat(keys(trace.scores),',')..' | finalState='..tostring(trace.finalUtilityState)
+                ..' | failedStage='..trace.failureStage..' | reason='..trace.failureReason
+                ..' | member_before=true | ammo_member_after='..tostring(trace.ammoReferenceAccepted)
+                ..' | ammoConsumers='..table.concat(trace.publicAmmoConsumers,',')..' | THIRD_PARTY_EFFECT=UNRESOLVED')
+        end
+    end
+    print('[ItemRarity][LateFailureSummary] SNAPSHOT='..label..' | LATE_FAILURE_COUNT='..#snap.lateFailures
+        ..' | AUGMENTATION_EXISTING_ROWS_CHANGED='..#(augmentationEvidence.existingRowsChanged or {})
+        ..' | AUGMENTATION_NEW_FIREARMS='..tostring(augmentationEvidence.statistics and augmentationEvidence.statistics.firearm))
+    for key in pairs(I.warningKeys) do snap.warnings[key]=true end
+    for id,row in pairs(snap.rows) do
+        if row.source=='UTILITY_ONLY' then
+            snap.utilityOnly[id]=true
+            if row.scarcityState~='UNKNOWN' or row.hasLootRoute~=false or row.routeWeighted~='SKIPPED'
+                or row.baseScarcityTier~=nil or row.scarcityPercentile~=nil then snap.invalidProvenance=snap.invalidProvenance+1 end
+        elseif row.utilityEligible~=true then snap.fallback[id]=true end
+    end
+    D.finalSnapshots[label]=snap
+    print('[ItemRarity][FINAL_HARDENING] SNAPSHOT='..label..'; GLOBAL_SCAN_FATALS=0; REGISTRY_COUNT='..#keys(snap.rows)
+        ..'; UTILITY_ONLY_COUNT='..#keys(snap.utilityOnly)..'; FALLBACK_COUNT='..#keys(snap.fallback)
+        ..'; INVALID_UTILITY_ONLY_PROVENANCE='..snap.invalidProvenance..'; PUBLICATION_ISOLATED='..tostring(snap.publication and snap.publication.isolated))
+    if label=='A' then return end
+    local a=D.finalSnapshots.A
+    local all={};for id in pairs(a.rows) do all[id]=true end;for id in pairs(snap.rows) do all[id]=true end
+    local changes,uoChanges,fallbackChanges=0,0,0
+    for _,id in ipairs(keys(all)) do
+        local delta={};diff(a.rows[id],snap.rows[id],'registry',delta)
+        if #delta>0 then
+            changes=changes+1
+            if a.utilityOnly[id] or snap.utilityOnly[id] then uoChanges=uoChanges+1 end
+            if a.fallback[id] or snap.fallback[id] then fallbackChanges=fallbackChanges+1 end
+            print('[ItemRarity][FINAL_HARDENING_DIFF] '..id..' | '..table.concat(delta,' | '))
+        end
+    end
+    local newWarnings=0;for key in pairs(snap.warnings) do if not a.warnings[key] then newWarnings=newWarnings+1 end end
+    local result={REGISTRY_HEALTHY_REGRESSION=changes,
+        UTILITY_ONLY_HEALTHY_REGRESSION=#keys(a.utilityOnly)>0 and uoChanges or 'NO_HEALTHY_ITEMS',
+        FALLBACK_HEALTHY_REGRESSION=#keys(a.fallback)>0 and fallbackChanges or 'NO_HEALTHY_ITEMS',
+        POPULATION_CONTAMINATION=(a.populationContamination==0 and snap.populationContamination==0) and 0 or 'UNKNOWN_LATE_FAILURE',
+        NEW_WARNING_KEYS_ON_B=newWarnings,GLOBAL_SCAN_FATALS=0,
+        SECOND_RESCAN=(a.signature~=nil and a.signature==snap.signature) and 'MATCH' or 'MISMATCH'}
+    for _,key in ipairs(keys(result)) do print('[ItemRarity][FINAL_HARDENING] '..key..'='..tostring(result[key])) end
+    D.finalComparison=result
+    return result
+end
+
 return D

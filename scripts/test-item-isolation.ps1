@@ -1,7 +1,7 @@
 param(
     [string]$GameRoot = 'C:\Program Files (x86)\Steam\steamapps\common\ProjectZomboid',
     [switch]$StagedCalculator,
-    [ValidateSet('magazine','ammo','fish','literature','batch3-shadow','lightfire','explosive','incendiary','noisemaker','accessory')][string]$Utility
+    [ValidateSet('magazine','ammo','fish','literature','batch3-shadow','lightfire','explosive','incendiary','noisemaker','accessory','final')][string]$Utility
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path $PSScriptRoot -Parent

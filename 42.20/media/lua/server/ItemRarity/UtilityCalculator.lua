@@ -5367,12 +5367,18 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
     -- Keep the helpers local to this isolated augmentation function. Kahlua
     -- enforces a 200-local limit per compiled chunk, while UtilityCalculator
     -- intentionally already contains the mature runtime formulas.
-    local function fullTypeFor(scriptItem)
+    local function rawFullTypeFor(scriptItem)
         local fullType = callMethod(scriptItem, "getFullName") or callMethod(scriptItem, "getFullType")
         if fullType and tostring(fullType) ~= "" then return tostring(fullType) end
         local module = callMethod(scriptItem, "getModuleName") or callMethod(scriptItem, "getModule")
         local name = callMethod(scriptItem, "getName")
         return module and name and tostring(module) .. "." .. tostring(name) or nil
+    end
+    local function fullTypeFor(scriptItem)
+        local owner={data={fullType='<unresolved ScriptItem>'},kind='UTILITY_ONLY'}
+        local ok,id=ItemRarityUtilityIsolation.run(owner,'UtilityOnly:Identity',function() return rawFullTypeFor(scriptItem) end)
+        if ok and type(id)=='string' and id~='' then return id end
+        return nil
     end
     local function allScriptItems()
         local manager = getScriptManager and getScriptManager() or nil
@@ -5447,8 +5453,8 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
     end
     local function directTier(candidate)
         if candidate.kind == "FIREARM" then
-            local combined = tonumber(candidate.firearmCombinedScore)
-            if combined == nil then return nil end
+            local combined = candidate.firearmCombinedScore
+            if not ItemRarityUtilityIsolation.requireFields(candidate,'UtilityOnly:FinalScore',candidate,{'firearmCombinedScore'}) then return nil end
             -- FirearmUtility normally blends a small Scarcity refinement. This
             -- route has UNKNOWN scarcity, so CombinedFirearmScore owns its tier.
             candidate.utility, candidate.firearmScarcityStrength = combined, nil
@@ -5488,20 +5494,27 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
         otherUtility = 0,
         entries = {},
     }
-    if not UTILITY.enabled or type(results) ~= "table" then return statistics end
+    assert(type(results)=='table','Utility-only results must be a table')
+    if not UTILITY.enabled then return statistics end
 
     local fishTypes = fishFullTypes()
     local candidates = {}
     for _, data in pairs(results) do
+        local owner={data={fullType=type(data)=='table' and data.fullType or '<invalid reference row>'},kind='UTILITY_ONLY'}
+        ItemRarityUtilityIsolation.run(owner,'UtilityOnly:Reference',function()
+        assert(type(data)=='table','Invalid reference row')
         if data.utilityKind == "FIREARM" and data.utilityEligible
             and data.utilityMetrics and data.utilityProfile and data.utilitySubgroup then
             table.insert(candidates, lootBackedFirearmReference(data))
             statistics.referenceLootBacked = statistics.referenceLootBacked + 1
         end
+        end)
     end
     for _, scriptItem in ipairs(allScriptItems()) do
         statistics.scannedScripts = statistics.scannedScripts + 1
         local fullType = fullTypeFor(scriptItem)
+        local owner={data={fullType=fullType},kind='UTILITY_ONLY'}
+        ItemRarityUtilityIsolation.run(owner,'UtilityOnly:Discovery',function()
         -- Existing loot-backed firearms are already represented above. The
         -- no-loot path intentionally reads only structural declarations: a
         -- generic candidateFor call would instantiate every incompatible
@@ -5512,7 +5525,7 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
             if fishTypes[fullType] then
                 candidate = ItemRarityUtilityIsolation.optionalDiscover(data,"FISH",function() return makeFishCandidate(data, scriptItem) end)
             elseif potentialFirearm(scriptItem) then
-                candidate = makeFirearmCandidate(data, scriptItem, false)
+                candidate = ItemRarityUtilityIsolation.optionalDiscover(data,'FIREARM',function() return makeFirearmCandidate(data, scriptItem, false) end)
             elseif potentialDirectAmmo(scriptItem) then
                 candidate = ItemRarityUtilityIsolation.optionalDiscover(data,"AMMO",function() return makeAmmoCandidate(data, scriptItem) end)
             end
@@ -5525,6 +5538,7 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
                 table.insert(candidates, candidate)
             end
         end
+        end)
     end
     table.sort(candidates, function(a, b) return a.data.fullType < b.data.fullType end)
     statistics.referenceCandidates = #candidates
@@ -5544,8 +5558,10 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
             -- Reference only. The active loot-backed row was scored solely by
             -- the normal pipeline before this augmentation began.
         else
+            ItemRarityUtilityIsolation.run(candidate,'UtilityOnly:Publication',function()
             local tier = directTier(candidate)
             if tier then
+                assert(type(tier)=='string' and TIER_INDEX[tier],'Invalid utility-only final tier')
                 local data = makeSynthetic(candidate, tier)
                 publishCandidateFields({ candidate })
                 -- publishCandidateFields intentionally only transports the
@@ -5580,6 +5596,7 @@ function ItemRarityUtilityCalculator.augmentUtilityOnly(results)
                 end
                 table.insert(statistics.entries, fullType)
             end
+            end)
         end
     end
     table.sort(statistics.entries)

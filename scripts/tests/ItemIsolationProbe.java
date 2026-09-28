@@ -25,9 +25,10 @@ public class ItemIsolationProbe {
     }
     public static void main(String[] args) throws Exception {
         Path repo=Paths.get(args[0]);
+        boolean finalBatch=args.length>1 && args[1].equals("final-isolation-probe.lua");
         boolean batch4=args.length>1 && args[1].matches("(?i)(lightfire|explosive|incendiary|noisemaker|accessory)-isolation-probe\\.lua");
         boolean batch3=batch4 || (args.length>1 && args[1].matches("(?i)(magazine|ammo|fish|literature)-isolation-probe\\.lua"));
-        String oracleRevision=batch4 ? "2fb7ebc" : batch3 ? "d660f37" : "4c8a0a6a5a2af71f8df695ecbdcfb9139c71d9ef";
+        String oracleRevision=finalBatch ? "1b6ae4c" : batch4 ? "2fb7ebc" : batch3 ? "d660f37" : "4c8a0a6a5a2af71f8df695ecbdcfb9139c71d9ef";
         String source=read(repo.resolve("42.20/media/lua/server/ItemRarity/UtilityCalculator.lua"));
         if(Boolean.getBoolean("itemrarity.staged")) source=gitCalculator(repo, "");
         String isolation=read(repo.resolve("42.20/media/lua/server/ItemRarity/UtilityIsolation.lua"));
@@ -64,6 +65,8 @@ public class ItemIsolationProbe {
             +"ItemRarityUtilityCalculator.fixtureBatch4Builders={LIGHTFIRE=makeLightFireCandidate,EXPLOSIVE=makeExplosiveCandidate,INCENDIARY=makeIncendiaryCandidate,NOISE_MAKER=makeNoiseMakerCandidate}\n"+literatureHook);
         instrumented=instrumented.replace("local function clothingNormalizationGroup(candidate, candidates)",
             "ItemRarityUtilityCalculator.fixtureAmmoInheritance=scoreAmmoInheritance\nlocal function clothingNormalizationGroup(candidate, candidates)");
+        instrumented=instrumented.replace("function ItemRarityUtilityCalculator.calculate(results)",
+            "ItemRarityUtilityCalculator.fixtureApplyTier=applyTierAdjustment\nfunction ItemRarityUtilityCalculator.calculate(results)");
         String[] setup={"require=function() end",
             read(repo.resolve("common/media/lua/shared/ItemRarity/RarityConfig.lua")),
             read(repo.resolve("common/media/lua/shared/ItemRarity/RarityTiers.lua")),
@@ -76,7 +79,7 @@ public class ItemIsolationProbe {
             gitCalculator(repo,oracleRevision).replace("local function candidateFor(data)",
                 "local function candidateFor(data)\n if FIXTURE_DISCOVERY then return FIXTURE_DISCOVERY(data) end")
                 .replace(literatureHook,"ItemRarityUtilityCalculator.fixtureLiterature=makeLiteratureCandidate\n"+literatureHook),
-            "LEGACY_CALCULATE=ItemRarityUtilityCalculator.calculate; LEGACY_LITERATURE=ItemRarityUtilityCalculator.fixtureLiterature",
+            "LEGACY_CALCULATE=ItemRarityUtilityCalculator.calculate; LEGACY_AUGMENT=ItemRarityUtilityCalculator.augmentUtilityOnly; LEGACY_LITERATURE=ItemRarityUtilityCalculator.fixtureLiterature",
             batch3 ? "local original=LEGACY_CALCULATE; LEGACY_CALCULATE=function(rows) "
                 +"local saved=ItemRarityUtilityIsolation; ItemRarityUtilityIsolation=PRE_ISOLATION; "
                 +"local ok,result=pcall(original,rows); ItemRarityUtilityIsolation=saved; "
@@ -89,6 +92,15 @@ public class ItemIsolationProbe {
         for(String chunk:setup) {
             Object[] loaded=(Object[])pcall.invoke(thread,compile.invoke(null,chunk,"Fixture setup",env),new Object[0]);
             if(!Boolean.TRUE.equals(loaded[0]))throw new AssertionError(java.util.Arrays.toString(loaded));
+        }
+        if(finalBatch) {
+            for(String chunk:new String[]{read(repo.resolve("common/media/lua/shared/ItemRarity/RarityAPI.lua")),
+                gitFile(repo,oracleRevision,"42.20/media/lua/server/ItemRarity/RarityRegistryPublisher.lua"),
+                "LEGACY_PUBLISH=ItemRarityRegistryPublisher.publish",
+                read(repo.resolve("42.20/media/lua/server/ItemRarity/RarityRegistryPublisher.lua"))}) {
+                Object[] loaded=(Object[])pcall.invoke(thread,compile.invoke(null,chunk,"Final fixture setup",env),new Object[0]);
+                if(!Boolean.TRUE.equals(loaded[0]))throw new AssertionError(java.util.Arrays.toString(loaded));
+            }
         }
         if(args.length>1 && args[1].equals("batch3-shadow-probe.lua")) {
             Method compileFile=Class.forName("se.krka.kahlua.luaj.compiler.LuaCompiler")
